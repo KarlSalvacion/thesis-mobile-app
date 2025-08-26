@@ -1,43 +1,37 @@
 import React from 'react'
-import { View, Text, TouchableOpacity, Pressable } from 'react-native'
+import { Ionicons } from '@expo/vector-icons'
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs'
+import Homescreen from '../screens/Homescreen'
+import Mapscreen from '../screens/Mapscreen'
+import DetectionResults from '../screens/DetResultscreen'
 
-interface NavigationBarProps {
-  currentRoute: string
-  onNavigate: (route: string) => void
-}
+const Tab = createBottomTabNavigator()
 
-const NavigationBar = ({ currentRoute, onNavigate }: NavigationBarProps) => {
-  const tabs = [
-    { name: 'Home', route: 'Home', icon: '🏠' },
-    { name: 'Map', route: 'Map', icon: '🗺️' },
-    { name: 'Results', route: 'DetectionResults', icon: '📊' }
-  ]
-
+const NavigationBar = () => {
   return (
-    <View className="bg-white border-t border-gray-200 px-2 py-2">
-      <View className="flex-row justify-around items-center">
-        {tabs.map((tab) => (
-          <Pressable
-            key={tab.route}
-            onPress={() => onNavigate(tab.route)}
-            className={`flex-1 items-center py-2 px-1 ${
-              currentRoute === tab.route ? 'opacity-100' : 'opacity-60'
-            }`}
-          >
-            <Text className="text-2xl mb-1">{tab.icon}</Text>
-            <Text 
-              className={`text-xs font-medium ${
-                currentRoute === tab.route 
-                  ? 'text-blue-600' 
-                  : 'text-gray-500'
-              }`}
-            >
-              {tab.name}
-            </Text>
-          </Pressable>
-        ))}
-      </View>
-    </View>
+    <Tab.Navigator
+      screenOptions={({ route }) => ({
+        headerShown: false,
+        tabBarActiveTintColor: 'rgb(37, 165, 120)rgb(76, 175, 46)',
+        tabBarInactiveTintColor: 'rgb(128, 134, 124)',
+        tabBarLabelStyle: { fontSize: 12, fontWeight: '500' },
+        tabBarIcon: ({ color, size }) => {
+          let iconName: keyof typeof Ionicons.glyphMap = 'home'
+          if (route.name === 'Home') iconName = 'home'
+          else if (route.name === 'Map') iconName = 'map'
+          else if (route.name === 'DetectionResults') iconName = 'stats-chart'
+          return <Ionicons name={iconName} size={size ?? 24} color={color} />
+        }
+      })}
+    >
+      <Tab.Screen name="Home" component={Homescreen} />
+      <Tab.Screen name="Map" component={Mapscreen} />
+      <Tab.Screen
+        name="DetectionResults"
+        component={DetectionResults}
+        options={{ title: 'Results' }}
+      />
+    </Tab.Navigator>
   )
 }
 
