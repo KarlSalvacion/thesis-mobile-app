@@ -12,7 +12,7 @@ const NavigationBar = () => {
     <Tab.Navigator
       screenOptions={({ route }) => ({
         headerShown: false,
-        tabBarActiveTintColor: 'rgb(37, 165, 120)rgb(76, 175, 46)',
+        tabBarActiveTintColor: 'rgb(37, 165, 120) ',
         tabBarInactiveTintColor: 'rgb(128, 134, 124)',
         tabBarLabelStyle: { fontSize: 12, fontWeight: '500' },
         tabBarIcon: ({ color, size }) => {

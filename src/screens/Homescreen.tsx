@@ -1,16 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { View, Text, Pressable, ActivityIndicator } from 'react-native'
+import { View, Text, Pressable, ActivityIndicator, ScrollView } from 'react-native'
 import * as DocumentPicker from 'expo-document-picker'
+import * as ImagePicker from 'expo-image-picker'
+import * as FileSystem from 'expo-file-system'
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons'
+import SrtDebugViewer from '../components/SrtDebugViewer'
 
 type SelectedFile = {
   uri: string
   name: string
   size?: number | null
+  type: 'media' | 'srt'
 }
 
 const Homescreen = () => {
-  const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null)
+  const [selectedMedia, setSelectedMedia] = useState<SelectedFile | null>(null)
+  const [selectedSrt, setSelectedSrt] = useState<SelectedFile | null>(null)
   const [status, setStatus] = useState<'idle' | 'picking' | 'ready' | 'uploading' | 'success' | 'error'>('idle')
   const [progress, setProgress] = useState<number>(0)
   const [message, setMessage] = useState<string>('')
@@ -22,41 +27,113 @@ const Homescreen = () => {
     }
   }, [])
 
-  const pickVideo = async () => {
+  const pickMedia = async () => {
+    try {
+      setMessage('')
+      setStatus('picking')
+
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync()
+      if (permission.status !== 'granted') {
+        setStatus(selectedMedia || selectedSrt ? 'ready' : 'idle')
+        setMessage('Permission to access media library is required.')
+        return
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.All,
+        allowsEditing: false,
+        quality: 1
+      })
+
+      if (result.canceled) {
+        setStatus((selectedMedia || selectedSrt) ? 'ready' : 'idle')
+        return
+      }
+
+      const asset = result.assets?.[0]
+      if (asset) {
+        const inferredName = asset.uri.split('/')?.pop() || (asset.type === 'video' ? 'video' : 'image')
+        let size: number | null | undefined = undefined
+        try {
+          const info: any = await FileSystem.getInfoAsync(asset.uri)
+          size = typeof info?.size === 'number' ? info.size : undefined
+        } catch {}
+
+        if (asset.type === 'video' || asset.type === 'image') {
+          setSelectedMedia({
+            uri: asset.uri,
+            name: inferredName,
+            size,
+            type: 'media'
+          })
+          setStatus('ready')
+        } else {
+          setMessage('Please select a valid video or image file.')
+          setStatus('error')
+        }
+      } else {
+        setStatus('idle')
+      }
+    } catch (err) {
+      setMessage('Failed to pick a media file.')
+      setStatus('error')
+    }
+  }
+
+  const pickSrt = async () => {
     try {
       setMessage('')
       setStatus('picking')
       const result = await DocumentPicker.getDocumentAsync({
-        type: 'video/*',
+        type: [
+
+          (DocumentPicker as any).types?.allFiles || 'public.item',
+          // iOS UTTypes
+          'public.item',
+          'public.data',
+          'public.content',
+          'public.text',
+          'public.plain-text',
+          'public.json',
+          'public.srt',
+          // Common MIME types
+          'text/plain',
+          'application/json',
+          '*/*',
+        ],
         multiple: false,
         copyToCacheDirectory: true
       })
 
       if (result.canceled) {
-        setStatus(selectedFile ? 'ready' : 'idle')
+        setStatus((selectedMedia || selectedSrt) ? 'ready' : 'idle')
         return
       }
 
       const file = result.assets?.[0]
       if (file) {
-        setSelectedFile({ uri: file.uri, name: file.name ?? 'video', size: file.size })
+        setSelectedSrt({
+          uri: file.uri,
+          name: file.name ?? 'subtitle.srt',
+          size: file.size,
+          type: 'srt'
+        })
         setStatus('ready')
       } else {
         setStatus('idle')
       }
     } catch (err) {
-      setMessage('Failed to pick a video.')
+      setMessage('Failed to pick an SRT file.')
       setStatus('error')
     }
   }
 
   const mockUpload = async () => {
-    if (!selectedFile) return
+    if (!selectedMedia && !selectedSrt) return
     setStatus('uploading')
     setProgress(0)
     setMessage('')
 
-    // Simulate uploading to a backend server
     let current = 0
     progressTimerRef.current = setInterval(() => {
       current = Math.min(current + Math.random() * 20 + 5, 100)
@@ -75,50 +152,90 @@ const Homescreen = () => {
       clearInterval(progressTimerRef.current)
       progressTimerRef.current = null
     }
-    setSelectedFile(null)
+    setSelectedMedia(null)
+    setSelectedSrt(null)
     setProgress(0)
     setMessage('')
     setStatus('idle')
   }
 
   const isBusy = status === 'picking' || status === 'uploading'
+  const hasAnyFile = selectedMedia || selectedSrt
 
   return (
-    <View className="flex-1 justify-center items-center bg-bgColor1">
-      <View className="justify-center items-center bg-white h-100 py-4 rounded-xl shadow-custom ">
-      <Ionicons name="cloud-upload" size={64} color="rgb(37, 165, 120)" className=" mt-4 mx-auto" />
+    <View className="flex-1 bg-bgColor1">
+      <ScrollView 
+        contentContainerStyle={{ alignItems: 'center', paddingVertical: 24 }}
+        showsVerticalScrollIndicator={false}
+        >
+        <View className="justify-center items-center bg-white h-auto py-4 rounded-xl shadow-custom">
+        <Ionicons name="cloud-upload" size={64} color="rgb(37, 165, 120)" className="mt-4 mx-auto" />
         <Text className="text-2xl font-bold text-gray-800 mb-4">
-          Upload Drone Footage
+          Upload Media & Subtitles
         </Text>
         <Text className="text-gray-600 text-center px-6 mb-6">
-          Pick a video and upload it to the mock backend.
+          Pick a video/photo and upload SRT subtitle file.
         </Text>
 
-        <Pressable
-          onPress={pickVideo}
-          disabled={isBusy}
-          className={`w-[310px] h-[200px] items-center justify-center rounded-md mb-3 border-2 border-greenColor ${isBusy ? 'bg-gray-300' : 'bg-bgColor1'}`}
-        >
-          <FontAwesome6 name='file-video' size={48} color='rgb(37, 165, 120)' />
+        {/* Media Picker */}
+        <View className="mb-4">
+          <Text className="text-lg font-semibold text-gray-700 mb-2 text-center">Media File</Text>
+          <Pressable
+            onPress={pickMedia}
+            disabled={isBusy}
+            className={`w-[310px] h-[150px] items-center justify-center rounded-md mb-3 border-2 border-greenColor ${isBusy ? 'bg-gray-300' : 'bg-bgColor1'}`}
+          >
+            <FontAwesome6 name='file-video' size={40} color='rgb(37, 165, 120)' />
 
-          <Text className="text-greenColor font-bold center text-lg text-center mt-4">
-            {status === 'picking' ? 'Opening picker...' : 'Choose video file'}
-          </Text>
-        </Pressable>
-
-        {selectedFile && (
-          <View className="w-72 bg-white border border-gray-200 rounded-md p-3 mb-3">
-            <Text className="text-gray-800 font-medium" numberOfLines={1}>{selectedFile.name}</Text>
-            <Text className="text-gray-500 text-xs">
-              {selectedFile.size ? `${(selectedFile.size / (1024 * 1024)).toFixed(2)} MB` : 'Size unknown'}
+            <Text className="text-greenColor font-bold center text-base text-center mt-3">
+              {status === 'picking' ? 'Opening picker...' : 'Choose video/image file'}
             </Text>
-          </View>
-        )}
+          </Pressable>
+
+          {selectedMedia && (
+            <View className="w-72 bg-white border border-gray-200 rounded-md p-3 mb-3">
+              <Text className="text-gray-800 font-medium" numberOfLines={1}>{selectedMedia.name}</Text>
+              <Text className="text-gray-500 text-xs">
+                {selectedMedia.size ? `${(selectedMedia.size / (1024 * 1024)).toFixed(2)} MB` : 'Size unknown'}
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {/* SRT File Picker */}
+        <View className="mb-4">
+          <Text className="text-lg font-semibold text-gray-700 mb-2 text-center">Subtitle File (SRT)</Text>
+          <Pressable
+            onPress={pickSrt}
+            disabled={isBusy}
+            className={`w-[310px] h-[100px] items-center justify-center rounded-md mb-3 border-2 border-blue-500 ${isBusy ? 'bg-gray-300' : 'bg-blue-50'}`}
+          >
+            <FontAwesome6 name='file-lines' size={32} color='rgb(59, 130, 246)' />
+
+            <Text className="text-blue-600 font-bold center text-base text-center mt-2">
+              {status === 'picking' ? 'Opening picker...' : 'Choose SRT file'}
+            </Text>
+          </Pressable>
+
+          {selectedSrt && (
+            <View className="w-72 bg-white border border-gray-200 rounded-md p-3 mb-3">
+              <Text className="text-gray-800 font-medium" numberOfLines={1}>{selectedSrt.name}</Text>
+              <Text className="text-gray-500 text-xs">
+                {selectedSrt.size ? `${(selectedSrt.size / 1024).toFixed(2)} KB` : 'Size unknown'}
+              </Text>
+            </View>
+          )}
+
+          {/* Parsed SRT Preview */}
+          {selectedSrt && (
+            <SrtDebugViewer srtUri={selectedSrt.uri} srtName={selectedSrt.name} />
+          )}
+        </View>
 
         <Pressable
           onPress={mockUpload}
-          disabled={!selectedFile || status === 'uploading'}
-          className={` mt-4 h-[45px] w-[310px] justify-center items-center px-4 py-2 rounded-md mb-3 ${(!selectedFile || status === 'uploading') ? 'bg-darkgrayColor' : 'bg-greenColor'}`}
+          disabled={!hasAnyFile || status === 'uploading'}
+          className={`mt-4 h-[45px] w-[310px] justify-center items-center px-4 py-2 rounded-md mb-3 ${(!hasAnyFile || status === 'uploading') ? 'bg-darkgrayColor' : 'bg-greenColor'}`}
         >
           <View className="flex-row items-center">
             {status === 'uploading' && (
@@ -127,7 +244,7 @@ const Homescreen = () => {
               </View>
             )}
             <Text className="text-white font-semibold text-lg">
-              {status === 'uploading' ? 'Uploading...' : 'Upload'}
+              {status === 'uploading' ? 'Uploading...' : 'Upload All Files'}
             </Text>
           </View>
         </Pressable>
@@ -144,13 +261,13 @@ const Homescreen = () => {
           </Text>
         )}
 
-        {(selectedFile || status === 'success' || status === 'error') && (
+        {(hasAnyFile || status === 'success' || status === 'error') && (
           <Pressable onPress={reset} disabled={isBusy} className={`px-4 py-2 rounded-md mt-4 ${isBusy ? 'bg-gray-300' : 'bg-gray-600'}`}>
             <Text className="text-white font-medium">Reset</Text>
           </Pressable>
         )}
-      </View>
-
+        </View>
+      </ScrollView>
     </View>
   )
 }

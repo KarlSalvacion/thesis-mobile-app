@@ -35,26 +35,32 @@ const Mapscreen = () => {
 
       </View>
       
-      <View className='flex-col justify-between items-left mt-4 bg-pink-100 h-[120px] w-[380px] rounded-lg p-4'>
-        <Text className='text-left text-gray-700 mt-2'>Density Overview</Text>
-        <View className='flex-row w-full justify-between  mt-1'>
-          <View className='flex-col justify-center items-center mx-2 bg-gray-200 w-24'>
-            <Text>High</Text>
-            <Text>Sample</Text>
+      <View className="flex-col mt-4 bg-white h-[150px] w-[380px] rounded-2xl p-4 shadow-custom border-2 border-gray-300">
+        <View className="bg-greenColor shadow-custom mb-2 self-start w-fit px-4 py-2 rounded-3xl">
+          <Text className="text-left text-white text-md font-bold">Density Overview</Text>
+        </View>
+        
+
+        <View className="flex-row justify-between items-center mt-2 h-[70px] w-full">
+          {/* Box 1 */}
+          <View className="flex-1 flex-col justify-center items-center  mx-1 rounded-md py-2">
+            <Text className='text- font-bold'>Low</Text>
+            <Text className='text-base font-medium'>Sample</Text>
           </View>
 
-          <View className='flex-col justify-center items-center mx-2 border-l-2 border-r-2 border-gray-300 px-4 w-24'>
-            <Text>High</Text>
-            <Text>Sample</Text>
+          {/* Box 2 */}
+          <View className="flex-1 flex-col justify-center items-center  mx-1 rounded-md py-2">
+            <Text className='text- font-bold'>Medium</Text>
+            <Text className='text-base font-medium'>Sample</Text>
           </View>
 
-          <View className='flex-col justify-center items-center mx-2 w-24'>
-            <Text>High</Text>
-            <Text>Sample</Text>
+          {/* Box 3 */}
+          <View className="flex-1 flex-col justify-center items-center  mx-1 rounded-md py-2">
+            <Text className='text- font-bold'>High</Text>
+            <Text className='text-base font-medium'>Sample</Text>
           </View>
         </View>
       </View>
-
     </View> 
   )
 }
