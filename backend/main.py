@@ -2,7 +2,9 @@ import os
 import datetime
 import time
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import json
 from inference import run_inference_auto, detect_file_type
 from database import (
     insert_detection, insert_frame_metadata, insert_detection_details,
@@ -11,6 +13,13 @@ from database import (
 from srt_parser import parse_srt_file, validate_srt_file
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -25,8 +34,9 @@ async def upload_file(file: UploadFile = File(...)):
     
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     
+    file_bytes = await file.read()
     with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
+        buffer.write(file_bytes)
 
     # Auto-detect file type and run appropriate inference
     detections = run_inference_auto(file_path)
@@ -34,8 +44,13 @@ async def upload_file(file: UploadFile = File(...)):
     # Get the actual file type based on file extension
     actual_file_type = detect_file_type(file_path)
     
-    # Calculate processing time
+    # Calculate processing time and sizes
     processing_time = time.time() - start_time
+    input_size_bytes = len(file_bytes) if file_bytes else None
+    try:
+        result_size_bytes = len(json.dumps(detections).encode('utf-8')) if detections is not None else 0
+    except Exception:
+        result_size_bytes = None
 
     # Handle both image and video results
     if isinstance(detections, list) and len(detections) > 0:
@@ -62,7 +77,9 @@ async def upload_file(file: UploadFile = File(...)):
         summary=summary,
         total_frames=total_frames,
         total_detections=total_detections,
-        processing_time=processing_time
+        processing_time=processing_time,
+        input_size_bytes=input_size_bytes,
+        result_size_bytes=result_size_bytes
     )
 
     # Store individual detection details if any
@@ -96,14 +113,15 @@ async def upload_file(file: UploadFile = File(...)):
                 insert_detection_details(detection_id, detection_data)
 
     return JSONResponse(content={
-        "filename": file.filename,
         "detection_id": detection_id,
-        "detections": detections,
+        "filename": file.filename,
         "file_type": actual_file_type,
         "summary": summary,
         "total_frames": total_frames,
         "total_detections": total_detections,
-        "processing_time": round(processing_time, 2)
+        "processing_time": round(processing_time, 2),
+        "input_size_bytes": input_size_bytes,
+        "result_size_bytes": result_size_bytes
     })
 
 @app.post("/upload-srt/")

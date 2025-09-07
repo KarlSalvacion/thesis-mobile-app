@@ -30,7 +30,7 @@ def run_inference(image_path: str):
         print(f"Error in image inference: {e}")
         return []
 
-def run_video_inference(video_path: str, fps: int = 5):
+def run_video_inference(video_path: str, fps: int = 2):
     """Run inference on a video file."""
     try:
         # Start video prediction
@@ -46,7 +46,9 @@ def run_video_inference(video_path: str, fps: int = 5):
         # Process video results
         all_detections = []
         if "predictions" in results:
-            for frame_result in results["predictions"]:
+            # Cap processed frames to reduce memory/size
+            max_frames = 300
+            for frame_result in results["predictions"][:max_frames]:
                 frame_detections = []
                 for pred in frame_result:
                     frame_detections.append({

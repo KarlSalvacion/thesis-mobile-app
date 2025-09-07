@@ -5,6 +5,63 @@ import * as ImagePicker from 'expo-image-picker'
 import * as FileSystem from 'expo-file-system'
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons'
 import SrtDebugViewer from '../components/SrtDebugViewer'
+function guessMimeType(name: string): string {
+  const lower = name.toLowerCase()
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
+  if (lower.endsWith('.png')) return 'image/png'
+  if (lower.endsWith('.bmp')) return 'image/bmp'
+  if (lower.endsWith('.gif')) return 'image/gif'
+  if (lower.endsWith('.mp4')) return 'video/mp4'
+  if (lower.endsWith('.mov')) return 'video/quicktime'
+  if (lower.endsWith('.avi')) return 'video/x-msvideo'
+  if (lower.endsWith('.mkv')) return 'video/x-matroska'
+  if (lower.endsWith('.srt')) return 'text/plain'
+  return 'application/octet-stream'
+}
+
+async function ensureLocalFilePath(uri: string, fallbackName: string): Promise<string> {
+  // Expo FileSystem can upload content:// URIs directly on Android when using uploadAsync.
+  // Still, when it's a remote or non-file scheme, copy it to cache to be safe.
+  try {
+    if (uri.startsWith('file://') || uri.startsWith('content://')) return uri
+    const dest = `${FileSystem.cacheDirectory}${fallbackName}`
+    await FileSystem.copyAsync({ from: uri, to: dest })
+    return dest
+  } catch {
+    return uri
+  }
+}
+
+import { API_BASE } from '../config'
+
+async function uploadFileToApi(uri: string, name: string) {
+  const type = guessMimeType(name)
+  const fileUri = await ensureLocalFilePath(uri, name)
+  const result = await FileSystem.uploadAsync(`${API_BASE}/upload/`, fileUri, {
+    httpMethod: 'POST',
+    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+    fieldName: 'file',
+    mimeType: type,
+    parameters: {},
+    headers: { Accept: 'application/json' },
+  })
+  if (result.status !== 200) throw new Error(`Upload failed: ${result.status}`)
+  return JSON.parse(result.body)
+}
+
+async function uploadSrtToApi(detectionId: number, uri: string, name: string) {
+  const fileUri = await ensureLocalFilePath(uri, name)
+  const result = await FileSystem.uploadAsync(`${API_BASE}/upload-srt/`, fileUri, {
+    httpMethod: 'POST',
+    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+    fieldName: 'srt_file',
+    mimeType: 'text/plain',
+    parameters: { detection_id: String(detectionId) },
+    headers: { Accept: 'application/json' },
+  })
+  if (result.status !== 200) throw new Error(`SRT upload failed: ${result.status}`)
+  return JSON.parse(result.body)
+}
 
 type SelectedFile = {
   uri: string
@@ -52,7 +109,7 @@ const Homescreen = () => {
 
       const asset = result.assets?.[0]
       if (asset) {
-        const inferredName = asset.uri.split('/')?.pop() || (asset.type === 'video' ? 'video' : 'image')
+        const inferredName = asset.uri.split('/')?.pop() || (asset.type === 'video' ? 'video.mp4' : 'image.jpg')
         let size: number | null | undefined = undefined
         try {
           const info: any = await FileSystem.getInfoAsync(asset.uri)
@@ -130,21 +187,33 @@ const Homescreen = () => {
 
   const mockUpload = async () => {
     if (!selectedMedia && !selectedSrt) return
-    setStatus('uploading')
-    setProgress(0)
-    setMessage('')
+    try {
+      setStatus('uploading')
+      setProgress(10)
+      setMessage('')
 
-    let current = 0
-    progressTimerRef.current = setInterval(() => {
-      current = Math.min(current + Math.random() * 20 + 5, 100)
-      setProgress(current)
-      if (current >= 100 && progressTimerRef.current !== null) {
+      let detectionId: number | null = null
+      if (selectedMedia) {
+        const res = await uploadFileToApi(selectedMedia.uri, selectedMedia.name)
+        detectionId = res?.detection_id ?? null
+      }
+      setProgress(60)
+
+      if (selectedSrt && detectionId) {
+        await uploadSrtToApi(detectionId, selectedSrt.uri, selectedSrt.name)
+      }
+      setProgress(100)
+      setStatus('success')
+      setMessage('Upload complete.')
+    } catch (e: any) {
+      setStatus('error')
+      setMessage(e?.message || 'Upload failed')
+    } finally {
+      if (progressTimerRef.current !== null) {
         clearInterval(progressTimerRef.current)
         progressTimerRef.current = null
-        setStatus('success')
-        setMessage('Upload complete (mock).')
       }
-    }, 400) as unknown as number
+    }
   }
 
   const reset = () => {

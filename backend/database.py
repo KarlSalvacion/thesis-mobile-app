@@ -19,7 +19,9 @@ def init_db():
             summary TEXT,
             total_frames INTEGER DEFAULT 0,
             total_detections INTEGER DEFAULT 0,
-            processing_time REAL DEFAULT 0.0
+            processing_time REAL DEFAULT 0.0,
+            input_size_bytes INTEGER,
+            result_size_bytes INTEGER
         )
     """)
     
@@ -73,15 +75,25 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_weed_class ON detection_details(weed_class)")
     
     conn.commit()
+
+    # Backfill columns for older DBs (SQLite lacks IF NOT EXISTS for columns)
+    try:
+        cursor.execute("ALTER TABLE detections ADD COLUMN input_size_bytes INTEGER")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE detections ADD COLUMN result_size_bytes INTEGER")
+    except Exception:
+        pass
     conn.close()
 
-def insert_detection(filename, timestamp, file_type, summary, total_frames=0, total_detections=0, processing_time=0.0):
+def insert_detection(filename, timestamp, file_type, summary, total_frames=0, total_detections=0, processing_time=0.0, input_size_bytes=None, result_size_bytes=None):
     """Insert a new detection session record."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO detections (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time)
+        "INSERT INTO detections (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes)
     )
     detection_id = cursor.lastrowid
     conn.commit()
