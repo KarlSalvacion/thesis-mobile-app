@@ -29,25 +29,7 @@ function msToTimestamp(totalMs: number): string {
 }
 
 export function parseSrtString(input: string): SrtParseResult {
-  // Try library-based parsing first for broader SRT variants (e.g., DJI telemetry)
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const subtitlesParser = require('subtitles-parser')
-    const cues = (subtitlesParser.fromSrt(input, true) || []).map((c: any, idx: number) => {
-      const index = typeof c.id === 'number' ? c.id : idx + 1
-      const startMs = typeof c.startTime === 'number' ? c.startTime : parseInt(c.startTime)
-      const endMs = typeof c.endTime === 'number' ? c.endTime : parseInt(c.endTime)
-      return {
-        index,
-        startMs,
-        endMs,
-        start: msToTimestamp(startMs),
-        end: msToTimestamp(endMs),
-        text: String(c.text ?? ''),
-      } as SrtCue
-    })
-    return { cues, errors: [] }
-  } catch {}
+  // Parse locally without external deps to avoid install issues
 
   const normalized = input.replace(/\r\n|\r/g, '\n').trim()
   const lines = normalized.split('\n')
