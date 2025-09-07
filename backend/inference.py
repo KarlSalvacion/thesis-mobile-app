@@ -1,8 +1,9 @@
 import os
 from roboflow import Roboflow
 
-# Initialize Roboflow client
-rf = Roboflow(api_key="RpeaIrOXAbnFIfwEbbdB")
+# Initialize Roboflow client (prefer env var in production)
+_rf_key = os.getenv("ROBOFLOW_API_KEY", "RpeaIrOXAbnFIfwEbbdB")
+rf = Roboflow(api_key=_rf_key)
 project = rf.workspace().project("thesis-online-gathered-ds-y6uy4")
 model = project.version("1").model
 

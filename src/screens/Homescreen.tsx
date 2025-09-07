@@ -34,6 +34,8 @@ async function ensureLocalFilePath(uri: string, fallbackName: string): Promise<s
 
 import { API_BASE } from '../config'
 
+console.log('API_BASE =', API_BASE)
+
 async function uploadFileToApi(uri: string, name: string) {
   const type = guessMimeType(name)
   const fileUri = await ensureLocalFilePath(uri, name)
