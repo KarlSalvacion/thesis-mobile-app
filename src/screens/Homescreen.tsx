@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react'
-import { View, Text, Pressable, ActivityIndicator, ScrollView } from 'react-native'
+import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { View, Text, Pressable, ActivityIndicator, ScrollView, RefreshControl } from 'react-native'
 import * as DocumentPicker from 'expo-document-picker'
 import * as ImagePicker from 'expo-image-picker'
 import * as FileSystem from 'expo-file-system'
@@ -53,15 +53,19 @@ async function uploadFileToApi(uri: string, name: string) {
 
 async function uploadSrtToApi(detectionId: number, uri: string, name: string) {
   const fileUri = await ensureLocalFilePath(uri, name)
-  const result = await FileSystem.uploadAsync(`${API_BASE}/upload-srt/`, fileUri, {
+  const url = `${API_BASE}/upload-srt/?detection_id=${encodeURIComponent(String(detectionId))}`
+  const result = await FileSystem.uploadAsync(url, fileUri, {
     httpMethod: 'POST',
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
     fieldName: 'srt_file',
     mimeType: 'text/plain',
-    parameters: { detection_id: String(detectionId) },
     headers: { Accept: 'application/json' },
   })
-  if (result.status !== 200) throw new Error(`SRT upload failed: ${result.status}`)
+  if (result.status !== 200) {
+    let body = ''
+    try { body = result.body ? `: ${result.body}` : '' } catch {}
+    throw new Error(`SRT upload failed: ${result.status}${body}`)
+  }
   return JSON.parse(result.body)
 }
 
@@ -233,12 +237,21 @@ const Homescreen = () => {
   const isBusy = status === 'picking' || status === 'uploading'
   const hasAnyFile = selectedMedia || selectedSrt
 
+  const onRefresh = useCallback(async () => {
+    // Soft refresh UI state; optionally ping backend to ensure API_BASE is reachable
+    try {
+      setStatus('idle')
+      setMessage('')
+      // Optional: await fetch(`${API_BASE}/detections/`).catch(() => {})
+    } catch {}
+  }, [])
+
   return (
     <View className="flex-1 bg-bgColor1">
       <ScrollView 
         contentContainerStyle={{ alignItems: 'center', paddingVertical: 24 }}
         showsVerticalScrollIndicator={false}
-        >
+        refreshControl={<RefreshControl refreshing={false} onRefresh={onRefresh} />}>
         <View className="justify-center items-center bg-white h-auto py-4 rounded-xl shadow-custom">
         <Ionicons name="cloud-upload" size={64} color="rgb(37, 165, 120)" className="mt-4 mx-auto" />
         <Text className="text-2xl font-bold text-gray-800 mb-4">

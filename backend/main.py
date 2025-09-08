@@ -4,6 +4,7 @@ import time
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 import json
 from inference import run_inference_auto, detect_file_type
 from database import (
@@ -22,6 +23,9 @@ app.add_middleware(
 )
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Serve uploaded media statically for frontend previews
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Initialize DB
 from database import init_db
