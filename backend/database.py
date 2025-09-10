@@ -47,6 +47,31 @@ def init_db():
         )
     """)
     
+    # Compact SRT track storage (aggregated per session)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS srt_tracks (
+            detection_id INTEGER PRIMARY KEY,
+            point_count INTEGER NOT NULL,
+            start_time TEXT,
+            end_time TEXT,
+            bounds_geojson TEXT,
+            path_geojson TEXT NOT NULL,
+            frames_json TEXT NOT NULL,
+            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+        )
+    """)
+
+    # Optional aggregated heatmap storage per session (grid-based)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS heatmaps (
+            detection_id INTEGER PRIMARY KEY,
+            grid_size_m REAL NOT NULL,
+            bounds_geojson TEXT,
+            cells_json TEXT NOT NULL,
+            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+        )
+    """)
+    
     # Individual detection details table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS detection_details (
@@ -85,6 +110,39 @@ def init_db():
         cursor.execute("ALTER TABLE detections ADD COLUMN result_size_bytes INTEGER")
     except Exception:
         pass
+    conn.close()
+
+def reset_compact_tables():
+    """Drop and recreate compact SRT/heatmap tables to reset data."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # Drop if exist
+    cursor.execute("DROP TABLE IF EXISTS srt_tracks")
+    cursor.execute("DROP TABLE IF EXISTS heatmaps")
+    conn.commit()
+    # Recreate
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS srt_tracks (
+            detection_id INTEGER PRIMARY KEY,
+            point_count INTEGER NOT NULL,
+            start_time TEXT,
+            end_time TEXT,
+            bounds_geojson TEXT,
+            path_geojson TEXT NOT NULL,
+            frames_json TEXT NOT NULL,
+            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS heatmaps (
+            detection_id INTEGER PRIMARY KEY,
+            grid_size_m REAL NOT NULL,
+            bounds_geojson TEXT,
+            cells_json TEXT NOT NULL,
+            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+        )
+    """)
+    conn.commit()
     conn.close()
 
 def insert_detection(filename, timestamp, file_type, summary, total_frames=0, total_detections=0, processing_time=0.0, input_size_bytes=None, result_size_bytes=None):
@@ -159,9 +217,9 @@ def fetch_detection_session(detection_id):
         conn.close()
         return None
     
-    # Get frame metadata
-    cursor.execute("SELECT * FROM frame_metadata WHERE detection_id = ? ORDER BY frame_number", (detection_id,))
-    frame_metadata = cursor.fetchall()
+    # Get compact SRT track (if available)
+    cursor.execute("SELECT detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json FROM srt_tracks WHERE detection_id = ?", (detection_id,))
+    srt_track = cursor.fetchone()
     
     # Get detection details
     cursor.execute("SELECT * FROM detection_details WHERE detection_id = ? ORDER BY frame_number, id", (detection_id,))
@@ -171,9 +229,48 @@ def fetch_detection_session(detection_id):
     
     return {
         'detection': detection,
-        'frame_metadata': frame_metadata,
+        'srt_track': srt_track,
         'detection_details': detection_details
     }
+
+def upsert_srt_track(detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json):
+    """Insert or replace compact SRT track for a detection session."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO srt_tracks (detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(detection_id) DO UPDATE SET
+            point_count=excluded.point_count,
+            start_time=excluded.start_time,
+            end_time=excluded.end_time,
+            bounds_geojson=excluded.bounds_geojson,
+            path_geojson=excluded.path_geojson,
+            frames_json=excluded.frames_json
+        """,
+        (detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json)
+    )
+    conn.commit()
+    conn.close()
+
+def upsert_heatmap(detection_id, grid_size_m, bounds_geojson, cells_json):
+    """Insert or replace aggregated heatmap data for a detection session."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO heatmaps (detection_id, grid_size_m, bounds_geojson, cells_json)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(detection_id) DO UPDATE SET
+            grid_size_m=excluded.grid_size_m,
+            bounds_geojson=excluded.bounds_geojson,
+            cells_json=excluded.cells_json
+        """,
+        (detection_id, grid_size_m, bounds_geojson, cells_json)
+    )
+    conn.commit()
+    conn.close()
 
 def fetch_all_detections():
     """Return all detection session records."""
