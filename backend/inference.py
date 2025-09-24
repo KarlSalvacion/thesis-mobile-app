@@ -1,15 +1,24 @@
 import os
 from roboflow import Roboflow
+from config import (
+    ROBOFLOW_API_KEY, 
+    ROBOFLOW_PROJECT, 
+    ROBOFLOW_VERSION,
+    DEFAULT_CONFIDENCE,
+    DEFAULT_OVERLAP,
+    DEFAULT_VIDEO_FPS,
+    MAX_VIDEO_FRAMES
+)
 
 # Initialize Roboflow client
-rf = Roboflow(api_key="RpeaIrOXAbnFIfwEbbdB")
-project = rf.workspace().project("thesis-online-gathered-ds-y6uy4")
-model = project.version("1").model
+rf = Roboflow(api_key=ROBOFLOW_API_KEY)
+project = rf.workspace().project(ROBOFLOW_PROJECT)
+model = project.version(ROBOFLOW_VERSION).model
 
 def run_inference(image_path: str):
     """Run inference on a single image."""
     try:
-        result = model.predict(image_path, confidence=40, overlap=30).json()
+        result = model.predict(image_path, confidence=DEFAULT_CONFIDENCE, overlap=DEFAULT_OVERLAP).json()
         
         detections = []
         if "predictions" in result:
@@ -30,7 +39,7 @@ def run_inference(image_path: str):
         print(f"Error in image inference: {e}")
         return []
 
-def run_video_inference(video_path: str, fps: int = 2):
+def run_video_inference(video_path: str, fps: int = DEFAULT_VIDEO_FPS):
     """Run inference on a video file."""
     try:
         # Start video prediction
@@ -47,7 +56,7 @@ def run_video_inference(video_path: str, fps: int = 2):
         all_detections = []
         if "predictions" in results:
             # Cap processed frames to reduce memory/size
-            max_frames = 300
+            max_frames = MAX_VIDEO_FRAMES
             for frame_result in results["predictions"][:max_frames]:
                 frame_detections = []
                 for pred in frame_result:
