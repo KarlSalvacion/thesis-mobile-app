@@ -8,6 +8,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import json
 from inference import run_inference_auto, detect_file_type
+from io import BytesIO
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 from database import (
     insert_detection, insert_frame_metadata, insert_detection_details,
     fetch_detection_session, fetch_all_detections, get_detection_statistics,
