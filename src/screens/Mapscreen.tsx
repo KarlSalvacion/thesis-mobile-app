@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import { View, Text, ActivityIndicator, Pressable } from 'react-native';
+import { View, Text, ActivityIndicator, Pressable, ScrollView, RefreshControl } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 import { API_BASE } from '../config';
 
 // Types
@@ -13,7 +14,8 @@ type DetectionRow = [
   total_detections: number,
   processing_time: number,
   input_size_bytes: number | null,
-  result_size_bytes: number | null
+  result_size_bytes: number | null,
+  has_srt_data: boolean | null
 ];
 
 type GMapPoint = { lat: number, lng: number };
@@ -67,19 +69,28 @@ const Mapscreen = () => {
     try {
       if (!opts?.silent) setLoading(true);
       setError('');
-      const res = await fetch(`${API_BASE}/detections/`);
-      const json = await res.json();
-      const rows: DetectionRow[] = json?.detections ?? [];
-      const latest = rows?.[0] ?? null;
-      if (!latest) {
-        setError('No detection sessions found.');
-        setLatestDetection(null);
+      
+      // First, get the most recent detection (regardless of SRT status)
+      const allRes = await fetch(`${API_BASE}/detections/`);
+      const allJson = await allRes.json();
+      const allRows: DetectionRow[] = allJson?.detections ?? [];
+      const mostRecent = allRows?.[0] ?? null;
+      
+      // Check if the most recent detection has SRT data
+      if (!mostRecent || !mostRecent[10]) { // has_srt_data is at index 10
+        const fileType = mostRecent ? mostRecent[3] : 'unknown';
+        const fileName = mostRecent ? mostRecent[1] : 'unknown';
+        setError(`Most recent detection (${fileName} - ${fileType}) has no GPS data. Upload a video with SRT file to view map data.`);
+        setLatestDetection(mostRecent); // Still show the detection info
         setDetails([]);
         setPolyline([]);
         setBounds(null);
         setHeatPoints([]);
         return;
       }
+      
+      // If most recent has SRT data, use it for mapping
+      const latest = mostRecent;
       const detId = latest[0];
       // fetch session details (for detection_details stats)
       const res2 = await fetch(`${API_BASE}/detection/${detId}`);
@@ -113,9 +124,20 @@ const Mapscreen = () => {
     }
   }, []);
 
+  // Initial load
   useEffect(() => {
     load();
-  }, [load]);
+  }, []);
+
+  // Auto-refresh when screen comes into focus (after initial load)
+  useFocusEffect(
+    useCallback(() => {
+      // Only refresh if we're not loading initially and have some data or error
+      if (!loading) {
+        load({ silent: true });
+      }
+    }, [loading])
+  );
 
   const density = useMemo(() => {
     const byFrame: Record<number, number> = {};
@@ -146,7 +168,18 @@ const Mapscreen = () => {
   }
 
   return (
-    <View className="flex-1 w-full bg-bgColor1 items-center justify-start pt-6 pb-4">
+    <ScrollView 
+      className="flex-1 bg-bgColor1"
+      contentContainerStyle={{ alignItems: 'center', paddingTop: 24, paddingBottom: 16 }}
+      refreshControl={
+        <RefreshControl
+          refreshing={loading}
+          onRefresh={() => load()}
+          colors={['#2563eb']}
+          tintColor="#2563eb"
+        />
+      }
+    >
       {/* Map view placed where the green section was */}
       <View className='h-[310px] w-[95vw] max-w-[420px] rounded-lg overflow-hidden bg-white shadow-custom border-2 border-gray-300 items-center justify-center'>
         <LeafletWebMap polyline={polyline} heat={heatPoints} setScrollEnabled={setScrollEnabled} />
@@ -208,10 +241,14 @@ const Mapscreen = () => {
             <Text className='text-xs text-gray-500 text-center mt-1'>
               Detected on {formatAmPm(latestDetection[2])}
             </Text>
+            <View className="flex-row items-center justify-center mt-1">
+              <View className="w-2 h-2 bg-green-500 rounded-full mr-1" />
+              <Text className='text-xs text-green-600 font-medium'>GPS Data Available</Text>
+            </View>
           </View>
         )}
       </View>
-    </View>
+    </ScrollView>
   );
 };
 

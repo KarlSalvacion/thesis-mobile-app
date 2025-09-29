@@ -51,22 +51,43 @@ async function uploadFileToApi(uri: string, name: string) {
   return JSON.parse(result.body)
 }
 
-async function uploadSrtToApi(detectionId: number, uri: string, name: string) {
-  const fileUri = await ensureLocalFilePath(uri, name)
-  const url = `${API_BASE}/upload-srt/?detection_id=${encodeURIComponent(String(detectionId))}`
-  const result = await FileSystem.uploadAsync(url, fileUri, {
-    httpMethod: 'POST',
-    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
-    fieldName: 'srt_file',
-    mimeType: 'text/plain',
-    headers: { Accept: 'application/json' },
+async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFile) {
+  // Prepare form data for multipart upload
+  const formData = new FormData()
+  
+  // Add media file
+  const mediaUri = await ensureLocalFilePath(mediaFile.uri, mediaFile.name)
+  const mediaType = guessMimeType(mediaFile.name)
+  
+  formData.append('media_file', {
+    uri: mediaUri,
+    name: mediaFile.name,
+    type: mediaType,
+  } as any)
+  
+  // Add SRT file
+  const srtUri = await ensureLocalFilePath(srtFile.uri, srtFile.name)
+  formData.append('srt_file', {
+    uri: srtUri,
+    name: srtFile.name,
+    type: 'text/plain',
+  } as any)
+
+  const response = await fetch(`${API_BASE}/upload-combined/`, {
+    method: 'POST',
+    body: formData,
+    headers: {
+      'Content-Type': 'multipart/form-data',
+      Accept: 'application/json',
+    },
   })
-  if (result.status !== 200) {
-    let body = ''
-    try { body = result.body ? `: ${result.body}` : '' } catch {}
-    throw new Error(`SRT upload failed: ${result.status}${body}`)
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`Upload failed: ${response.status} - ${errorText}`)
   }
-  return JSON.parse(result.body)
+
+  return await response.json()
 }
 
 type SelectedFile = {
@@ -193,24 +214,38 @@ const Homescreen = () => {
 
   const mockUpload = async () => {
     if (!selectedMedia && !selectedSrt) return
+    
     try {
       setStatus('uploading')
       setProgress(10)
       setMessage('')
 
-      let detectionId: number | null = null
-      if (selectedMedia) {
-        const res = await uploadFileToApi(selectedMedia.uri, selectedMedia.name)
-        detectionId = res?.detection_id ?? null
+      // Validate upload combination
+      if (selectedSrt && !selectedMedia) {
+        throw new Error('SRT file cannot be uploaded without a media file')
       }
-      setProgress(60)
 
-      if (selectedSrt && detectionId) {
-        await uploadSrtToApi(detectionId, selectedSrt.uri, selectedSrt.name)
+      const isVideo = selectedMedia?.name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i)
+      const isImage = selectedMedia?.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i)
+
+      if (selectedSrt && isImage) {
+        throw new Error('SRT files can only be uploaded with video files, not images')
       }
+
+      setProgress(30)
+
+      // Use combined upload endpoint if both files are selected
+      if (selectedMedia && selectedSrt) {
+        const result = await uploadCombinedFiles(selectedMedia, selectedSrt)
+        setMessage(result.message || 'Upload complete with GPS data.')
+      } else if (selectedMedia) {
+        // Upload media only
+        const result = await uploadFileToApi(selectedMedia.uri, selectedMedia.name)
+        setMessage(`${result.summary} (No GPS data - image only or video without SRT)`)
+      }
+
       setProgress(100)
       setStatus('success')
-      setMessage('Upload complete.')
     } catch (e: any) {
       setStatus('error')
       setMessage(e?.message || 'Upload failed')
@@ -287,8 +322,11 @@ const Homescreen = () => {
         </View>
 
         {/* SRT File Picker */}
-        <View className="mb-4">
+        <View className="mb-4 items-center">
           <Text className="text-lg font-semibold text-gray-700 mb-2 text-center">Subtitle File (SRT)</Text>
+          <Text className="text-xs text-gray-500 text-center mb-2 px-4">
+            Optional for videos. Provides GPS coordinates for mapping. Cannot be used with images.
+          </Text>
           <Pressable
             onPress={pickSrt}
             disabled={isBusy}
@@ -297,7 +335,7 @@ const Homescreen = () => {
             <FontAwesome6 name='file-lines' size={32} color='rgb(59, 130, 246)' />
 
             <Text className="text-blue-600 font-bold center text-base text-center mt-2">
-              {status === 'picking' ? 'Opening picker...' : 'Choose SRT file'}
+              {status === 'picking' ? 'Opening picker...' : 'Choose SRT file (Optional)'}
             </Text>
           </Pressable>
 
@@ -318,8 +356,12 @@ const Homescreen = () => {
 
         <Pressable
           onPress={mockUpload}
-          disabled={!hasAnyFile || status === 'uploading'}
-          className={`mt-4 h-[45px] w-[310px] justify-center items-center px-4 py-2 rounded-md mb-3 ${(!hasAnyFile || status === 'uploading') ? 'bg-darkgrayColor' : 'bg-greenColor'}`}
+          disabled={!hasAnyFile || status === 'uploading' || 
+            (selectedSrt && !selectedMedia) ||
+            (selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i))}
+          className={`mt-4 h-[45px] w-[310px] justify-center items-center px-4 py-2 rounded-md mb-3 ${(!hasAnyFile || status === 'uploading' || 
+            (selectedSrt && !selectedMedia) ||
+            (selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i))) ? 'bg-darkgrayColor' : 'bg-greenColor'}`}
         >
           <View className="flex-row items-center">
             {status === 'uploading' && (
@@ -336,6 +378,28 @@ const Homescreen = () => {
         {status === 'uploading' && (
           <View className="w-72 h-3 bg-gray-200 rounded-full overflow-hidden mb-3">
             <View style={{ width: `${progress}%` }} className="h-3 bg-blue-600" />
+          </View>
+        )}
+
+        {/* Validation warnings */}
+        {selectedSrt && !selectedMedia && (
+          <View className="w-72 bg-yellow-50 border border-yellow-300 rounded-md p-3 mb-3">
+            <Text className="text-yellow-800 text-sm font-medium">⚠️ SRT file requires a media file</Text>
+            <Text className="text-yellow-700 text-xs">Please select a video or image file first.</Text>
+          </View>
+        )}
+        
+        {selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i) && (
+          <View className="w-72 bg-red-50 border border-red-300 rounded-md p-3 mb-3">
+            <Text className="text-red-800 text-sm font-medium">❌ SRT files cannot be used with images</Text>
+            <Text className="text-red-700 text-xs">SRT files provide GPS data for video mapping only.</Text>
+          </View>
+        )}
+
+        {selectedMedia && !selectedSrt && !!selectedMedia.name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i) && (
+          <View className="w-72 bg-blue-50 border border-blue-300 rounded-md p-3 mb-3">
+            <Text className="text-blue-800 text-sm font-medium">ℹ️ Video without GPS data</Text>
+            <Text className="text-blue-700 text-xs">Upload an SRT file to enable map visualization of detection locations.</Text>
           </View>
         )}
 

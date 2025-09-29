@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react'
-import { View, Text, ScrollView, ActivityIndicator, RefreshControl, Image } from 'react-native'
-import { Ionicons, FontAwesome6 } from '@expo/vector-icons'
+import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import { View, Text, ActivityIndicator, ScrollView, RefreshControl, Image } from 'react-native';
+import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
+import { useFocusEffect } from '@react-navigation/native';
 import { API_BASE } from '../config'
 
 type DetectionRow = [
@@ -13,7 +14,8 @@ type DetectionRow = [
   total_detections: number,
   processing_time: number,
   input_size_bytes: number | null,
-  result_size_bytes: number | null
+  result_size_bytes: number | null,
+  has_srt_data: boolean | null
 ]
 
 type FrameMetadataRow = [
@@ -101,21 +103,12 @@ const DetectionResults = () => {
     }
   }, [])
 
-  useEffect(() => {
-    let active = true
-    async function boot() {
-      try {
-        await load()
-      } catch {
-      } finally {
-        active = false
-      }
-    }
-    boot()
-    return () => {
-      active = false
-    }
-  }, [load])
+  // Auto-refresh when screen comes into focus
+  useFocusEffect(
+    useCallback(() => {
+      load()
+    }, [load])
+  )
 
   const summary = useMemo(() => {
     if (!latestDetection) return null
@@ -239,6 +232,21 @@ const DetectionResults = () => {
               <Text className="text-xs text-gray-500 text-center mt-1">
                 {summary?.timestamp ? `Detected on ${formatAmPm(summary.timestamp)}` : 'No recent session'}
               </Text>
+              {latestDetection && (
+                <View className="flex-row items-center justify-center mt-2">
+                  {latestDetection[10] ? (
+                    <>
+                      <View className="w-2 h-2 bg-green-500 rounded-full mr-1" />
+                      <Text className='text-xs text-green-600 font-medium'>GPS Data Available</Text>
+                    </>
+                  ) : (
+                    <>
+                      <View className="w-2 h-2 bg-gray-400 rounded-full mr-1" />
+                      <Text className='text-xs text-gray-500 font-medium'>No GPS Data</Text>
+                    </>
+                  )}
+                </View>
+              )}
             </View>
           </View>
         </View>

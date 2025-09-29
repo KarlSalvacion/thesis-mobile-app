@@ -1,24 +1,20 @@
 import os
 import datetime
 import time
+import sqlite3
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import json
 from inference import run_inference_auto, detect_file_type
-from io import BytesIO
-try:
-    from PIL import Image
-except Exception:
-    Image = None
 from database import (
     insert_detection, insert_frame_metadata, insert_detection_details,
     fetch_detection_session, fetch_all_detections, get_detection_statistics,
-    upsert_srt_track, reset_compact_tables
+    upsert_srt_track, reset_compact_tables, update_srt_status, DB_NAME, init_db,
+    fetch_detections_by_class, upsert_heatmap
 )
 from srt_parser import parse_srt_file, validate_srt_file
-from database import DB_NAME
 
 app = FastAPI()
 app.add_middleware(
@@ -35,12 +31,192 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Initialize DB
-from database import init_db
 init_db()
+
+@app.post("/upload-combined/")
+async def upload_combined_files(
+    media_file: UploadFile = File(..., description="Video or image file"),
+    srt_file: UploadFile = File(None, description="Optional SRT file for video")
+):
+    """Upload and process media file with optional SRT file for enhanced validation."""
+    start_time = time.time()
+    
+    # Validate file types
+    media_filename = media_file.filename.lower()
+    if not (media_filename.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.mp4', '.mov', '.avi', '.mkv'))):
+        raise HTTPException(status_code=400, detail="Media file must be an image or video")
+    
+    is_video = media_filename.endswith(('.mp4', '.mov', '.avi', '.mkv'))
+    is_image = media_filename.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif'))
+    
+    # Validation rules
+    if srt_file and is_image:
+        raise HTTPException(status_code=400, detail="SRT files can only be uploaded with video files, not images")
+    
+    if srt_file and not srt_file.filename.lower().endswith('.srt'):
+        raise HTTPException(status_code=400, detail="SRT file must have .srt extension")
+    
+    # Process media file first
+    media_path = os.path.join(UPLOAD_DIR, media_file.filename)
+    media_bytes = await media_file.read()
+    if not media_bytes:
+        raise HTTPException(status_code=400, detail="Empty media file")
+    
+    with open(media_path, "wb") as buffer:
+        buffer.write(media_bytes)
+    
+    # Run inference
+    print("Starting inference...")
+    detections = run_inference_auto(media_path)
+    print(f"Inference completed in {time.time() - start_time:.2f} seconds")
+    
+    # Get file type and process results
+    actual_file_type = detect_file_type(media_path)
+    processing_time = time.time() - start_time
+    input_size_bytes = len(media_bytes)
+    
+    try:
+        result_size_bytes = len(json.dumps(detections).encode('utf-8')) if detections is not None else 0
+    except Exception:
+        result_size_bytes = None
+
+    # Calculate detection summary
+    if isinstance(detections, list) and len(detections) > 0:
+        if isinstance(detections[0], list):  # Video results
+            total_frames = len(detections)
+            total_detections = sum(len(frame) for frame in detections)
+            summary = f"Detected {total_detections} objects across {total_frames} frames"
+        else:  # Image results
+            total_frames = 1
+            total_detections = len(detections)
+            summary = f"Detected {total_detections} objects"
+    else:
+        total_frames = 1 if actual_file_type == "image" else 0
+        total_detections = 0
+        summary = "No objects detected"
+    
+    timestamp = datetime.datetime.now().isoformat()
+    has_srt_data = srt_file is not None
+
+    # Insert detection record
+    detection_id = insert_detection(
+        filename=media_file.filename,
+        timestamp=timestamp,
+        file_type=actual_file_type,
+        summary=summary,
+        total_frames=total_frames,
+        total_detections=total_detections,
+        processing_time=processing_time,
+        input_size_bytes=input_size_bytes,
+        result_size_bytes=result_size_bytes,
+        has_srt_data=has_srt_data
+    )
+
+    # Store detection details
+    if detections and len(detections) > 0:
+        print(f"Storing detection details...")
+        detail_count = 0
+        for frame_idx, frame_detections in enumerate(detections if isinstance(detections[0], list) else [detections]):
+            for det in frame_detections:
+                insert_detection_details(detection_id, {
+                    'frame_number': frame_idx + 1,
+                    'weed_class': det.get('class', 'unknown'),
+                    'confidence': det.get('confidence', 0.0),
+                    'bbox_x': det.get('bbox', [0, 0, 0, 0])[0],
+                    'bbox_y': det.get('bbox', [0, 0, 0, 0])[1],
+                    'bbox_width': det.get('bbox', [0, 0, 0, 0])[2],
+                    'bbox_height': det.get('bbox', [0, 0, 0, 0])[3],
+                    'detection_timestamp': timestamp
+                })
+                detail_count += 1
+        print(f"Stored {detail_count} detection details")
+
+    # Process SRT file if provided
+    srt_message = ""
+    if srt_file:
+        try:
+            srt_content = await srt_file.read()
+            srt_text = srt_content.decode('utf-8')
+            
+            if not validate_srt_file(srt_text):
+                raise HTTPException(status_code=400, detail="Invalid SRT file format")
+            
+            frames = parse_srt_file(srt_text)
+            if not frames:
+                raise HTTPException(status_code=400, detail="No valid frame data found in SRT file")
+
+            # Build compact track
+            coords = []
+            min_lat = min_lon = float("inf")
+            max_lat = max_lon = float("-inf")
+            compact_frames = []
+            
+            for f in frames:
+                lat = f.get('latitude')
+                lon = f.get('longitude')
+                if lat is None or lon is None:
+                    continue
+                coords.append([lon, lat])
+                if lat < min_lat: min_lat = lat
+                if lat > max_lat: max_lat = lat
+                if lon < min_lon: min_lon = lon
+                if lon > max_lon: max_lon = lon
+                compact_frames.append({
+                    'i': f.get('frame_number'),
+                    't': f.get('timestamp'),
+                    'lat': lat,
+                    'lon': lon,
+                    'alt': f.get('altitude')
+                })
+
+            if coords:
+                start_time_srt = frames[0].get('timestamp') if frames else None
+                end_time_srt = frames[-1].get('timestamp') if frames else None
+
+                bounds_geojson = json.dumps({
+                    'type': 'Feature',
+                    'properties': {},
+                    'geometry': {
+                        'type': 'Polygon',
+                        'coordinates': [[
+                            [min_lon, min_lat],
+                            [max_lon, min_lat],
+                            [max_lon, max_lat],
+                            [min_lon, max_lat],
+                            [min_lon, min_lat]
+                        ]]
+                    }
+                })
+
+                path_geojson = json.dumps({
+                    'type': 'Feature',
+                    'properties': {'detection_id': detection_id},
+                    'geometry': {'type': 'LineString', 'coordinates': coords}
+                })
+
+                frames_json = json.dumps(compact_frames)
+
+                upsert_srt_track(detection_id, len(coords), start_time_srt, end_time_srt, bounds_geojson, path_geojson, frames_json)
+                srt_message = f" with {len(coords)} GPS points"
+            else:
+                srt_message = " (SRT file contained no GPS coordinates)"
+                
+        except Exception as e:
+            # Don't fail the entire upload if SRT processing fails
+            srt_message = f" (SRT processing failed: {str(e)})"
+            update_srt_status(detection_id, False)
+
+    return JSONResponse({
+        "message": f"File uploaded and processed successfully{srt_message}",
+        "detection_id": detection_id,
+        "summary": summary,
+        "processing_time": f"{processing_time:.2f}s",
+        "has_srt_data": has_srt_data and srt_message and "failed" not in srt_message
+    })
 
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload and process a video or image file for weed detection with optimizations."""
+    """Upload and process a video or image file for weed detection (legacy endpoint)."""
     start_time = time.time()
     
     file_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -99,7 +275,7 @@ async def upload_file(file: UploadFile = File(...)):
     
     timestamp = datetime.datetime.now().isoformat()
 
-    # Insert main detection record
+    # Insert main detection record (legacy endpoint - no SRT data)
     detection_id = insert_detection(
         filename=file.filename,
         timestamp=timestamp,
@@ -109,7 +285,8 @@ async def upload_file(file: UploadFile = File(...)):
         total_detections=total_detections,
         processing_time=processing_time,
         input_size_bytes=input_size_bytes,
-        result_size_bytes=result_size_bytes
+        result_size_bytes=result_size_bytes,
+        has_srt_data=False  # Legacy endpoint never has SRT data
     )
 
     # Store individual detection details if any (with batch optimization)
@@ -260,6 +437,16 @@ async def get_detections():
     detections = fetch_all_detections()
     return {"detections": detections}
 
+@app.get("/detections/with-srt/")
+async def get_detections_with_srt():
+    """Get only detection sessions that have associated SRT data for mapping."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM detections WHERE has_srt_data = TRUE ORDER BY timestamp DESC")
+    detections = cursor.fetchall()
+    conn.close()
+    return {"detections": detections}
+
 @app.get("/detection/{detection_id}")
 async def get_detection_details(detection_id: int):
     """Get complete details of a specific detection session."""
@@ -277,7 +464,6 @@ async def get_statistics():
 @app.get("/detections/class/{weed_class}")
 async def get_detections_by_class(weed_class: str):
     """Get all detections of a specific weed class."""
-    from database import fetch_detections_by_class
     detections = fetch_detections_by_class(weed_class)
     return {"weed_class": weed_class, "detections": detections}
 
@@ -305,8 +491,7 @@ async def admin_reset_db(confirm: bool = Query(False, description="Set true to c
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete DB file: {e}")
     # Recreate tables
-    from database import init_db as recreate
-    recreate()
+    init_db()
     return {"message": "Database file reset and tables recreated"}
 
 @app.post("/admin/drop-tables")
@@ -428,7 +613,6 @@ async def generate_heatmap(detection_id: int, grid_size_m: float = Query(10.0), 
     persisted = False
     if persist:
         try:
-            from database import upsert_heatmap
             upsert_heatmap(
                 detection_id=detection_id,
                 grid_size_m=grid_size_m,

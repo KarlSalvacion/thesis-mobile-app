@@ -21,7 +21,8 @@ def init_db():
             total_detections INTEGER DEFAULT 0,
             processing_time REAL DEFAULT 0.0,
             input_size_bytes INTEGER,
-            result_size_bytes INTEGER
+            result_size_bytes INTEGER,
+            has_srt_data BOOLEAN DEFAULT FALSE
         )
     """)
     
@@ -110,6 +111,10 @@ def init_db():
         cursor.execute("ALTER TABLE detections ADD COLUMN result_size_bytes INTEGER")
     except Exception:
         pass
+    try:
+        cursor.execute("ALTER TABLE detections ADD COLUMN has_srt_data BOOLEAN DEFAULT FALSE")
+    except Exception:
+        pass
     conn.close()
 
 def reset_compact_tables():
@@ -145,13 +150,13 @@ def reset_compact_tables():
     conn.commit()
     conn.close()
 
-def insert_detection(filename, timestamp, file_type, summary, total_frames=0, total_detections=0, processing_time=0.0, input_size_bytes=None, result_size_bytes=None):
+def insert_detection(filename, timestamp, file_type, summary, total_frames=0, total_detections=0, processing_time=0.0, input_size_bytes=None, result_size_bytes=None, has_srt_data=False):
     """Insert a new detection session record."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO detections (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes)
+        "INSERT INTO detections (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data)
     )
     detection_id = cursor.lastrowid
     conn.commit()
@@ -250,6 +255,24 @@ def upsert_srt_track(detection_id, point_count, start_time, end_time, bounds_geo
             frames_json=excluded.frames_json
         """,
         (detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json)
+    )
+    
+    # Update the detection record to mark it as having SRT data
+    cursor.execute(
+        "UPDATE detections SET has_srt_data = TRUE WHERE id = ?",
+        (detection_id,)
+    )
+    
+    conn.commit()
+    conn.close()
+
+def update_srt_status(detection_id, has_srt_data):
+    """Update the SRT data status for a detection session."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE detections SET has_srt_data = ? WHERE id = ?",
+        (has_srt_data, detection_id)
     )
     conn.commit()
     conn.close()
