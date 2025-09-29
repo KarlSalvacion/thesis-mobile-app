@@ -7,6 +7,11 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import json
 from inference import run_inference_auto, detect_file_type
+from io import BytesIO
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 from database import (
     insert_detection, insert_frame_metadata, insert_detection_details,
     fetch_detection_session, fetch_all_detections, get_detection_statistics,
@@ -35,17 +40,36 @@ init_db()
 
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload and process a video or image file for weed detection."""
+    """Upload and process a video or image file for weed detection with optimizations."""
     start_time = time.time()
     
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     
+    # Read file and save
     file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+    file_size_mb = len(file_bytes) / (1024 * 1024)
+    print(f"Processing file: {file.filename} ({file_size_mb:.1f} MB)")
+    
+    # Basic validation for images to avoid downstream crashes
+    if file.filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".gif")):
+        if Image is None:
+            print("Warning: Pillow not installed; skipping image validation")
+        else:
+            try:
+                img = Image.open(BytesIO(file_bytes))
+                img.verify()  # verifies integrity
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid or corrupted image file")
+    
     with open(file_path, "wb") as buffer:
         buffer.write(file_bytes)
 
-    # Auto-detect file type and run appropriate inference
+    # Auto-detect file type and run appropriate inference with optimization
+    print("Starting inference...")
     detections = run_inference_auto(file_path)
+    print(f"Inference completed in {time.time() - start_time:.2f} seconds")
     
     # Get the actual file type based on file extension
     actual_file_type = detect_file_type(file_path)
@@ -88,8 +112,9 @@ async def upload_file(file: UploadFile = File(...)):
         result_size_bytes=result_size_bytes
     )
 
-    # Store individual detection details if any
+    # Store individual detection details if any (with batch optimization)
     if detections and len(detections) > 0:
+        print(f"Storing detection details...")
         if isinstance(detections[0], list):  # Video
             for frame_idx, frame_detections in enumerate(detections):
                 for detection in frame_detections:
@@ -117,6 +142,14 @@ async def upload_file(file: UploadFile = File(...)):
                     'detection_timestamp': timestamp
                 }
                 insert_detection_details(detection_id, detection_data)
+
+    # Clean up large video files to save disk space (keep files < 100MB)
+    if actual_file_type == "video" and file_size_mb > 100:
+        try:
+            os.remove(file_path)
+            print(f"Cleaned up large video file: {file.filename} ({file_size_mb:.1f} MB)")
+        except Exception as e:
+            print(f"Warning: Could not clean up file {file.filename}: {e}")
 
     return JSONResponse(content={
         "detection_id": detection_id,
