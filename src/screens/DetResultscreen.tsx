@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import { View, Text, ActivityIndicator, ScrollView, RefreshControl, Image } from 'react-native';
+import { View, Text, ActivityIndicator, ScrollView, RefreshControl, Image, TouchableOpacity, Modal, Dimensions, Alert } from 'react-native';
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
+import { Video, ResizeMode } from 'expo-av';
 import { API_BASE } from '../config'
 
 type DetectionRow = [
@@ -70,6 +71,13 @@ const DetectionResults = () => {
   const [latestDetection, setLatestDetection] = useState<DetectionRow | null>(null)
   const [details, setDetails] = useState<DetectionDetailRow[]>([])
   const [frames, setFrames] = useState<FrameMetadataRow[]>([])
+  const [isModalVisible, setIsModalVisible] = useState<boolean>(false)
+
+  // Get screen dimensions for modal sizing
+  const { width: screenWidth, height: screenHeight } = Dimensions.get('window')
+  
+  // DJI Mini 4 Pro aspect ratio is 4:3
+  const djiAspectRatio = 4 / 3
 
   const load = useCallback(async (opts?: { silent?: boolean }) => {
     let cancelled = false
@@ -93,6 +101,13 @@ const DetectionResults = () => {
       setLatestDetection(latest)
       setFrames((j2?.frame_metadata ?? []) as FrameMetadataRow[])
       setDetails((j2?.detection_details ?? []) as DetectionDetailRow[])
+      // Attach cloud info if available (backend returns session with detection tuple)
+      // Detection tuple indices: id, filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data, cloud_public_id, cloud_resource_type, cloud_secure_url
+  // Map cloud fields from the backend detection tuple. New DB adds cloud_annotated_url at index 14.
+  ;(latest as any).cloud_public_id = (j2?.detection ?? [])[11]
+  ;(latest as any).cloud_resource_type = (j2?.detection ?? [])[12]
+  ;(latest as any).cloud_secure_url = (j2?.detection ?? [])[13]
+  ;(latest as any).cloud_annotated_url = (j2?.detection ?? [])[14]
     } catch (e: any) {
       setError(e?.message || 'Failed to load results')
     } finally {
@@ -155,31 +170,126 @@ const DetectionResults = () => {
     <ScrollView className="flex-1 bg-bgColor1" showsVerticalScrollIndicator={false}
       refreshControl={<RefreshControl refreshing={loading} onRefresh={() => load()} />}>
       <View className="flex-1 justify-start items-center pt-12 pb-8 px-4">
-        {/* Video Placeholder */}
+        {/* Media Container - Expandable with DJI Mini 4 Pro aspect ratio */}
         <View className="w-full items-center mb-6">
-          <View className="bg-gray-800 rounded-2xl shadow-lg w-full max-w-md h-64 items-center justify-center overflow-hidden">
-            {latestDetection && latestDetection[3] === 'image' ? (
-              <Image
-                source={{ uri: `${API_BASE}/uploads/${latestDetection[1]}` }}
-                resizeMode="cover"
-                style={{ width: '100%', height: '100%' }}
-                onError={() => {}}
-              />
-            ) : (
-              <>
-                <Ionicons name="play-circle" size={64} color="white" />
-                <Text className="text-white text-lg font-medium mt-3">
-                  {latestDetection?.[3] === 'video' ? 'Detection Video' : 'Media preview unavailable'}
-                </Text>
-                <Text className="text-gray-300 text-xs mt-1 px-3 text-center">
-                  {latestDetection?.[3] === 'video'
-                    ? 'Video playback requires serving uploads/ over HTTP in the backend.'
-                    : 'Configure backend static hosting to preview media.'}
-                </Text>
-              </>
-            )}
-          </View>
+          <TouchableOpacity 
+            onPress={() => setIsModalVisible(true)}
+            activeOpacity={0.8}
+            className="w-full max-w-md"
+          >
+            <View 
+              className="bg-gray-800 rounded-2xl shadow-lg overflow-hidden"
+              style={{ 
+                width: '100%', 
+                aspectRatio: djiAspectRatio 
+              }}
+            >
+              {latestDetection && latestDetection[3] === 'image' ? (
+                <Image
+                  source={{ uri: (latestDetection as any).cloud_annotated_url || (latestDetection as any).cloud_secure_url || `${API_BASE}/uploads/${latestDetection[1]}` }}
+                  resizeMode="cover"
+                  style={{ width: '100%', height: '100%' }}
+                  onError={(error) => {
+                    console.log('Image load error:', error)
+                    Alert.alert('Error', 'Failed to load image')
+                  }}
+                />
+              ) : latestDetection && latestDetection[3] === 'video' && (latestDetection as any).cloud_secure_url ? (
+                <Video
+                  source={{ uri: (latestDetection as any).cloud_annotated_url || (latestDetection as any).cloud_secure_url }}
+                  style={{ width: '100%', height: '100%' }}
+                  resizeMode={ResizeMode.COVER}
+                  shouldPlay={false}
+                  isLooping={true}
+                  isMuted={true}
+                  onError={(error) => {
+                    console.log('Video load error:', error)
+                    Alert.alert('Error', 'Failed to load video')
+                  }}
+                />
+              ) : (
+                <View className="flex-1 items-center justify-center">
+                  <Ionicons name="play-circle" size={64} color="white" />
+                  <Text className="text-white text-lg font-medium mt-3 text-center">
+                    {latestDetection?.[3] === 'video' ? 'Detection Video' : 'Media preview unavailable'}
+                  </Text>
+                  <Text className="text-gray-300 text-xs mt-1 px-3 text-center">
+                    {latestDetection?.[3] === 'video'
+                      ? 'Tap to expand and play video'
+                      : 'No media available for preview'}
+                  </Text>
+                </View>
+              )}
+              
+              {/* Expand indicator overlay */}
+              <View className="absolute top-2 right-2 bg-black/50 rounded-full p-2">
+                <Ionicons name="expand" size={20} color="white" />
+              </View>
+            </View>
+          </TouchableOpacity>
         </View>
+
+        {/* Fullscreen Modal */}
+        <Modal
+          visible={isModalVisible}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setIsModalVisible(false)}
+        >
+          <View className="flex-1 bg-black/90 justify-center items-center">
+            <TouchableOpacity 
+              className="absolute top-12 right-4 z-10 bg-black/50 rounded-full p-3"
+              onPress={() => setIsModalVisible(false)}
+            >
+              <Ionicons name="close" size={24} color="white" />
+            </TouchableOpacity>
+            
+            <View 
+              className="w-full max-w-full mx-4"
+              style={{ 
+                aspectRatio: djiAspectRatio,
+                maxHeight: screenHeight * 0.8,
+                maxWidth: screenWidth * 0.95
+              }}
+            >
+              {latestDetection && latestDetection[3] === 'image' ? (
+                <Image
+                  source={{ uri: (latestDetection as any).cloud_annotated_url || (latestDetection as any).cloud_secure_url || `${API_BASE}/uploads/${latestDetection[1]}` }}
+                  resizeMode="contain"
+                  style={{ width: '100%', height: '100%' }}
+                  onError={(error) => {
+                    console.log('Modal image load error:', error)
+                    Alert.alert('Error', 'Failed to load image in fullscreen')
+                  }}
+                />
+              ) : latestDetection && latestDetection[3] === 'video' && (latestDetection as any).cloud_secure_url ? (
+                <Video
+                  source={{ uri: (latestDetection as any).cloud_annotated_url || (latestDetection as any).cloud_secure_url }}
+                  style={{ width: '100%', height: '100%' }}
+                  resizeMode={ResizeMode.CONTAIN}
+                  shouldPlay={true}
+                  isLooping={true}
+                  isMuted={false}
+                  useNativeControls={true}
+                  onError={(error) => {
+                    console.log('Modal video load error:', error)
+                    Alert.alert('Error', 'Failed to load video in fullscreen')
+                  }}
+                />
+              ) : (
+                <View className="flex-1 items-center justify-center bg-gray-800 rounded-lg">
+                  <Ionicons name="alert-circle" size={64} color="white" />
+                  <Text className="text-white text-lg font-medium mt-3 text-center">
+                    Media Unavailable
+                  </Text>
+                  <Text className="text-gray-300 text-sm mt-1 px-4 text-center">
+                    The media file could not be loaded for preview
+                  </Text>
+                </View>
+              )}
+            </View>
+          </View>
+        </Modal>
 
         {/* Header */}
         {loading && (

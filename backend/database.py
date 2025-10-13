@@ -22,7 +22,11 @@ def init_db():
             processing_time REAL DEFAULT 0.0,
             input_size_bytes INTEGER,
             result_size_bytes INTEGER,
-            has_srt_data BOOLEAN DEFAULT FALSE
+            has_srt_data BOOLEAN DEFAULT FALSE,
+            cloud_public_id TEXT,
+            cloud_resource_type TEXT,
+            cloud_secure_url TEXT,
+            cloud_annotated_url TEXT
         )
     """)
     
@@ -115,6 +119,23 @@ def init_db():
         cursor.execute("ALTER TABLE detections ADD COLUMN has_srt_data BOOLEAN DEFAULT FALSE")
     except Exception:
         pass
+    # New cloud storage columns (optional backfill)
+    try:
+        cursor.execute("ALTER TABLE detections ADD COLUMN cloud_public_id TEXT")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE detections ADD COLUMN cloud_resource_type TEXT")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE detections ADD COLUMN cloud_secure_url TEXT")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE detections ADD COLUMN cloud_annotated_url TEXT")
+    except Exception:
+        pass
     conn.close()
 
 def reset_compact_tables():
@@ -150,13 +171,43 @@ def reset_compact_tables():
     conn.commit()
     conn.close()
 
-def insert_detection(filename, timestamp, file_type, summary, total_frames=0, total_detections=0, processing_time=0.0, input_size_bytes=None, result_size_bytes=None, has_srt_data=False):
+def insert_detection(
+    filename,
+    timestamp,
+    file_type,
+    summary,
+    total_frames=0,
+    total_detections=0,
+    processing_time=0.0,
+    input_size_bytes=None,
+    result_size_bytes=None,
+    has_srt_data=False,
+    cloud_public_id=None,
+    cloud_resource_type=None,
+    cloud_secure_url=None,
+    cloud_annotated_url=None,
+):
     """Insert a new detection session record."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO detections (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data)
+        "INSERT INTO detections (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data, cloud_public_id, cloud_resource_type, cloud_secure_url, cloud_annotated_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            filename,
+            timestamp,
+            file_type,
+            summary,
+            total_frames,
+            total_detections,
+            processing_time,
+            input_size_bytes,
+            result_size_bytes,
+            has_srt_data,
+            cloud_public_id,
+            cloud_resource_type,
+            cloud_secure_url,
+            cloud_annotated_url,
+        ),
     )
     detection_id = cursor.lastrowid
     conn.commit()

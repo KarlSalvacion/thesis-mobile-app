@@ -27,7 +27,8 @@
     "expo-image-picker": "~16.1.4",
     "react-native-gesture-handler": "~2.24.0",
     "react-native-maps": "1.20.1",
-    "react-native-webview": "13.13.5"
+    "react-native-webview": "13.13.5",
+    "expo-av": "~15.1.7"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
