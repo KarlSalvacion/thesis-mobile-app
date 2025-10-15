@@ -2,6 +2,7 @@ import os
 import datetime
 import time
 import sqlite3
+import subprocess
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -704,6 +705,278 @@ async def get_detections_by_class(weed_class: str):
     """Get all detections of a specific weed class."""
     detections = fetch_detections_by_class(weed_class)
     return {"weed_class": weed_class, "detections": detections}
+
+@app.post("/debug/roboflow-video/")
+async def debug_roboflow_video(
+    media_file: UploadFile = File(..., description="Video file for debugging"),
+    fps: int = Query(5, description="FPS for video inference")
+):
+    """Debug endpoint to test Roboflow video API response structure."""
+    try:
+        # Read file
+        file_bytes = await media_file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        # Save to temp for inference
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_file.filename)[1])
+        tmp.write(file_bytes)
+        tmp.flush()
+        tmp.close()
+        file_path = tmp.name
+
+        # Test Roboflow video API directly
+        from .inference import model
+        job_id, signed_url, expire_time = model.predict_video(
+            file_path,
+            fps=fps,
+            prediction_type="batch-video",
+        )
+        
+        results = model.poll_until_video_results(job_id)
+        
+        # Cleanup
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+        
+        return {
+            "job_id": job_id,
+            "signed_url": signed_url,
+            "expire_time": expire_time,
+            "results_type": str(type(results)),
+            "results_keys": list(results.keys()) if isinstance(results, dict) else "Not a dict",
+            "results_preview": str(results)[:1000] + "..." if len(str(results)) > 1000 else str(results)
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+@app.post("/debug/test-preprocessing/")
+async def debug_test_preprocessing(
+    media_file: UploadFile = File(..., description="Image file for testing preprocessing"),
+    confidence: float = Query(0.001, description="Confidence threshold"),
+    denoise: bool = Query(True, description="Enable denoising"),
+    sharpen: bool = Query(True, description="Enable sharpening"),
+    contrast: bool = Query(True, description="Enable contrast enhancement"),
+    brightness: float = Query(1.1, description="Brightness multiplier"),
+    contrast_factor: float = Query(1.2, description="Contrast factor")
+):
+    """Test different preprocessing settings on a single image."""
+    try:
+        # Read file
+        file_bytes = await media_file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        # Save to temp for inference
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_file.filename)[1])
+        tmp.write(file_bytes)
+        tmp.flush()
+        tmp.close()
+        file_path = tmp.name
+
+        # Test without preprocessing first
+        from .inference import run_inference
+        detections_original, _ = run_inference(file_path, confidence=confidence)
+        
+        # Apply custom preprocessing
+        preprocessed_path = tempfile.mktemp(suffix='_preprocessed.jpg')
+        
+        # Build ffmpeg filter chain
+        filters = []
+        if denoise:
+            filters.append("hqdn3d=4:3:6:4.5")
+        if contrast or brightness != 1.0:
+            filters.append(f"eq=contrast={contrast_factor}:brightness={brightness}")
+        if sharpen:
+            filters.append("unsharp=5:5:0.8:3:3:0.4")
+        
+        filter_chain = ",".join(filters) if filters else "null"
+        
+        # Run preprocessing
+        from .config import FFMPEG_BINARY
+        cmd = [
+            FFMPEG_BINARY, "-y", "-i", file_path,
+            "-vf", filter_chain,
+            "-q:v", "2",
+            "-frames:v", "1",
+            preprocessed_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        detections_preprocessed = []
+        if result.returncode == 0:
+            detections_preprocessed, _ = run_inference(preprocessed_path, confidence=confidence)
+        
+        # Cleanup
+        try:
+            os.remove(file_path)
+            if os.path.exists(preprocessed_path):
+                os.remove(preprocessed_path)
+        except Exception:
+            pass
+        
+        return {
+            "filename": media_file.filename,
+            "confidence_used": confidence,
+            "preprocessing_settings": {
+                "denoise": denoise,
+                "sharpen": sharpen,
+                "contrast": contrast,
+                "brightness": brightness,
+                "contrast_factor": contrast_factor,
+                "filter_chain": filter_chain
+            },
+            "original_detections": {
+                "count": len(detections_original),
+                "detections": detections_original
+            },
+            "preprocessed_detections": {
+                "count": len(detections_preprocessed),
+                "detections": detections_preprocessed,
+                "preprocessing_success": result.returncode == 0
+            }
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+@app.post("/debug/test-image-inference/")
+async def debug_test_image_inference(
+    media_file: UploadFile = File(..., description="Image file for testing inference"),
+    confidence: float = Query(0.01, description="Confidence threshold")
+):
+    """Test image inference directly on a single image."""
+    try:
+        # Read file
+        file_bytes = await media_file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        # Save to temp for inference
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_file.filename)[1])
+        tmp.write(file_bytes)
+        tmp.flush()
+        tmp.close()
+        file_path = tmp.name
+
+        # Test image inference directly
+        from .inference import run_inference
+        detections, annotated = run_inference(file_path, confidence=confidence)
+        
+        # Cleanup
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+        
+        return {
+            "filename": media_file.filename,
+            "confidence_used": confidence,
+            "detections_count": len(detections),
+            "detections": detections,
+            "annotated_url": annotated
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+@app.post("/debug/roboflow-video-detailed/")
+async def debug_roboflow_video_detailed(
+    media_file: UploadFile = File(..., description="Video file for debugging"),
+    fps: int = Query(5, description="FPS for video inference")
+):
+    """Debug endpoint with detailed frame analysis."""
+    try:
+        # Read file
+        file_bytes = await media_file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        # Save to temp for inference
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_file.filename)[1])
+        tmp.write(file_bytes)
+        tmp.flush()
+        tmp.close()
+        file_path = tmp.name
+
+        # Test Roboflow video API directly
+        from .inference import model
+        job_id, signed_url, expire_time = model.predict_video(
+            file_path,
+            fps=fps,
+            prediction_type="batch-video",
+        )
+        
+        results = model.poll_until_video_results(job_id)
+        
+        # Analyze the response structure
+        analysis = {
+            "job_id": job_id,
+            "results_type": str(type(results)),
+            "total_keys": len(results.keys()) if isinstance(results, dict) else 0,
+            "keys": list(results.keys()) if isinstance(results, dict) else [],
+        }
+        
+        # Find frames data
+        frames_data = None
+        if isinstance(results, dict):
+            for key, value in results.items():
+                if isinstance(value, list) and len(value) > 0:
+                    analysis[f"key_{key}_length"] = len(value)
+                    analysis[f"key_{key}_type"] = str(type(value[0])) if value else "empty"
+                    if isinstance(value[0], dict):
+                        analysis[f"key_{key}_first_item_keys"] = list(value[0].keys())
+                    elif isinstance(value[0], (int, float, str)):
+                        analysis[f"key_{key}_first_item_value"] = value[0]
+                    
+                    # Special handling for the project name key
+                    if key == "thesis-online-gathered-ds-y6uy4":
+                        analysis[f"key_{key}_sample_items"] = value[:3] if len(value) >= 3 else value
+                        frames_data = value
+                    elif key == "frame_offset":
+                        analysis[f"key_{key}_sample_values"] = value[:5] if len(value) >= 5 else value
+                    else:
+                        frames_data = value
+                        break
+        
+        # Analyze first few frames
+        if frames_data and len(frames_data) > 0:
+            analysis["total_frames"] = len(frames_data)
+            analysis["first_3_frames"] = []
+            for i in range(min(3, len(frames_data))):
+                frame = frames_data[i]
+                frame_analysis = {
+                    "frame_index": i,
+                    "type": str(type(frame)),
+                    "keys": list(frame.keys()) if isinstance(frame, dict) else "not_dict",
+                }
+                if isinstance(frame, dict):
+                    # Look for prediction data
+                    prediction_keys = ['predictions', 'detections', 'objects', 'class', 'bbox', 'confidence']
+                    found_prediction_keys = [k for k in prediction_keys if k in frame]
+                    frame_analysis["prediction_keys_found"] = found_prediction_keys
+                    
+                    # Check if it's just metadata
+                    metadata_keys = ['frame_offset', 'time_offset', 'timestamp', 'frame_number']
+                    is_metadata_only = all(k in metadata_keys for k in frame.keys())
+                    frame_analysis["is_metadata_only"] = is_metadata_only
+                
+                analysis["first_3_frames"].append(frame_analysis)
+        
+        # Cleanup
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+        
+        return analysis
+        
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 @app.post("/admin/reset-compact-tables")
 async def admin_reset_compact_tables(confirm: bool = Query(False, description="Set true to confirm reset")):
