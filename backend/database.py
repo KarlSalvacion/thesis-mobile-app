@@ -1,8 +1,10 @@
 import sqlite3
 import json
+import os
 from datetime import datetime
 
-DB_NAME = "weed_detection.db"
+# Store database in backend folder
+DB_NAME = os.path.join(os.path.dirname(__file__), "weed_detection.db")
 
 def init_db():
     """Initialize the database and create tables if they don't exist."""
@@ -347,10 +349,10 @@ def upsert_heatmap(detection_id, grid_size_m, bounds_geojson, cells_json):
     conn.close()
 
 def fetch_all_detections():
-    """Return all detection session records."""
+    """Return all detection session records, sorted by ID descending (newest first)."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM detections ORDER BY timestamp DESC")
+    cursor.execute("SELECT * FROM detections ORDER BY id DESC")
     rows = cursor.fetchall()
     conn.close()
     return rows
