@@ -68,3 +68,96 @@ def transcode_video_to_preview(input_path: str, target_height: Optional[int] = N
     return out_path
 
 
+def get_video_fps(video_path: str) -> float:
+    """Get the FPS (frames per second) of a video file using ffprobe.
+    
+    Returns the video FPS, or DEFAULT_VIDEO_FPS if unable to detect.
+    """
+    try:
+        from .config import DEFAULT_VIDEO_FPS
+        # Use ffprobe to get video metadata
+        cmd_args = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=r_frame_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_path
+        ]
+        result = subprocess.check_output(cmd_args, stderr=subprocess.STDOUT).decode('utf-8').strip()
+        
+        # Parse the frame rate (usually in format "30/1" or "30000/1001")
+        if '/' in result:
+            num, den = result.split('/')
+            fps = float(num) / float(den)
+        else:
+            fps = float(result)
+        
+        # Sanity check: FPS should be between 1 and 120
+        if 1 <= fps <= 120:
+            print(f'Detected original video FPS: {fps:.2f}')
+            return fps
+        else:
+            print(f'Unusual FPS detected ({fps}), using default: {DEFAULT_VIDEO_FPS}')
+            return float(DEFAULT_VIDEO_FPS)
+            
+    except Exception as e:
+        print(f'Could not detect video FPS: {e}, using default: {DEFAULT_VIDEO_FPS}')
+        from .config import DEFAULT_VIDEO_FPS
+        return float(DEFAULT_VIDEO_FPS)
+
+
+def get_video_duration(video_path: str) -> Optional[float]:
+    """Get the duration of a video file in seconds using ffprobe.
+    
+    Returns the video duration in seconds, or None if unable to detect.
+    """
+    try:
+        cmd_args = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_path
+        ]
+        result = subprocess.check_output(cmd_args, stderr=subprocess.STDOUT).decode('utf-8').strip()
+        duration = float(result)
+        print(f'Detected video duration: {duration:.2f} seconds')
+        return duration
+    except Exception as e:
+        print(f'Could not detect video duration: {e}')
+        return None
+
+
+def get_video_frame_count(video_path: str) -> Optional[int]:
+    """Get the total number of frames in a video using ffprobe.
+    
+    Returns the frame count, or None if unable to detect.
+    """
+    try:
+        cmd_args = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-count_frames',
+            '-show_entries', 'stream=nb_read_frames',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_path
+        ]
+        result = subprocess.check_output(cmd_args, stderr=subprocess.STDOUT).decode('utf-8').strip()
+        frame_count = int(result)
+        print(f'Detected video frame count: {frame_count} frames')
+        return frame_count
+    except Exception as e:
+        # Fallback: calculate from duration and FPS
+        print(f'Could not count frames directly: {e}, calculating from duration and FPS')
+        try:
+            duration = get_video_duration(video_path)
+            fps = get_video_fps(video_path)
+            if duration and fps:
+                frame_count = int(duration * fps)
+                print(f'Calculated frame count: {frame_count} frames')
+                return frame_count
+        except Exception:
+            pass
+        return None

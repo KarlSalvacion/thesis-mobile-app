@@ -3,6 +3,19 @@
 # dependencies
 node_modules/
 
+# Python virtual environment (optional - only if using venv)
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
 # Expo
 .expo/
 dist/
