@@ -23,7 +23,7 @@ DEFAULT_OVERLAP = 0.45
 DEFAULT_VIDEO_FPS = 3  # fps for video frame sampling for detection (lower = faster)
 
 # Inference optimization settings
-USE_LOCAL_INFERENCE = True  # Use local Roboflow Inference Server (4x faster, requires 'inference' package)
+USE_LOCAL_INFERENCE = False  # Use Roboflow hosted API (no local inference package needed on Render)
 COMPRESS_FRAMES_BEFORE_INFERENCE = True  # Reduce image size before sending (faster upload)
 INFERENCE_IMAGE_SIZE = 640  # Resize to this width/height before inference (640 is optimal for YOLO)
 
