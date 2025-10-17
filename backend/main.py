@@ -763,8 +763,9 @@ async def admin_reset_db(confirm: bool = Query(False, description="Set true to c
     try:
         if os.path.exists(DB_NAME):
             os.remove(DB_NAME)
-        # Also try removing one level up (in case DB was at project root)
-        parent_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, DB_NAME)
+        # Also try removing one level up (in case old DB was at project root)
+        old_db_name = "weed_detection.db"  # Just the filename
+        parent_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, old_db_name)
         parent_db = os.path.abspath(parent_db)
         if os.path.exists(parent_db):
             os.remove(parent_db)
