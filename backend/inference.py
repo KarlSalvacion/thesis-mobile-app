@@ -1,4 +1,4 @@
-import os
+﻿import os
 import time
 import tempfile
 import subprocess
@@ -621,11 +621,12 @@ def run_video_inference(
     fps: int = DEFAULT_VIDEO_FPS,
     confidence: Optional[int] = None,
     overlap: Optional[int] = None,
-    allow_ffmpeg_fallback: bool = True,
     frame_interval: Optional[int] = None,
     max_frames: Optional[int] = None,
 ) -> Tuple[List[List[Dict[str, Any]]], Optional[str]]:
     """Run inference on a video file using Roboflow batch-video API.
+    
+    Note: Frame-by-frame fallback has been DISABLED to prevent excessive credit usage.
 
     Returns (list_of_frame_detections, annotated_url_or_none)
     """
@@ -771,8 +772,9 @@ def run_video_inference(
                 print(f'Retry failed: {e}')
 
         if len(all_detections) == 0:
-            print('Video API returned 0 frames; triggering local frame sampling fallback...')
-            raise RuntimeError('Zero frames returned by video API')
+            print('Video API returned 0 frames after retry.')
+            print('GIVING UP: No detections found. Expensive frame-by-frame fallback is disabled.')
+            raise RuntimeError('Zero frames returned by video API - check video format/size')
         
         # Create annotated video locally if detections exist and PIL is available
         if _HAS_PIL and len(all_detections) > 0 and any(len(frame_dets) > 0 for frame_dets in all_detections):
@@ -993,320 +995,15 @@ def run_video_inference(
         
         return all_detections, annotated
     except Exception as e:
-        # If the video API fails (BAD REQUEST or similar), fall back to frame sampling using ffmpeg
+        # If the video API fails, DO NOT fall back to expensive frame-by-frame inference
+        # This fallback uses hosted image inference API which consumes too many credits
         print(f'Error in video inference: {e}')
-        if not allow_ffmpeg_fallback:
-            # In fast mode we do not sample frames locally; return empty detections quickly
-            return [], None
-        try:
-            print('Starting frame extraction fallback (OpenCV only, no FFmpeg)...')
-            
-            # Get original video FPS for full-length annotated video
-            original_fps = get_video_fps(video_path) if USE_ORIGINAL_FPS else float(DEFAULT_VIDEO_FPS)
-            original_duration = get_video_duration(video_path)
-            print(f'Original video FPS: {original_fps:.2f}, Duration: {original_duration:.2f}s')
-            
-            # Use OpenCV for frame extraction
-            files = extract_frames_cv2(video_path, target_fps=original_fps, max_frames=MAX_VIDEO_FRAMES)
-            tmpdir = None
-            
-            if files is None:
-                # OpenCV not available - cannot proceed
-                raise RuntimeError('OpenCV not available for frame extraction. Please install opencv-python-headless.')
-            
-            # OpenCV extraction successful
-            print(f'OpenCV frame extraction completed with {len(files)} frames')
-            tmpdir = os.path.dirname(files[0]) if files else None
-            
-            sampled = files  # Use all extracted frames
-            
-            # Initialize smart frame skipper
-            skipper = SmartFrameSkipper(skip_window=SMART_SKIP_WINDOW, frame_interval=FRAME_INTERVAL)
-            print(f'Smart frame skipping: enabled={ENABLE_SMART_SKIP}, window={SMART_SKIP_WINDOW}, interval={FRAME_INTERVAL}')
-            
-            # Initialize motion detection skipper (OpenCV-based, more sophisticated)
-            motion_detector = MotionDetectionSkipper(
-                motion_threshold=MOTION_PIXEL_THRESHOLD, 
-                min_changed_pixels=MOTION_MIN_CHANGED_PIXELS
-            ) if ENABLE_MOTION_DETECTION else None
-            if motion_detector:
-                print(f'Motion detection: enabled (threshold={MOTION_PIXEL_THRESHOLD}, min_pixels={MOTION_MIN_CHANGED_PIXELS})')
-            else:
-                print('Motion detection: disabled')
-            
-            # Initialize advanced OpenCV features for better detection
-            object_tracker = ObjectTracker(
-                tracker_type='KCF', 
-                confidence_decay=TRACKING_CONFIDENCE_DECAY
-            ) if ENABLE_OBJECT_TRACKING else None
-            if object_tracker and object_tracker.has_opencv:
-                print(f'Object tracking: enabled (KCF, decay={TRACKING_CONFIDENCE_DECAY})')
-            else:
-                print('Object tracking: disabled')
-            
-            temporal_filter = TemporalConsistencyFilter(
-                min_appearances=TEMPORAL_MIN_APPEARANCES, 
-                max_gap=TEMPORAL_MAX_GAP
-            ) if ENABLE_TEMPORAL_FILTER else None
-            if temporal_filter:
-                print(f'Temporal consistency filter: enabled (min_appearances={TEMPORAL_MIN_APPEARANCES}, max_gap={TEMPORAL_MAX_GAP})')
-            else:
-                print('Temporal consistency filter: disabled')
-            
-            bg_subtractor = BackgroundSubtractor(
-                learning_rate=BG_LEARNING_RATE, 
-                var_threshold=BG_VAR_THRESHOLD
-            ) if ENABLE_BACKGROUND_SUBTRACTION else None
-            if bg_subtractor and bg_subtractor.bg_subtractor:
-                print(f'Background subtraction: enabled (MOG2, learning_rate={BG_LEARNING_RATE}, threshold={BG_VAR_THRESHOLD})')
-            else:
-                print('Background subtraction: disabled')
-            
-            print(f'Found {len(files)} extracted frames')
-            
-            all_detections = []
-            # Temporal smoothing: Keep track of recent detections to persist across frames
-            # For smooth tracking like Roboflow preview, persist between detection frames
-            # With IoU-based merging at 0.15 threshold, overlapping boxes get replaced smoothly
-            persistence_window = max(5, FRAME_INTERVAL * 5)  # Persist for ~5 detection intervals
-            print(f'Detection persistence: {persistence_window} frames (~{persistence_window / original_fps:.2f}s)')
-            recent_detections = []  # Will store (frame_idx, detections) tuples
-            
-            def merge_all_recent_detections():
-                """Merge overlapping detections from multiple recent frames, keeping newest."""
-                merged = []
-                used = set()
-                
-                # Sort by frame index (newest first) to prioritize recent detections
-                sorted_dets = []
-                for frame_idx, dets in recent_detections:
-                    for det in dets:
-                        sorted_dets.append((frame_idx, det))
-                sorted_dets.sort(key=lambda x: x[0], reverse=True)
-                
-                for i, (frame_i, det_i) in enumerate(sorted_dets):
-                    if i in used:
-                        continue
-                    
-                    # Check if this detection overlaps with any already added
-                    should_add = True
-                    for merged_det in merged:
-                        if det_i['class'] == merged_det['class']:
-                            iou = calculate_iou(det_i, merged_det)
-                            if iou > 0.15:  # Same threshold as merge_detections
-                                should_add = False
-                                break
-                    
-                    if should_add:
-                        merged.append(det_i)
-                        # Mark overlapping older detections as used
-                        for j, (frame_j, det_j) in enumerate(sorted_dets):
-                            if j <= i or j in used:
-                                continue
-                            if det_i['class'] == det_j['class']:
-                                iou = calculate_iou(det_i, det_j)
-                                if iou > 0.15:
-                                    used.add(j)
-                
-                return merged
-            
-            ann_frames_dir = tempfile.mkdtemp(prefix='rf_ann_frames_') if _HAS_PIL else None
-            if ann_frames_dir:
-                print(f'Created annotated frames directory: {ann_frames_dir}')
-            else:
-                print('Warning: PIL not available, skipping annotated video creation')
-            
-            for i, frame_file in enumerate(sampled):
-                # First check motion detection (more sophisticated than frame interval)
-                has_motion = motion_detector.has_motion(frame_file) if motion_detector else True
-                
-                # Check if we should process this frame (combine motion detection + frame interval)
-                should_process = skipper.should_process_frame(i) and has_motion
-                
-                if not should_process:
-                    # Skip inference but check if we have recent detections to apply
-                    # Remove old detections outside persistence window
-                    recent_detections = [(idx, dets) for idx, dets in recent_detections if i - idx < persistence_window]
-                    
-                    # Merge all recent detections intelligently (replace overlapping boxes)
-                    frame_dets = merge_all_recent_detections()
-                    
-                    all_detections.append(frame_dets)
-                    
-                    # Still need to save the frame for full-length video
-                    if ann_frames_dir:
-                        try:
-                            out_path = os.path.join(ann_frames_dir, f'ann_{i+1:06d}.jpg')
-                            if frame_dets:
-                                # Apply persisted detections
-                                ann_bytes = _annotate_image_file(frame_file, frame_dets)
-                                if ann_bytes:
-                                    with open(out_path, 'wb') as f:
-                                        f.write(ann_bytes)
-                                else:
-                                    shutil.copy(frame_file, out_path)
-                            else:
-                                shutil.copy(frame_file, out_path)
-                        except Exception:
-                            pass
-                    continue
-                
-                if i < 5 or i % 50 == 0:  # Log first few and periodic updates
-                    print(f'Processing frame {i+1}/{len(sampled)} (motion detected): {os.path.basename(frame_file)}')
-                
-                # Use frame as-is for inference
-                inference_path = frame_file
-                
-                # Apply frame compression if enabled
-                if COMPRESS_FRAMES_BEFORE_INFERENCE:
-                    compressed_path = _compress_frame_for_inference(inference_path, INFERENCE_IMAGE_SIZE)
-                    if compressed_path != inference_path:
-                        inference_path = compressed_path
-                
-                # Force direct per-frame predict to mirror preview
-                dets, _ann = run_inference(inference_path, confidence=0.05, overlap=0.45)
-                
-                # Apply advanced OpenCV filtering for better detection accuracy
-                # 1. Object tracking - smooth bounding boxes and maintain consistent IDs
-                if object_tracker:
-                    dets = object_tracker.update(frame_file, dets)
-                
-                # 2. Background subtraction - filter out static objects
-                if bg_subtractor and bg_subtractor.bg_subtractor is not None:
-                    moving_dets = []
-                    for det in dets:
-                        if bg_subtractor.is_moving(frame_file, det['bbox']):
-                            moving_dets.append(det)
-                        elif i < 3:
-                            print(f'  Filtered static object: {det["class"]} (background subtraction)')
-                    dets = moving_dets
-                
-                # 3. Temporal consistency - require objects to appear in multiple frames
-                if temporal_filter:
-                    dets = temporal_filter.filter(dets)
-                
-                if i < 5 and len(dets) > 0:
-                    print(f'  Frame {i+1} after advanced filtering: {len(dets)} detections')
-                
-                # Clean up old detections outside persistence window
-                recent_detections = [(idx, d) for idx, d in recent_detections if i - idx < persistence_window]
-                
-                # Add current detections to recent list if any found
-                if dets:
-                    recent_detections.append((i, dets))
-                
-                # Merge all recent detections intelligently (replace overlapping boxes)
-                frame_dets = merge_all_recent_detections()
-                
-                all_detections.append(frame_dets)
-                
-                # Update skipper if NEW detections found (not persisted ones)
-                if len(dets) > 0:
-                    skipper.on_detection_found()
-                    if i < 5:  # Log first few frames with detections
-                        print(f'  Frame {i+1} new detections: {len(dets)}, total with persistence: {len(frame_dets)} - entering smart skip window')
-                
-                if i < 3:  # Log first few frames
-                    print(f'  Frame {i+1} detections: {len(frame_dets)} (new: {len(dets)})')
-                    if len(frame_dets) > 0:
-                        print(f'  First detection: {frame_dets[0]}')
-
-                # Save frame: annotated if detections exist (including persisted), original if no detections
-                if ann_frames_dir:
-                    try:
-                        out_path = os.path.join(ann_frames_dir, f'ann_{i+1:06d}.jpg')
-                        if frame_dets:
-                            # Annotate frame with all detections (including persisted)
-                            ann_bytes = _annotate_image_file(frame_file, frame_dets)
-                            if ann_bytes:
-                                with open(out_path, 'wb') as f:
-                                    f.write(ann_bytes)
-                                if i < 3:
-                                    print(f'  Saved annotated frame: {os.path.basename(out_path)}')
-                            else:
-                                # Annotation failed, copy original
-                                shutil.copy(frame_file, out_path)
-                        else:
-                            # No detections, copy original frame
-                            shutil.copy(frame_file, out_path)
-                    except Exception as e:
-                        if i < 3:
-                            print(f'  Failed to save frame: {e}')
-                        # On error, try to copy original
-                        try:
-                            shutil.copy(frame_file, out_path)
-                        except Exception:
-                            pass
-            
-            # Print smart skip statistics
-            stats = skipper.get_stats()
-            print(f'Smart frame skipping stats: {stats["processed"]} processed, {stats["skipped"]} skipped ({stats["skip_rate"]})')
-            
-            # Print motion detection statistics
-            if motion_detector:
-                motion_stats = motion_detector.get_stats()
-                print(f'Motion detection stats: {motion_stats["motion_frames"]} motion frames, {motion_stats["skipped_frames"]} static frames ({motion_stats["skip_rate"]})')
-
-            # Count annotated frames before stitching
-            if ann_frames_dir:
-                ann_frame_files = sorted([f for f in os.listdir(ann_frames_dir) if f.lower().endswith('.jpg')])
-                print(f'Total frames saved for annotated video: {len(ann_frame_files)}')
-                print(f'Expected duration: {len(ann_frame_files) / original_fps:.2f} seconds at {original_fps:.2f} FPS')
-
-            # Optionally stitch annotated frames to a temp video and return URL via Cloudinary
-            annotated_video_url: Optional[str] = None
-            if ann_frames_dir:
-                try:
-                    ann_video_path = tempfile.mktemp(suffix='_annotated.mp4')
-                    # Use original video FPS for annotated output
-                    print(f'Stitching annotated video with OpenCV at {original_fps:.2f} FPS')
-                    
-                    # Use OpenCV stitching (no FFmpeg dependency)
-                    stitch_success = stitch_video_cv2(ann_frames_dir, original_fps, ann_video_path, frame_pattern='ann_%06d.jpg')
-                    
-                    if not stitch_success:
-                        # OpenCV failed
-                        raise RuntimeError('OpenCV video stitching failed')
-                    
-                    print(f'Successfully stitched annotated video with OpenCV: {ann_video_path}')
-                    
-                    # Verify output video duration (functions already imported at module level)
-                    try:
-                        output_duration = get_video_duration(ann_video_path)
-                        output_frames = get_video_frame_count(ann_video_path)
-                        input_duration = get_video_duration(video_path)
-                        if output_duration and input_duration:
-                            print(f'Original video: {input_duration:.2f}s, Annotated video: {output_duration:.2f}s')
-                            if abs(output_duration - input_duration) > 0.5:
-                                print(f'WARNING: Duration mismatch! Difference: {abs(output_duration - input_duration):.2f}s')
-                        if output_frames:
-                            print(f'Annotated video frame count: {output_frames}')
-                    except Exception as verify_err:
-                        print(f'Could not verify output video: {verify_err}')
-                    
-                    try:
-                        from .cloudinary_utils import upload_video_streaming
-                        uploaded = upload_video_streaming(ann_video_path, os.path.basename(video_path), folder="weed-detections/annotated", annotate=False)
-                        annotated_video_url = uploaded.get('secure_url')
-                        print(f'Annotated video uploaded to Cloudinary: {annotated_video_url}')
-                    except Exception as e:
-                        print(f'Failed to upload annotated video to Cloudinary: {e}')
-                        annotated_video_url = None
-                except Exception as e:
-                    print(f'Error creating annotated video: {e}')
-                    annotated_video_url = None
-
-            # cleanup
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            if ann_frames_dir:
-                shutil.rmtree(ann_frames_dir, ignore_errors=True)
-            if annotated_video_url:
-                return all_detections, annotated_video_url
-            print(f'Frame-sampling fallback produced {len(all_detections)} frames of detections')
-            return all_detections, None
-        except Exception as ex:
-            print('Frame-sampling fallback also failed:', ex)
-            return [], None
+        print('FALLBACK DISABLED: Frame-by-frame inference.')
+        print('Possible solutions:')
+        print('  1. Check if video is too large (compress before upload)')
+        print('  2. Check if video format is supported by Roboflow')
+        print('  3. Verify Roboflow API key and project settings')
+        return [], None
 
 
 def detect_file_type(file_path: str) -> str:
@@ -1321,11 +1018,15 @@ def detect_file_type(file_path: str) -> str:
     return 'unknown'
 
 
-def run_inference_auto(file_path: str, confidence: Optional[int] = None, overlap: Optional[int] = None, allow_ffmpeg_fallback: bool = True) -> Tuple[Any, Optional[str]]:
+def run_inference_auto(file_path: str, confidence: Optional[int] = None, overlap: Optional[int] = None) -> Tuple[Any, Optional[str]]:
     """Automatically detect file type and run appropriate inference with optimization.
+    
+    Note: Expensive frame-by-frame fallback has been DISABLED to save Roboflow credits.
 
     Returns (detections_or_frames, annotated_url_or_none)
     """
+    from .video_utils import compress_for_inference
+    
     file_type = detect_file_type(file_path)
     if file_type == 'image':
         return run_inference(file_path, confidence=confidence, overlap=overlap)
@@ -1333,7 +1034,28 @@ def run_inference_auto(file_path: str, confidence: Optional[int] = None, overlap
         file_size = os.path.getsize(file_path)
         file_size_mb = file_size / (1024 * 1024)
         print(f'Processing video: {file_size_mb:.1f} MB')
-        # Always start with configured default FPS for Roboflow batch-video
-        return run_video_inference(file_path, fps=DEFAULT_VIDEO_FPS, confidence=confidence, overlap=overlap, allow_ffmpeg_fallback=allow_ffmpeg_fallback)
+        
+        # Compress large videos before Roboflow upload to avoid timeouts
+        compressed_path = None
+        inference_path = file_path
+        try:
+            if file_size_mb > 100:
+                print(f'Video exceeds 100 MB, compressing for Roboflow upload...')
+                compressed_path = compress_for_inference(file_path, max_size_mb=100)
+                inference_path = compressed_path
+                print(f'Using compressed video for inference: {os.path.getsize(compressed_path) / (1024 * 1024):.1f} MB')
+            
+            # Always start with configured default FPS for Roboflow batch-video
+            result = run_video_inference(inference_path, fps=DEFAULT_VIDEO_FPS, confidence=confidence, overlap=overlap)
+            return result
+        finally:
+            # Clean up compressed file if created
+            if compressed_path and os.path.exists(compressed_path):
+                try:
+                    os.remove(compressed_path)
+                    print(f'Cleaned up compressed file: {compressed_path}')
+                except Exception as e:
+                    print(f'Warning: Failed to delete compressed file {compressed_path}: {e}')
+    
     print(f'Unsupported file type: {file_path}')
     return [], None

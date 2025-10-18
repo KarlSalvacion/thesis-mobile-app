@@ -68,6 +68,97 @@ def transcode_video_to_preview(input_path: str, target_height: Optional[int] = N
     return out_path
 
 
+def compress_for_inference(input_path: str, max_size_mb: int = 100) -> str:
+    """Compress video for Roboflow inference while maintaining detection quality.
+    
+    Strategy:
+    - Reduce resolution to 1080p max (detection quality unaffected)
+    - Use H.264 codec with optimized settings
+    - Maintain aspect ratio
+    - Target file size ~100MB for fast API upload
+    - Keep original FPS for accurate frame mapping
+    
+    Args:
+        input_path: Path to original video
+        max_size_mb: Target maximum file size in MB
+        
+    Returns:
+        Path to compressed video file (temp file - caller should delete)
+    """
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input video not found: {input_path}")
+    
+    # Check if compression is needed
+    try:
+        size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        if size_mb <= max_size_mb:
+            print(f"Video is {size_mb:.1f} MB, no compression needed (target: {max_size_mb} MB)")
+            return input_path
+    except Exception:
+        pass
+    
+    print(f"Compressing video for inference (target: {max_size_mb} MB)...")
+    
+    # Create temporary output file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp.close()
+    out_path = tmp.name
+    
+    # Compression settings optimized for detection quality
+    # - Scale to 1080p max (weeds still clearly visible)
+    # - CRF 28 = good quality, smaller file (lower = better quality, bigger file)
+    # - Fast preset for speed
+    # - Copy audio (not needed for detection but keeps it)
+    cmd_args = [
+        FFMPEG_BINARY,
+        '-y',  # Overwrite output
+        '-i', input_path,
+        '-vf', 'scale=-2:\'min(1080,ih)\'',  # Max height 1080p, maintain aspect ratio
+        '-c:v', 'libx264',  # H.264 codec
+        '-crf', '28',  # Constant Rate Factor (18-28 is good range, 28 = smaller files)
+        '-preset', 'fast',  # Encoding speed (fast = good balance)
+        '-pix_fmt', 'yuv420p',  # Compatibility
+        '-c:a', 'aac',  # Audio codec
+        '-b:a', '128k',  # Audio bitrate (keep low, not needed for detection)
+        '-movflags', '+faststart',  # Optimize for streaming
+        out_path
+    ]
+    
+    try:
+        print(f"Running ffmpeg compression: {' '.join(cmd_args[:3])}...")
+        subprocess.check_output(cmd_args, stderr=subprocess.STDOUT)
+        
+        # Check output file size
+        if os.path.exists(out_path):
+            compressed_size_mb = os.path.getsize(out_path) / (1024 * 1024)
+            original_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+            reduction = ((original_size_mb - compressed_size_mb) / original_size_mb) * 100
+            print(f"✅ Compression complete: {original_size_mb:.1f} MB → {compressed_size_mb:.1f} MB ({reduction:.1f}% reduction)")
+            return out_path
+        else:
+            raise FileNotFoundError("FFmpeg did not create output file")
+            
+    except subprocess.CalledProcessError as e:
+        # Clean up output if ffmpeg failed
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        
+        error_output = e.output.decode('utf-8') if e.output else str(e)
+        print(f"❌ FFmpeg compression failed: {error_output}")
+        raise FileNotFoundError(f"ffmpeg compression failed: {error_output}")
+    except Exception as e:
+        # Clean up on any error
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        raise
+
+
 def get_video_fps(video_path: str) -> float:
     """Get the FPS (frames per second) of a video file.
     
