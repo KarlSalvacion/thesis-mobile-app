@@ -37,8 +37,19 @@ import { API_BASE } from '../config'
 console.log('API_BASE =', API_BASE)
 
 async function uploadFileToApi(uri: string, name: string) {
+  console.log('📤 [UPLOAD] Starting upload...')
+  console.log('📤 [UPLOAD] File:', name)
+  console.log('📤 [UPLOAD] API Endpoint:', `${API_BASE}/upload/`)
+  
   const type = guessMimeType(name)
+  console.log('📤 [UPLOAD] MIME Type:', type)
+  
   const fileUri = await ensureLocalFilePath(uri, name)
+  console.log('📤 [UPLOAD] Local file URI:', fileUri)
+  
+  console.log('📤 [UPLOAD] Sending request to backend...')
+  const startTime = Date.now()
+  
   const result = await FileSystem.uploadAsync(`${API_BASE}/upload/`, fileUri, {
     httpMethod: 'POST',
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
@@ -47,17 +58,37 @@ async function uploadFileToApi(uri: string, name: string) {
     parameters: {},
     headers: { Accept: 'application/json' },
   })
-  if (result.status !== 200) throw new Error(`Upload failed: ${result.status}`)
-  return JSON.parse(result.body)
+  
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(2)
+  console.log(`📤 [UPLOAD] Response received in ${elapsed}s`)
+  console.log('📤 [UPLOAD] Status:', result.status)
+  
+  if (result.status !== 200) {
+    console.error('❌ [UPLOAD] Upload failed with status:', result.status)
+    throw new Error(`Upload failed: ${result.status}`)
+  }
+  
+  const response = JSON.parse(result.body)
+  console.log('✅ [UPLOAD] Success!')
+  console.log('✅ [UPLOAD] Summary:', response.summary)
+  console.log('✅ [UPLOAD] Processing time:', response.processing_time)
+  
+  return response
 }
 
 async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFile) {
+  console.log('📤 [COMBINED] Starting combined upload...')
+  console.log('📤 [COMBINED] Media file:', mediaFile.name)
+  console.log('📤 [COMBINED] SRT file:', srtFile.name)
+  console.log('📤 [COMBINED] API Endpoint:', `${API_BASE}/upload-combined/`)
+  
   // Prepare form data for multipart upload
   const formData = new FormData()
   
   // Add media file
   const mediaUri = await ensureLocalFilePath(mediaFile.uri, mediaFile.name)
   const mediaType = guessMimeType(mediaFile.name)
+  console.log('📤 [COMBINED] Media MIME Type:', mediaType)
   
   formData.append('media_file', {
     uri: mediaUri,
@@ -73,6 +104,9 @@ async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFil
     type: 'text/plain',
   } as any)
 
+  console.log('📤 [COMBINED] Sending request to backend...')
+  const startTime = Date.now()
+
   const response = await fetch(`${API_BASE}/upload-combined/`, {
     method: 'POST',
     body: formData,
@@ -82,12 +116,24 @@ async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFil
     },
   })
 
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(2)
+  console.log(`📤 [COMBINED] Response received in ${elapsed}s`)
+  console.log('📤 [COMBINED] Status:', response.status)
+
   if (!response.ok) {
     const errorText = await response.text()
+    console.error('❌ [COMBINED] Upload failed:', response.status, errorText)
     throw new Error(`Upload failed: ${response.status} - ${errorText}`)
   }
 
-  return await response.json()
+  const result = await response.json()
+  console.log('✅ [COMBINED] Success!')
+  console.log('✅ [COMBINED] Message:', result.message)
+  console.log('✅ [COMBINED] Summary:', result.summary)
+  console.log('✅ [COMBINED] Processing time:', result.processing_time)
+  console.log('✅ [COMBINED] Detection ID:', result.detection_id)
+
+  return result
 }
 
 type SelectedFile = {
@@ -216,37 +262,57 @@ const Homescreen = () => {
     if (!selectedMedia && !selectedSrt) return
     
     try {
+      console.log('🚀 [UPLOAD START] ================================================')
+      console.log('🚀 [UPLOAD START] Initiating upload process...')
+      const uploadStartTime = Date.now()
+      
       setStatus('uploading')
       setProgress(10)
-      setMessage('')
+      setMessage('Preparing files...')
 
       // Validate upload combination
       if (selectedSrt && !selectedMedia) {
+        console.error('❌ [VALIDATION] SRT file without media')
         throw new Error('SRT file cannot be uploaded without a media file')
       }
 
       const isVideo = selectedMedia?.name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i)
       const isImage = selectedMedia?.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i)
 
+      console.log('📋 [VALIDATION] File type:', isVideo ? 'VIDEO' : isImage ? 'IMAGE' : 'UNKNOWN')
+      console.log('📋 [VALIDATION] Has SRT:', !!selectedSrt)
+
       if (selectedSrt && isImage) {
+        console.error('❌ [VALIDATION] SRT with image not allowed')
         throw new Error('SRT files can only be uploaded with video files, not images')
       }
 
       setProgress(30)
+      setMessage('Uploading to server...')
 
       // Use combined upload endpoint if both files are selected
       if (selectedMedia && selectedSrt) {
+        console.log('📦 [MODE] Using combined upload (media + SRT)')
         const result = await uploadCombinedFiles(selectedMedia, selectedSrt)
         setMessage(result.message || 'Upload complete with GPS data.')
       } else if (selectedMedia) {
-        // Upload media only
+        console.log('📦 [MODE] Using single file upload (media only)')
         const result = await uploadFileToApi(selectedMedia.uri, selectedMedia.name)
         setMessage(`${result.summary} (No GPS data - image only or video without SRT)`)
       }
 
+      const totalTime = ((Date.now() - uploadStartTime) / 1000).toFixed(2)
+      console.log(`✅ [UPLOAD COMPLETE] Total time: ${totalTime}s`)
+      console.log('✅ [UPLOAD COMPLETE] ================================================')
+
       setProgress(100)
       setStatus('success')
     } catch (e: any) {
+      console.error('❌ [UPLOAD ERROR] ================================================')
+      console.error('❌ [UPLOAD ERROR]', e)
+      console.error('❌ [UPLOAD ERROR] Message:', e?.message)
+      console.error('❌ [UPLOAD ERROR] ================================================')
+      
       setStatus('error')
       setMessage(e?.message || 'Upload failed')
     } finally {

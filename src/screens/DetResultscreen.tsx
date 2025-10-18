@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import { View, Text, ActivityIndicator, ScrollView, RefreshControl, Image, TouchableOpacity, Modal, Dimensions, Alert } from 'react-native';
+import { View, Text, ActivityIndicator, ScrollView, RefreshControl, Image, TouchableOpacity, Modal, Dimensions, Alert, Linking, Platform } from 'react-native';
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
-import { useFocusEffect } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { Video, ResizeMode } from 'expo-av';
+import * as FileSystem from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
 import { API_BASE } from '../config'
 
 type DetectionRow = [
@@ -66,18 +68,234 @@ function pickColorForClass(className: string): string {
 }
 
 const DetectionResults = () => {
+  const navigation = useNavigation()
   const [loading, setLoading] = useState<boolean>(true)
   const [error, setError] = useState<string>('')
   const [latestDetection, setLatestDetection] = useState<DetectionRow | null>(null)
   const [details, setDetails] = useState<DetectionDetailRow[]>([])
   const [frames, setFrames] = useState<FrameMetadataRow[]>([])
   const [isModalVisible, setIsModalVisible] = useState<boolean>(false)
+  const [exporting, setExporting] = useState<boolean>(false)
+  const [uniqueWeedCount, setUniqueWeedCount] = useState<number | null>(null)
+  const [uniqueWeedData, setUniqueWeedData] = useState<any>(null)
 
   // Get screen dimensions for modal sizing
   const { width: screenWidth, height: screenHeight } = Dimensions.get('window')
   
   // DJI Mini 4 Pro aspect ratio is 4:3
   const djiAspectRatio = 4 / 3
+
+  // Action Handlers
+  const handleViewMap = useCallback(() => {
+    if (!latestDetection) {
+      Alert.alert('No Data', 'No detection session available.')
+      return
+    }
+    
+    const detectionId = latestDetection[0]
+    const hasGPS = latestDetection[10]
+    
+    if (!hasGPS) {
+      Alert.alert(
+        'GPS Data Required',
+        'This detection has no GPS data. Upload a video with SRT file to view map data.',
+        [{ text: 'OK' }]
+      )
+      return
+    }
+    
+    // Navigate to Map screen
+    (navigation as any).navigate('Map', { 
+      detectionId,
+      autoFocus: true 
+    })
+  }, [latestDetection, navigation])
+
+  const handleExport = useCallback(async () => {
+    if (!latestDetection) {
+      Alert.alert('No Data', 'No detection session available to export.')
+      return
+    }
+
+    const detectionId = latestDetection[0]
+
+    Alert.alert(
+      'Export Format',
+      'Choose export format:',
+      [
+        {
+          text: 'JSON',
+          onPress: () => exportReport(detectionId, 'json')
+        },
+        {
+          text: 'CSV',
+          onPress: () => exportReport(detectionId, 'csv')
+        },
+        {
+          text: 'PDF',
+          onPress: () => exportReport(detectionId, 'pdf')
+        },
+        {
+          text: 'Cancel',
+          style: 'cancel'
+        }
+      ]
+    )
+  }, [latestDetection])
+
+  const exportReport = async (detectionId: number, format: string) => {
+    try {
+      setExporting(true)
+      const url = `${API_BASE}/detection/${detectionId}/export?format=${format}`
+      
+      console.log(`📥 Exporting ${format.toUpperCase()} report...`)
+      
+      const filename = `detection_report_${detectionId}.${format}`
+      const fileUri = `${FileSystem.documentDirectory}${filename}`
+      
+      // Download the file
+      const downloadResult = await FileSystem.downloadAsync(url, fileUri)
+      
+      if (downloadResult.status === 200) {
+        console.log('✅ Report downloaded:', downloadResult.uri)
+        
+        // Check if sharing is available
+        const canShare = await Sharing.isAvailableAsync()
+        
+        if (canShare) {
+          await Sharing.shareAsync(downloadResult.uri, {
+            mimeType: format === 'json' ? 'application/json' : 
+                     format === 'csv' ? 'text/csv' : 
+                     'application/pdf',
+            dialogTitle: `Export Detection Report (${format.toUpperCase()})`
+          })
+        } else {
+          Alert.alert(
+            'Export Complete',
+            `Report saved to:\n${downloadResult.uri}`,
+            [
+              { text: 'OK' }
+            ]
+          )
+        }
+      } else {
+        throw new Error(`Download failed with status: ${downloadResult.status}`)
+      }
+    } catch (error: any) {
+      console.error('❌ Export error:', error)
+      
+      if (error.message?.includes('reportlab')) {
+        Alert.alert(
+          'PDF Export Unavailable',
+          'PDF export requires additional setup on the server. Try JSON or CSV format instead.',
+          [{ text: 'OK' }]
+        )
+      } else {
+        Alert.alert(
+          'Export Failed',
+          error.message || 'Could not export report. Please try again.',
+          [{ text: 'OK' }]
+        )
+      }
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  const handleShare = useCallback(async () => {
+    if (!latestDetection) {
+      Alert.alert('No Data', 'No detection session available to share.')
+      return
+    }
+
+    const detectionId = latestDetection[0]
+
+    try {
+      setExporting(true)
+      
+      console.log('📤 Creating share package...')
+      const response = await fetch(`${API_BASE}/detection/${detectionId}/share`, {
+        method: 'POST'
+      })
+      
+      if (!response.ok) {
+        throw new Error(`Share failed: ${response.status}`)
+      }
+      
+      const shareData = await response.json()
+      console.log('✅ Share package created:', shareData)
+      
+      const shareMessage = shareData.share_message || 
+        `🌿 Weed Detection Results\n\nFile: ${latestDetection[1]}\nDetected: ${details.length} weeds\n\nView: ${shareData.media_urls?.annotated || 'N/A'}`
+      
+      // Check if native sharing is available
+      const canShare = await Sharing.isAvailableAsync()
+      
+      if (canShare && shareData.media_urls?.annotated) {
+        // Download annotated media first
+        const filename = `detection_${detectionId}_annotated.${latestDetection[3] === 'video' ? 'mp4' : 'jpg'}`
+        const fileUri = `${FileSystem.cacheDirectory}${filename}`
+        
+        try {
+          const downloadResult = await FileSystem.downloadAsync(shareData.media_urls.annotated, fileUri)
+          
+          if (downloadResult.status === 200) {
+            await Sharing.shareAsync(downloadResult.uri, {
+              mimeType: latestDetection[3] === 'video' ? 'video/mp4' : 'image/jpeg',
+              dialogTitle: 'Share Detection Results'
+            })
+          } else {
+            // Fallback to URL only
+            Alert.alert(
+              'Share Results',
+              shareMessage,
+              [
+                {
+                  text: 'Copy Link',
+                  onPress: () => {
+                    // In a real app, you'd copy to clipboard here
+                    Alert.alert('Link', shareData.media_urls?.annotated || 'No link available')
+                  }
+                },
+                { text: 'Cancel', style: 'cancel' }
+              ]
+            )
+          }
+        } catch (downloadError) {
+          console.error('Download error:', downloadError)
+          // Fallback to text share
+          Alert.alert('Share Results', shareMessage, [{ text: 'OK' }])
+        }
+      } else {
+        // Fallback to alert with message
+        Alert.alert(
+          'Share Results',
+          shareMessage,
+          [
+            {
+              text: 'Open Link',
+              onPress: () => {
+                const url = shareData.media_urls?.annotated || shareData.media_urls?.original
+                if (url) {
+                  Linking.openURL(url)
+                }
+              }
+            },
+            { text: 'OK' }
+          ]
+        )
+      }
+    } catch (error: any) {
+      console.error('❌ Share error:', error)
+      Alert.alert(
+        'Share Failed',
+        error.message || 'Could not create share package. Please try again.',
+        [{ text: 'OK' }]
+      )
+    } finally {
+      setExporting(false)
+    }
+  }, [latestDetection, details])
 
   const load = useCallback(async (opts?: { silent?: boolean }) => {
     let cancelled = false
@@ -101,6 +319,26 @@ const DetectionResults = () => {
       setLatestDetection(latest)
       setFrames((j2?.frame_metadata ?? []) as FrameMetadataRow[])
       setDetails((j2?.detection_details ?? []) as DetectionDetailRow[])
+      
+      // Fetch unique weed count for video detections
+      if (latest[3] === 'video') {
+        try {
+          const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds`)
+          if (res3.ok) {
+            const uniqueData = await res3.json()
+            setUniqueWeedCount(uniqueData.unique_weed_count)
+            setUniqueWeedData(uniqueData)
+            console.log('✅ Unique weeds:', uniqueData.unique_weed_count, 'from', uniqueData.total_detections, 'detections')
+          }
+        } catch (e) {
+          console.warn('Could not fetch unique weed count:', e)
+        }
+      } else {
+        // For images, unique count = total detections
+        setUniqueWeedCount(null)
+        setUniqueWeedData(null)
+      }
+      
       // Attach cloud info if available (backend returns session with detection tuple)
       // Detection tuple indices: id, filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data, cloud_public_id, cloud_resource_type, cloud_secure_url
   // Map cloud fields from the backend detection tuple. New DB adds cloud_annotated_url at index 14.
@@ -319,10 +557,17 @@ const DetectionResults = () => {
               <View className="items-center flex-1">
                 <View className="bg-green-100 rounded-full w-16 h-16 items-center justify-center mb-2">
                   <Text className="text-2xl font-bold text-green-600">
-                    {summary?.totalWeeds ?? 0}
+                    {uniqueWeedCount !== null ? uniqueWeedCount : (summary?.totalWeeds ?? 0)}
                   </Text>
                 </View>
-                <Text className="text-sm text-gray-600 text-center">Total Weeds</Text>
+                <Text className="text-sm text-gray-600 text-center">
+                  {uniqueWeedCount !== null ? 'Unique Weeds' : 'Total Weeds'}
+                </Text>
+                {uniqueWeedCount !== null && uniqueWeedData && (
+                  <Text className="text-xs text-gray-500 text-center mt-1">
+                    ({uniqueWeedData.total_detections} detections)
+                  </Text>
+                )}
               </View>
               
               <View className="items-center flex-1">
@@ -409,7 +654,11 @@ const DetectionResults = () => {
             </Text>
             
             <View className="space-y-3">
-              <View className="bg-green-50 border border-green-200 rounded-lg p-3">
+              <TouchableOpacity 
+                className="bg-green-50 border border-green-200 rounded-lg p-3"
+                onPress={handleViewMap}
+                disabled={exporting}
+              >
                 <View className="flex-row items-center">
                   <FontAwesome6 name="map-marker-alt" size={20} color="rgb(37, 165, 120)" />
                   <Text className="text-green-700 font-medium ml-3 flex-1">
@@ -417,19 +666,31 @@ const DetectionResults = () => {
                   </Text>
                   <Ionicons name="chevron-forward" size={20} color="rgb(37, 165, 120)" />
                 </View>
-              </View>
+              </TouchableOpacity>
               
-              <View className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+              <TouchableOpacity 
+                className="bg-blue-50 border border-blue-200 rounded-lg p-3"
+                onPress={handleExport}
+                disabled={exporting}
+              >
                 <View className="flex-row items-center">
                   <FontAwesome6 name="download" size={20} color="rgb(59, 130, 246)" />
                   <Text className="text-blue-700 font-medium ml-3 flex-1">
-                    Export Report
+                    {exporting ? 'Exporting...' : 'Export Report'}
                   </Text>
-                  <Ionicons name="chevron-forward" size={20} color="rgb(59, 130, 246)" />
+                  {exporting ? (
+                    <ActivityIndicator size="small" color="rgb(59, 130, 246)" />
+                  ) : (
+                    <Ionicons name="chevron-forward" size={20} color="rgb(59, 130, 246)" />
+                  )}
                 </View>
-              </View>
+              </TouchableOpacity>
               
-              <View className="bg-orange-50 border border-orange-200 rounded-lg p-3">
+              <TouchableOpacity 
+                className="bg-orange-50 border border-orange-200 rounded-lg p-3"
+                onPress={handleShare}
+                disabled={exporting}
+              >
                 <View className="flex-row items-center">
                   <FontAwesome6 name="share" size={20} color="rgb(245, 101, 101)" />
                   <Text className="text-orange-700 font-medium ml-3 flex-1">
@@ -437,7 +698,7 @@ const DetectionResults = () => {
                   </Text>
                   <Ionicons name="chevron-forward" size={20} color="rgb(245, 101, 101)" />
                 </View>
-              </View>
+              </TouchableOpacity>
             </View>
           </View>
         </View>

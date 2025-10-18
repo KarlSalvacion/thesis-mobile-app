@@ -4,4 +4,6 @@ python-multipart==0.0.6
 roboflow==1.2.9
 cloudinary==1.41.0
 Pillow==10.4.0
+opencv-python-headless==4.10.0.84  # Required by roboflow (for faster video frame extraction and stitching)
+reportlab==4.0.7  # For PDF export generation
 # inference>=0.58.2  # Commented out - using Roboflow hosted API instead

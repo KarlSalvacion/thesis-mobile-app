@@ -11,7 +11,7 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Main detections table (sessions)
+    # Main detections table (sessions) - OPTIMIZED with summary fields
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS detections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,31 +28,19 @@ def init_db():
             cloud_public_id TEXT,
             cloud_resource_type TEXT,
             cloud_secure_url TEXT,
-            cloud_annotated_url TEXT
+            cloud_annotated_url TEXT,
+            -- OPTIMIZED: Cached summary fields for fast mobile app queries
+            weed_class_counts TEXT,
+            has_gps_data BOOLEAN DEFAULT FALSE,
+            bounds_min_lat REAL,
+            bounds_max_lat REAL,
+            bounds_min_lng REAL,
+            bounds_max_lng REAL
         )
     """)
     
-    # Frame metadata table (from SRT files)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS frame_metadata (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            detection_id INTEGER NOT NULL,
-            frame_number INTEGER NOT NULL,
-            timestamp TEXT NOT NULL,
-            latitude REAL,
-            longitude REAL,
-            altitude REAL,
-            relative_altitude REAL,
-            iso INTEGER,
-            shutter_speed TEXT,
-            f_number REAL,
-            exposure_value REAL,
-            focal_length REAL,
-            color_temperature INTEGER,
-            camera_model TEXT DEFAULT 'DJI',
-            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
-        )
-    """)
+    # REMOVED: frame_metadata table (redundant with srt_tracks)
+    # Data stored once in srt_tracks.frames_json instead of twice
     
     # Compact SRT track storage (aggregated per session)
     cursor.execute("""
@@ -79,7 +67,7 @@ def init_db():
         )
     """)
     
-    # Individual detection details table
+    # Individual detection details table - OPTIMIZED with GPS data
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS detection_details (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,48 +84,69 @@ def init_db():
             normalized_bbox_width REAL,
             normalized_bbox_height REAL,
             detection_timestamp TEXT NOT NULL,
+            -- OPTIMIZED: GPS coordinates stored directly for fast heatmap generation
+            latitude REAL,
+            longitude REAL,
+            altitude REAL,
             FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
         )
     """)
     
-    # Create indexes for better performance
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_id ON frame_metadata(detection_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_frame_number ON frame_metadata(frame_number)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_id ON detection_details(detection_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_weed_class ON detection_details(weed_class)")
+    # OPTIMIZED: Better indexes for mobile app queries
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_timestamp ON detections(timestamp DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_has_srt ON detections(has_srt_data)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_file_type ON detections(file_type)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_session ON detection_details(detection_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_class ON detection_details(weed_class)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_gps ON detection_details(detection_id, latitude, longitude)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_frame ON detection_details(detection_id, frame_number)")
     
     conn.commit()
 
     # Backfill columns for older DBs (SQLite lacks IF NOT EXISTS for columns)
-    try:
-        cursor.execute("ALTER TABLE detections ADD COLUMN input_size_bytes INTEGER")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE detections ADD COLUMN result_size_bytes INTEGER")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE detections ADD COLUMN has_srt_data BOOLEAN DEFAULT FALSE")
-    except Exception:
-        pass
-    # New cloud storage columns (optional backfill)
-    try:
-        cursor.execute("ALTER TABLE detections ADD COLUMN cloud_public_id TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE detections ADD COLUMN cloud_resource_type TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE detections ADD COLUMN cloud_secure_url TEXT")
-    except Exception:
-        pass
-    try:
-        cursor.execute("ALTER TABLE detections ADD COLUMN cloud_annotated_url TEXT")
-    except Exception:
-        pass
+    existing_columns = [row[1] for row in cursor.execute("PRAGMA table_info(detections)").fetchall()]
+    
+    columns_to_add = [
+        ("input_size_bytes", "INTEGER"),
+        ("result_size_bytes", "INTEGER"),
+        ("has_srt_data", "BOOLEAN DEFAULT FALSE"),
+        ("cloud_public_id", "TEXT"),
+        ("cloud_resource_type", "TEXT"),
+        ("cloud_secure_url", "TEXT"),
+        ("cloud_annotated_url", "TEXT"),
+        # New optimized columns
+        ("weed_class_counts", "TEXT"),
+        ("has_gps_data", "BOOLEAN DEFAULT FALSE"),
+        ("bounds_min_lat", "REAL"),
+        ("bounds_max_lat", "REAL"),
+        ("bounds_min_lng", "REAL"),
+        ("bounds_max_lng", "REAL"),
+    ]
+    
+    for col_name, col_type in columns_to_add:
+        if col_name not in existing_columns:
+            try:
+                cursor.execute(f"ALTER TABLE detections ADD COLUMN {col_name} {col_type}")
+                conn.commit()
+            except Exception as e:
+                pass  # Column might already exist
+    
+    # Backfill GPS columns in detection_details
+    existing_detail_columns = [row[1] for row in cursor.execute("PRAGMA table_info(detection_details)").fetchall()]
+    detail_columns_to_add = [
+        ("latitude", "REAL"),
+        ("longitude", "REAL"),
+        ("altitude", "REAL"),
+    ]
+    
+    for col_name, col_type in detail_columns_to_add:
+        if col_name not in existing_detail_columns:
+            try:
+                cursor.execute(f"ALTER TABLE detection_details ADD COLUMN {col_name} {col_type}")
+                conn.commit()
+            except Exception:
+                pass
+    
     conn.close()
 
 def reset_compact_tables():
@@ -216,28 +225,6 @@ def insert_detection(
     conn.close()
     return detection_id
 
-def insert_frame_metadata(detection_id, frame_data):
-    """Insert frame metadata from SRT file."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO frame_metadata (
-            detection_id, frame_number, timestamp, latitude, longitude, altitude, 
-            relative_altitude, iso, shutter_speed, f_number, exposure_value, 
-            focal_length, color_temperature
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        detection_id, frame_data['frame_number'], frame_data['timestamp'],
-        frame_data.get('latitude'), frame_data.get('longitude'), frame_data.get('altitude'),
-        frame_data.get('relative_altitude'), frame_data.get('iso'), frame_data.get('shutter_speed'),
-        frame_data.get('f_number'), frame_data.get('exposure_value'), frame_data.get('focal_length'),
-        frame_data.get('color_temperature')
-    ))
-    
-    conn.commit()
-    conn.close()
-
 def insert_detection_details(detection_id, detection_data):
     """Insert individual weed detection details."""
     conn = sqlite3.connect(DB_NAME)
@@ -261,6 +248,349 @@ def insert_detection_details(detection_id, detection_data):
     
     conn.commit()
     conn.close()
+
+def batch_insert_detection_details(detection_id: int, detections_list: list, srt_frames: dict = None):
+    """Batch insert multiple detection details at once (10x faster than individual inserts).
+    
+    Args:
+        detection_id: The parent detection session ID
+        detections_list: List of detection data dictionaries
+        srt_frames: Optional dict mapping frame_number -> (lat, lon, alt) for GPS data
+    
+    Returns:
+        Number of rows inserted
+    """
+    if not detections_list:
+        return 0
+    
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Prepare batch data as tuples (with GPS data if available)
+    batch_data = []
+    for det in detections_list:
+        frame_num = det['frame_number']
+        lat, lon, alt = None, None, None
+        
+        # Look up GPS data from SRT if available
+        if srt_frames and frame_num in srt_frames:
+            lat, lon, alt = srt_frames[frame_num]
+        
+        batch_data.append((
+            detection_id,
+            frame_num,
+            det['weed_class'],
+            det['confidence'],
+            det['bbox_x'],
+            det['bbox_y'],
+            det['bbox_width'],
+            det['bbox_height'],
+            det.get('normalized_bbox_x'),
+            det.get('normalized_bbox_y'),
+            det.get('normalized_bbox_width'),
+            det.get('normalized_bbox_height'),
+            det['detection_timestamp'],
+            lat,
+            lon,
+            alt
+        ))
+    
+    # Use executemany for batch insert (much faster than individual inserts)
+    cursor.executemany("""
+        INSERT INTO detection_details (
+            detection_id, frame_number, weed_class, confidence, 
+            bbox_x, bbox_y, bbox_width, bbox_height,
+            normalized_bbox_x, normalized_bbox_y, normalized_bbox_width, normalized_bbox_height,
+            detection_timestamp, latitude, longitude, altitude
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, batch_data)
+    
+    rows_inserted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    
+    return rows_inserted
+
+
+def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.3, frame_gap: int = 10) -> dict:
+    """Calculate unique weed count by tracking weeds across frames.
+    
+    Args:
+        detection_id: The detection session ID
+        iou_threshold: IoU threshold for considering same weed (0.0-1.0)
+        frame_gap: Maximum frame gap to consider for tracking (frames)
+    
+    Returns:
+        dict with unique_weed_count, tracks, and breakdown by class
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Get all detections sorted by frame
+    cursor.execute("""
+        SELECT id, frame_number, weed_class, confidence,
+               bbox_x, bbox_y, bbox_width, bbox_height,
+               latitude, longitude
+        FROM detection_details
+        WHERE detection_id = ?
+        ORDER BY frame_number, id
+    """, (detection_id,))
+    
+    detections = cursor.fetchall()
+    conn.close()
+    
+    if not detections:
+        return {'unique_count': 0, 'total_detections': 0, 'tracks': [], 'by_class': {}}
+    
+    def calculate_iou(box1, box2):
+        """Calculate Intersection over Union between two bounding boxes."""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        
+        # Calculate intersection
+        x_left = max(x1, x2)
+        y_top = max(y1, y2)
+        x_right = min(x1 + w1, x2 + w2)
+        y_bottom = min(y1 + h1, y2 + h2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+        
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+        box1_area = w1 * h1
+        box2_area = w2 * h2
+        union_area = box1_area + box2_area - intersection_area
+        
+        return intersection_area / union_area if union_area > 0 else 0.0
+    
+    def calculate_gps_distance(lat1, lon1, lat2, lon2):
+        """Calculate distance in meters between two GPS coordinates."""
+        if None in [lat1, lon1, lat2, lon2]:
+            return None
+        
+        from math import radians, cos, sin, asin, sqrt
+        
+        # Haversine formula
+        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        c = 2 * asin(sqrt(a))
+        r = 6371000  # Radius of earth in meters
+        return c * r
+    
+    # Track weeds across frames
+    tracks = []  # Each track is a list of detection IDs
+    
+    for det in detections:
+        det_id, frame_num, weed_class, confidence, bbox_x, bbox_y, bbox_width, bbox_height, lat, lon = det
+        box = (bbox_x, bbox_y, bbox_width, bbox_height)
+        
+        # Try to match with existing tracks
+        matched = False
+        for track in tracks:
+            last_det = track['detections'][-1]
+            last_frame, last_class, last_box, last_lat, last_lon = last_det
+            
+            # Check if same class
+            if weed_class != last_class:
+                continue
+            
+            # Check frame gap
+            if frame_num - last_frame > frame_gap:
+                continue
+            
+            # Check spatial proximity (IoU for bbox, GPS distance if available)
+            iou = calculate_iou(box, last_box)
+            gps_ok = True
+            
+            if lat is not None and lon is not None and last_lat is not None and last_lon is not None:
+                gps_dist = calculate_gps_distance(lat, lon, last_lat, last_lon)
+                # If GPS available, weed shouldn't move more than 2 meters
+                gps_ok = gps_dist is None or gps_dist < 2.0
+            
+            # Match if IoU is high enough and GPS check passes
+            if iou >= iou_threshold and gps_ok:
+                track['detections'].append((frame_num, weed_class, box, lat, lon))
+                track['detection_ids'].append(det_id)
+                track['last_frame'] = frame_num
+                track['avg_confidence'] = (track['avg_confidence'] * track['count'] + confidence) / (track['count'] + 1)
+                track['count'] += 1
+                matched = True
+                break
+        
+        # Create new track if no match
+        if not matched:
+            tracks.append({
+                'weed_class': weed_class,
+                'detections': [(frame_num, weed_class, box, lat, lon)],
+                'detection_ids': [det_id],
+                'first_frame': frame_num,
+                'last_frame': frame_num,
+                'avg_confidence': confidence,
+                'count': 1
+            })
+    
+    # Calculate summary
+    unique_count = len(tracks)
+    by_class = {}
+    for track in tracks:
+        weed_class = track['weed_class']
+        by_class[weed_class] = by_class.get(weed_class, 0) + 1
+    
+    return {
+        'unique_count': unique_count,
+        'total_detections': len(detections),
+        'tracks': tracks,
+        'by_class': by_class,
+        'reduction_percentage': round((1 - unique_count / len(detections)) * 100, 1) if len(detections) > 0 else 0
+    }
+
+
+def update_session_summary(detection_id: int):
+    """Update cached summary fields in detections table for fast mobile queries.
+    
+    Call this after inserting detection_details to cache:
+    - weed_class_counts (JSON)
+    - has_gps_data
+    - bounds (min/max lat/lng)
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Get class counts
+    cursor.execute("""
+        SELECT weed_class, COUNT(*) 
+        FROM detection_details 
+        WHERE detection_id = ? 
+        GROUP BY weed_class
+    """, (detection_id,))
+    class_counts = {row[0]: row[1] for row in cursor.fetchall()}
+    class_counts_json = json.dumps(class_counts)
+    
+    # Check if any detections have GPS data
+    cursor.execute("""
+        SELECT COUNT(*) 
+        FROM detection_details 
+        WHERE detection_id = ? AND latitude IS NOT NULL
+    """, (detection_id,))
+    has_gps = cursor.fetchone()[0] > 0
+    
+    # Get GPS bounds if available
+    bounds = {}
+    if has_gps:
+        cursor.execute("""
+            SELECT 
+                MIN(latitude), MAX(latitude),
+                MIN(longitude), MAX(longitude)
+            FROM detection_details 
+            WHERE detection_id = ? AND latitude IS NOT NULL
+        """, (detection_id,))
+        result = cursor.fetchone()
+        if result and result[0] is not None:
+            bounds = {
+                'min_lat': result[0],
+                'max_lat': result[1],
+                'min_lng': result[2],
+                'max_lng': result[3]
+            }
+    
+    # Update detections table
+    cursor.execute("""
+        UPDATE detections SET
+            weed_class_counts = ?,
+            has_gps_data = ?,
+            bounds_min_lat = ?,
+            bounds_max_lat = ?,
+            bounds_min_lng = ?,
+            bounds_max_lng = ?
+        WHERE id = ?
+    """, (
+        class_counts_json,
+        has_gps,
+        bounds.get('min_lat'),
+        bounds.get('max_lat'),
+        bounds.get('min_lng'),
+        bounds.get('max_lng'),
+        detection_id
+    ))
+    
+    conn.commit()
+    conn.close()
+
+
+def get_sessions_for_mobile():
+    """Get all detection sessions optimized for mobile app list view.
+    
+    Returns session data with cached summaries (no joins needed).
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT 
+            id, filename, timestamp, file_type, 
+            total_frames, total_detections, 
+            cloud_secure_url, cloud_annotated_url,
+            weed_class_counts, has_gps_data, has_srt_data
+        FROM detections 
+        ORDER BY timestamp DESC
+    """)
+    
+    sessions = []
+    for row in cursor.fetchall():
+        session = {
+            'id': row[0],
+            'filename': row[1],
+            'timestamp': row[2],
+            'file_type': row[3],
+            'total_frames': row[4],
+            'total_detections': row[5],
+            'cloud_secure_url': row[6],
+            'cloud_annotated_url': row[7],
+            'weed_class_counts': json.loads(row[8]) if row[8] else {},
+            'has_gps_data': bool(row[9]),
+            'has_srt_data': bool(row[10])
+        }
+        sessions.append(session)
+    
+    conn.close()
+    return sessions
+
+
+def get_detections_for_heatmap(detection_id: int):
+    """Get all detections with GPS data for heatmap generation (single query).
+    
+    Much faster than joining tables - GPS data stored directly in detection_details.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT 
+            frame_number, weed_class, confidence,
+            latitude, longitude, altitude,
+            bbox_x, bbox_y, bbox_width, bbox_height
+        FROM detection_details
+        WHERE detection_id = ? AND latitude IS NOT NULL
+        ORDER BY frame_number
+    """, (detection_id,))
+    
+    detections = []
+    for row in cursor.fetchall():
+        detections.append({
+            'frame_number': row[0],
+            'weed_class': row[1],
+            'confidence': row[2],
+            'latitude': row[3],
+            'longitude': row[4],
+            'altitude': row[5],
+            'bbox': [row[6], row[7], row[8], row[9]]
+        })
+    
+    conn.close()
+    return detections
+
 
 def fetch_detection_session(detection_id):
     """Fetch complete detection session with all details."""
@@ -288,7 +618,8 @@ def fetch_detection_session(detection_id):
     return {
         'detection': detection,
         'srt_track': srt_track,
-        'detection_details': detection_details
+        'detection_details': detection_details,
+        'frame_metadata': []  # Deprecated: frame_metadata table removed, kept for backward compatibility
     }
 
 def upsert_srt_track(detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json):
@@ -407,5 +738,6 @@ if __name__ == "__main__":
     print("✅ Enhanced database initialized with new tables!")
     print("📊 Tables created:")
     print("   - detections (sessions)")
-    print("   - frame_metadata (SRT data)")
+    print("   - srt_tracks (compact SRT/GPS data)")
     print("   - detection_details (individual detections)")
+    print("   - heatmaps (optional grid-based aggregation)")

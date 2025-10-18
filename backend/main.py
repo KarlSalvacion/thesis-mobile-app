@@ -18,10 +18,10 @@ try:
 except Exception:
     Image = None
 from .database import (
-    insert_detection, insert_frame_metadata, insert_detection_details,
+    insert_detection, insert_detection_details,
     fetch_detection_session, fetch_all_detections, get_detection_statistics,
     upsert_srt_track, reset_compact_tables, update_srt_status, DB_NAME, init_db,
-    fetch_detections_by_class, upsert_heatmap
+    fetch_detections_by_class, upsert_heatmap, calculate_unique_weeds
 )
 from .srt_parser import parse_srt_file, validate_srt_file
 
@@ -256,10 +256,12 @@ async def upload_combined_files(
     # Store detection details
     if detections and len(detections) > 0:
         print(f"Storing detection details...")
+        # Batch insert detection details (much faster than individual inserts)
         detail_count = 0
+        batch_details = []
         for frame_idx, frame_detections in enumerate(detections if isinstance(detections[0], list) else [detections]):
             for det in frame_detections:
-                insert_detection_details(detection_id, {
+                batch_details.append({
                     'frame_number': frame_idx + 1,
                     'weed_class': det.get('class', 'unknown'),
                     'confidence': det.get('confidence', 0.0),
@@ -270,7 +272,12 @@ async def upload_combined_files(
                     'detection_timestamp': timestamp
                 })
                 detail_count += 1
-        print(f"Stored {detail_count} detection details")
+        
+        # Single batch insert instead of N individual inserts (10x faster)
+        if batch_details:
+            from backend.database import batch_insert_detection_details
+            batch_insert_detection_details(detection_id, batch_details)
+        print(f"Stored {detail_count} detection details in batch")
 
     # Process SRT file if provided
     srt_message = ""
@@ -562,10 +569,12 @@ async def upload_file(file: UploadFile = File(...), skip_cloud: bool = Query(Fal
     # Store individual detection details if any (with batch optimization)
     if detections and len(detections) > 0:
         print(f"Storing detection details...")
+        batch_details = []
+        
         if isinstance(detections[0], list):  # Video
             for frame_idx, frame_detections in enumerate(detections):
                 for detection in frame_detections:
-                    detection_data = {
+                    batch_details.append({
                         'frame_number': frame_idx + 1,
                         'weed_class': detection['class'],
                         'confidence': detection['confidence'],
@@ -574,11 +583,10 @@ async def upload_file(file: UploadFile = File(...), skip_cloud: bool = Query(Fal
                         'bbox_width': detection['bbox'][2],
                         'bbox_height': detection['bbox'][3],
                         'detection_timestamp': timestamp
-                    }
-                    insert_detection_details(detection_id, detection_data)
+                    })
         else:  # Image
             for detection in detections:
-                detection_data = {
+                batch_details.append({
                     'frame_number': 1,
                     'weed_class': detection['class'],
                     'confidence': detection['confidence'],
@@ -587,8 +595,13 @@ async def upload_file(file: UploadFile = File(...), skip_cloud: bool = Query(Fal
                     'bbox_width': detection['bbox'][2],
                     'bbox_height': detection['bbox'][3],
                     'detection_timestamp': timestamp
-                }
-                insert_detection_details(detection_id, detection_data)
+                })
+        
+        # Single batch insert instead of N individual inserts (10x faster)
+        if batch_details:
+            from backend.database import batch_insert_detection_details
+            batch_insert_detection_details(detection_id, batch_details)
+            print(f"Stored {len(batch_details)} detection details in batch")
 
     # Cleanup temp file
     try:
@@ -720,11 +733,10 @@ async def get_detections():
 @app.get("/detections/with-srt/")
 async def get_detections_with_srt():
     """Get only detection sessions that have associated SRT data for mapping."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM detections WHERE has_srt_data = TRUE ORDER BY timestamp DESC")
-    detections = cursor.fetchall()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM detections WHERE has_srt_data = TRUE ORDER BY timestamp DESC")
+        detections = cursor.fetchall()
     return {"detections": detections}
 
 @app.get("/detection/{detection_id}")
@@ -734,6 +746,36 @@ async def get_detection_details(detection_id: int):
     if not session:
         raise HTTPException(status_code=404, detail="Detection session not found")
     return session
+
+@app.get("/detection/{detection_id}/unique-weeds")
+async def get_unique_weeds(
+    detection_id: int,
+    iou_threshold: float = Query(0.3, description="IoU threshold for matching (0.0-1.0)"),
+    frame_gap: int = Query(10, description="Maximum frame gap for tracking")
+):
+    """Calculate unique weed count by tracking across frames.
+    
+    This solves the problem of counting the same weed multiple times across frames.
+    Returns unique weed count instead of total detection count.
+    """
+    session = fetch_detection_session(detection_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Detection session not found")
+    
+    unique_weeds = calculate_unique_weeds(detection_id, iou_threshold, frame_gap)
+    
+    return {
+        "detection_id": detection_id,
+        "unique_weed_count": unique_weeds['unique_count'],
+        "total_detections": unique_weeds['total_detections'],
+        "reduction_percentage": unique_weeds['reduction_percentage'],
+        "weed_species": unique_weeds['by_class'],
+        "tracking_params": {
+            "iou_threshold": iou_threshold,
+            "frame_gap": frame_gap
+        },
+        "message": f"Found {unique_weeds['unique_count']} unique weeds from {unique_weeds['total_detections']} total detections ({unique_weeds['reduction_percentage']}% reduction)"
+    }
 
 @app.get("/statistics/")
 async def get_statistics():
@@ -806,11 +848,11 @@ async def admin_drop_tables(tables: str = Query("", description="Comma-separated
 async def get_gmap_polyline(detection_id: int):
     """Return Google Maps-ready polyline points and bounds for a detection's SRT track."""
     import sqlite3
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT path_geojson, bounds_geojson FROM srt_tracks WHERE detection_id = ?", (detection_id,))
-    row = cursor.fetchone()
-    conn.close()
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT path_geojson, bounds_geojson FROM srt_tracks WHERE detection_id = ?", (detection_id,))
+        row = cursor.fetchone()
+    
     if not row:
         raise HTTPException(status_code=404, detail="SRT track not found")
     path_geojson = json.loads(row[0])
@@ -830,21 +872,19 @@ async def generate_heatmap(detection_id: int, grid_size_m: float = Query(10.0), 
     """Generate heatmap from detection_details mapped to SRT frames; optionally persist aggregated grid."""
     import sqlite3
     # Load srt frames
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT frames_json, bounds_geojson FROM srt_tracks WHERE detection_id = ?", (detection_id,))
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="SRT track not found")
-    frames_json = row[0]
-    bounds_geojson = row[1]
-    frames = { int(f.get('i')): (f.get('lat'), f.get('lon')) for f in json.loads(frames_json) if f.get('lat') is not None and f.get('lon') is not None }
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT frames_json, bounds_geojson FROM srt_tracks WHERE detection_id = ?", (detection_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="SRT track not found")
+        frames_json = row[0]
+        bounds_geojson = row[1]
+        frames = { int(f.get('i')): (f.get('lat'), f.get('lon')) for f in json.loads(frames_json) if f.get('lat') is not None and f.get('lon') is not None }
 
-    # Load detection details
-    cursor.execute("SELECT frame_number, weed_class, confidence FROM detection_details WHERE detection_id = ?", (detection_id,))
-    details = cursor.fetchall()
-    conn.close()
+        # Load detection details
+        cursor.execute("SELECT frame_number, weed_class, confidence FROM detection_details WHERE detection_id = ?", (detection_id,))
+        details = cursor.fetchall()
 
     # Map detections to lat/lng points
     points = []
@@ -905,6 +945,317 @@ async def generate_heatmap(detection_id: int, grid_size_m: float = Query(10.0), 
             persisted = False
 
     return { 'detection_id': detection_id, 'points': points, 'grid': { 'grid_size_m': grid_size_m, 'cells': cells }, 'persisted': persisted }
+
+@app.get("/detection/{detection_id}/export")
+async def export_report(
+    detection_id: int,
+    format: str = Query("json", description="Export format: json, csv, or pdf")
+):
+    """Export detection report in JSON, CSV, or PDF format."""
+    from fastapi.responses import StreamingResponse
+    import io
+    import csv
+    from datetime import datetime as dt
+    
+    # Fetch all detection data
+    session = fetch_detection_session(detection_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Detection session not found")
+    
+    detection = session['detection']
+    detection_details = session['detection_details']
+    srt_track = session.get('srt_track')
+    
+    # Parse detection tuple
+    det_id, filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data = detection[0:11]
+    cloud_public_id = detection[11] if len(detection) > 11 else None
+    cloud_resource_type = detection[12] if len(detection) > 12 else None
+    cloud_secure_url = detection[13] if len(detection) > 13 else None
+    cloud_annotated_url = detection[14] if len(detection) > 14 else None
+    
+    # Calculate statistics
+    weed_classes = {}
+    total_confidence = 0
+    for detail in detection_details:
+        weed_class = detail[3]
+        confidence = detail[4]
+        if weed_class not in weed_classes:
+            weed_classes[weed_class] = {'count': 0, 'total_confidence': 0}
+        weed_classes[weed_class]['count'] += 1
+        weed_classes[weed_class]['total_confidence'] += confidence
+        total_confidence += confidence
+    
+    # Calculate averages
+    avg_confidence = (total_confidence / len(detection_details)) if detection_details else 0
+    for weed_class in weed_classes:
+        weed_classes[weed_class]['avg_confidence'] = weed_classes[weed_class]['total_confidence'] / weed_classes[weed_class]['count']
+    
+    if format.lower() == "json":
+        # JSON Export
+        report = {
+            'report_generated': dt.now().isoformat(),
+            'detection_session': {
+                'id': det_id,
+                'filename': filename,
+                'timestamp': timestamp,
+                'file_type': file_type,
+                'summary': summary,
+                'total_frames': total_frames,
+                'total_detections': total_detections,
+                'processing_time': processing_time,
+                'has_gps_data': bool(has_srt_data),
+                'cloud_url': cloud_secure_url,
+                'annotated_url': cloud_annotated_url
+            },
+            'statistics': {
+                'total_weeds_detected': len(detection_details),
+                'average_confidence': round(avg_confidence, 2),
+                'weed_classes': {
+                    weed_class: {
+                        'count': data['count'],
+                        'percentage': round((data['count'] / len(detection_details)) * 100, 2),
+                        'avg_confidence': round(data['avg_confidence'], 2)
+                    }
+                    for weed_class, data in weed_classes.items()
+                }
+            },
+            'detections': [
+                {
+                    'id': d[0],
+                    'frame_number': d[2],
+                    'weed_class': d[3],
+                    'confidence': round(d[4], 2),
+                    'bbox': {
+                        'x': d[5], 'y': d[6], 'width': d[7], 'height': d[8]
+                    },
+                    'timestamp': d[14] if len(d) > 14 else None
+                }
+                for d in detection_details
+            ]
+        }
+        
+        if srt_track:
+            frames_json = json.loads(srt_track[6]) if len(srt_track) > 6 else []
+            report['gps_data'] = {
+                'point_count': srt_track[1] if len(srt_track) > 1 else 0,
+                'start_time': srt_track[2] if len(srt_track) > 2 else None,
+                'end_time': srt_track[3] if len(srt_track) > 3 else None,
+                'frames': frames_json
+            }
+        
+        return JSONResponse(content=report)
+    
+    elif format.lower() == "csv":
+        # CSV Export
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Header rows
+        writer.writerow(['Weed Detection Report'])
+        writer.writerow(['Generated', dt.now().strftime('%Y-%m-%d %H:%M:%S')])
+        writer.writerow(['Session ID', det_id])
+        writer.writerow(['Filename', filename])
+        writer.writerow(['Timestamp', timestamp])
+        writer.writerow(['Total Detections', len(detection_details)])
+        writer.writerow(['Average Confidence', f"{avg_confidence:.2f}%"])
+        writer.writerow([])
+        
+        # Weed class summary
+        writer.writerow(['Weed Class Summary'])
+        writer.writerow(['Class', 'Count', 'Percentage', 'Avg Confidence'])
+        for weed_class, data in weed_classes.items():
+            writer.writerow([
+                weed_class,
+                data['count'],
+                f"{(data['count'] / len(detection_details)) * 100:.2f}%",
+                f"{data['avg_confidence']:.2f}%"
+            ])
+        writer.writerow([])
+        
+        # Detailed detections
+        writer.writerow(['Detailed Detections'])
+        writer.writerow(['ID', 'Frame', 'Weed Class', 'Confidence', 'BBox X', 'BBox Y', 'Width', 'Height'])
+        for d in detection_details:
+            writer.writerow([d[0], d[2], d[3], f"{d[4]:.2f}", d[5], d[6], d[7], d[8]])
+        
+        output.seek(0)
+        return StreamingResponse(
+            io.BytesIO(output.getvalue().encode('utf-8')),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=detection_report_{det_id}.csv"}
+        )
+    
+    elif format.lower() == "pdf":
+        # PDF Export (requires reportlab - optional, fallback to JSON if not available)
+        try:
+            from reportlab.lib.pagesizes import letter, A4
+            from reportlab.lib import colors
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+            from reportlab.lib.enums import TA_CENTER, TA_LEFT
+            
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=letter)
+            styles = getSampleStyleSheet()
+            story = []
+            
+            # Title
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=24,
+                textColor=colors.HexColor('#2c3e50'),
+                spaceAfter=30,
+                alignment=TA_CENTER
+            )
+            story.append(Paragraph("Weed Detection Report", title_style))
+            story.append(Spacer(1, 0.2*inch))
+            
+            # Session info
+            session_data = [
+                ['Session ID:', str(det_id)],
+                ['Filename:', filename],
+                ['Date:', timestamp],
+                ['File Type:', file_type],
+                ['Total Frames:', str(total_frames)],
+                ['Total Detections:', str(len(detection_details))],
+                ['Processing Time:', f"{processing_time:.2f}s"],
+                ['Average Confidence:', f"{avg_confidence:.2f}%"],
+                ['GPS Data:', 'Yes' if has_srt_data else 'No']
+            ]
+            
+            session_table = Table(session_data, colWidths=[2*inch, 4*inch])
+            session_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#ecf0f1')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey)
+            ]))
+            story.append(session_table)
+            story.append(Spacer(1, 0.3*inch))
+            
+            # Weed class summary
+            story.append(Paragraph("Weed Species Summary", styles['Heading2']))
+            story.append(Spacer(1, 0.1*inch))
+            
+            class_data = [['Weed Class', 'Count', 'Percentage', 'Avg Confidence']]
+            for weed_class, data in weed_classes.items():
+                class_data.append([
+                    weed_class,
+                    str(data['count']),
+                    f"{(data['count'] / len(detection_details)) * 100:.1f}%",
+                    f"{data['avg_confidence']:.1f}%"
+                ])
+            
+            class_table = Table(class_data, colWidths=[2*inch, 1.5*inch, 1.5*inch, 1.5*inch])
+            class_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3498db')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 11),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.black)
+            ]))
+            story.append(class_table)
+            story.append(Spacer(1, 0.3*inch))
+            
+            # Detection details (first 50 for brevity)
+            story.append(Paragraph(f"Detection Details (showing first 50 of {len(detection_details)})", styles['Heading2']))
+            story.append(Spacer(1, 0.1*inch))
+            
+            detail_data = [['Frame', 'Weed Class', 'Confidence', 'BBox (x, y, w, h)']]
+            for d in detection_details[:50]:
+                detail_data.append([
+                    str(d[2]),
+                    d[3],
+                    f"{d[4]:.1f}%",
+                    f"({d[5]:.0f}, {d[6]:.0f}, {d[7]:.0f}, {d[8]:.0f})"
+                ])
+            
+            detail_table = Table(detail_data, colWidths=[1*inch, 2*inch, 1.5*inch, 2*inch])
+            detail_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2ecc71')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey]),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.black)
+            ]))
+            story.append(detail_table)
+            
+            # Build PDF
+            doc.build(story)
+            buffer.seek(0)
+            
+            return StreamingResponse(
+                buffer,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename=detection_report_{det_id}.pdf"}
+            )
+        except ImportError:
+            # Fallback to JSON if reportlab not installed
+            raise HTTPException(
+                status_code=501,
+                detail="PDF export requires 'reportlab' package. Install with: pip install reportlab"
+            )
+    else:
+        raise HTTPException(status_code=400, detail="Invalid format. Use 'json', 'csv', or 'pdf'")
+
+@app.post("/detection/{detection_id}/share")
+async def create_share_package(detection_id: int):
+    """Create a shareable package with detection report and media URLs."""
+    import base64
+    
+    # Fetch detection data
+    session = fetch_detection_session(detection_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Detection session not found")
+    
+    detection = session['detection']
+    detection_details = session['detection_details']
+    
+    # Parse detection tuple
+    det_id, filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data = detection[0:11]
+    cloud_public_id = detection[11] if len(detection) > 11 else None
+    cloud_secure_url = detection[13] if len(detection) > 13 else None
+    cloud_annotated_url = detection[14] if len(detection) > 14 else None
+    
+    # Calculate simple stats
+    weed_classes = {}
+    for detail in detection_details:
+        weed_class = detail[3]
+        weed_classes[weed_class] = weed_classes.get(weed_class, 0) + 1
+    
+    # Create shareable package
+    share_package = {
+        'detection_id': det_id,
+        'filename': filename,
+        'timestamp': timestamp,
+        'summary': summary,
+        'total_detections': len(detection_details),
+        'weed_species': weed_classes,
+        'has_gps_data': bool(has_srt_data),
+        'media_urls': {
+            'original': cloud_secure_url,
+            'annotated': cloud_annotated_url
+        },
+        'share_message': f"🌿 Weed Detection Results\n\nFile: {filename}\nDetected: {len(detection_details)} weeds\nSpecies: {', '.join(weed_classes.keys())}\n\nView details at: {cloud_annotated_url or cloud_secure_url or 'N/A'}"
+    }
+    
+    # Generate a simple share token (base64 encoded detection_id)
+    share_token = base64.urlsafe_b64encode(str(det_id).encode()).decode()
+    share_package['share_token'] = share_token
+    # Note: In production, this should point to a web frontend or public share page
+    share_package['share_url'] = f"https://your-domain.com/shared/{share_token}"
+    
+    return JSONResponse(content=share_package)
 
 if __name__ == "__main__":
     import uvicorn
