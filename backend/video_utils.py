@@ -68,7 +68,7 @@ def transcode_video_to_preview(input_path: str, target_height: Optional[int] = N
     return out_path
 
 
-def compress_for_inference(input_path: str, max_size_mb: int = 100) -> str:
+def compress_for_inference(input_path: str, max_size_mb: int = 100, force: bool = False) -> str:
     """Compress video for Roboflow inference while maintaining detection quality.
     
     Strategy:
@@ -81,6 +81,7 @@ def compress_for_inference(input_path: str, max_size_mb: int = 100) -> str:
     Args:
         input_path: Path to original video
         max_size_mb: Target maximum file size in MB
+        force: Force re-encoding even if size is OK (for codec compatibility)
         
     Returns:
         Path to compressed video file (temp file - caller should delete)
@@ -88,41 +89,60 @@ def compress_for_inference(input_path: str, max_size_mb: int = 100) -> str:
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input video not found: {input_path}")
     
-    # Check if compression is needed
-    try:
-        size_mb = os.path.getsize(input_path) / (1024 * 1024)
-        if size_mb <= max_size_mb:
-            print(f"Video is {size_mb:.1f} MB, no compression needed (target: {max_size_mb} MB)")
-            return input_path
-    except Exception:
-        pass
+    # Check if compression/re-encoding is needed
+    size_mb = os.path.getsize(input_path) / (1024 * 1024)
     
-    print(f"Compressing video for inference (target: {max_size_mb} MB)...")
+    if not force and size_mb <= max_size_mb:
+        # Size is OK, but check if codec is compatible
+        if not needs_reencoding(input_path):
+            print(f"Video is {size_mb:.1f} MB with compatible codec, no processing needed")
+            return input_path
+        else:
+            print(f"Video codec incompatible, re-encoding to H.264...")
+    else:
+        print(f"Compressing video for inference (current: {size_mb:.1f} MB, target: {max_size_mb} MB)...")
     
     # Create temporary output file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp.close()
     out_path = tmp.name
     
+    # Get current video size to determine compression strategy
+    current_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+    
+    # Use 1440p for better quality, adjust CRF based on file size
+    target_height = 1440  # 2560x1440 resolution
+    
+    if current_size_mb > 500:
+        # More aggressive CRF for very large files
+        crf = 30  # Still good quality, smaller file
+        bitrate_limit = '5M'  # Max bitrate cap (higher for 1440p)
+        print(f"Compressing large video (1440p, CRF 30) for {current_size_mb:.1f} MB video")
+    else:
+        # Standard compression for moderate files
+        crf = 28
+        bitrate_limit = None
+        print(f"Using standard compression (1440p, CRF 28) for {current_size_mb:.1f} MB video")
+    
     # Compression settings optimized for detection quality
-    # - Scale to 1080p max (weeds still clearly visible)
-    # - CRF 28 = good quality, smaller file (lower = better quality, bigger file)
-    # - Fast preset for speed
-    # - Copy audio (not needed for detection but keeps it)
     cmd_args = [
         FFMPEG_BINARY,
         '-y',  # Overwrite output
         '-i', input_path,
-        '-vf', 'scale=-2:\'min(1080,ih)\'',  # Max height 1080p, maintain aspect ratio
+        '-vf', f'scale=-2:\'min({target_height},ih)\'',  # Scale to 1440p max
         '-c:v', 'libx264',  # H.264 codec
-        '-crf', '28',  # Constant Rate Factor (18-28 is good range, 28 = smaller files)
-        '-preset', 'fast',  # Encoding speed (fast = good balance)
+        '-crf', str(crf),  # Variable quality
+        '-preset', 'veryfast',  # Very fast encoding for speed (was 'faster')
         '-pix_fmt', 'yuv420p',  # Compatibility
         '-c:a', 'aac',  # Audio codec
-        '-b:a', '128k',  # Audio bitrate (keep low, not needed for detection)
-        '-movflags', '+faststart',  # Optimize for streaming
-        out_path
+        '-b:a', '64k',  # Lower audio bitrate (not needed for detection)
     ]
+    
+    # Add bitrate limit for very large files
+    if bitrate_limit:
+        cmd_args.extend(['-maxrate', bitrate_limit, '-bufsize', '4M'])
+    
+    cmd_args.extend(['-movflags', '+faststart', out_path])
     
     try:
         print(f"Running ffmpeg compression: {' '.join(cmd_args[:3])}...")
@@ -134,6 +154,32 @@ def compress_for_inference(input_path: str, max_size_mb: int = 100) -> str:
             original_size_mb = os.path.getsize(input_path) / (1024 * 1024)
             reduction = ((original_size_mb - compressed_size_mb) / original_size_mb) * 100
             print(f"✅ Compression complete: {original_size_mb:.1f} MB → {compressed_size_mb:.1f} MB ({reduction:.1f}% reduction)")
+            
+            # If still too large and we haven't tried aggressive yet, retry with 1080p
+            if compressed_size_mb > max_size_mb and target_height > 1080:
+                print(f"⚠️  Output still {compressed_size_mb:.1f} MB (target: {max_size_mb} MB), retrying with 1080p...")
+                os.remove(out_path)
+                
+                # Retry with more aggressive settings (1080p)
+                tmp2 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp2.close()
+                out_path2 = tmp2.name
+                
+                cmd_args_aggressive = [
+                    FFMPEG_BINARY, '-y', '-i', input_path,
+                    '-vf', 'scale=-2:\'min(1080,ih)\'',  # 1080p fallback
+                    '-c:v', 'libx264', '-crf', '32',
+                    '-preset', 'faster', '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac', '-b:a', '64k',
+                    '-maxrate', '3M', '-bufsize', '4M',
+                    '-movflags', '+faststart', out_path2
+                ]
+                
+                subprocess.check_output(cmd_args_aggressive, stderr=subprocess.STDOUT)
+                compressed_size_mb = os.path.getsize(out_path2) / (1024 * 1024)
+                print(f"✅ Aggressive compression: {original_size_mb:.1f} MB → {compressed_size_mb:.1f} MB ({((original_size_mb - compressed_size_mb) / original_size_mb) * 100:.1f}% reduction)")
+                return out_path2
+            
             return out_path
         else:
             raise FileNotFoundError("FFmpeg did not create output file")
@@ -159,14 +205,56 @@ def compress_for_inference(input_path: str, max_size_mb: int = 100) -> str:
         raise
 
 
+def get_video_codec(video_path: str) -> str:
+    """Get the video codec name (e.g., 'h264', 'hevc', 'vp9').
+    
+    Uses ffprobe to detect codec. Returns 'unknown' if unable to detect.
+    """
+    try:
+        cmd_args = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_path
+        ]
+        result = subprocess.check_output(cmd_args, stderr=subprocess.STDOUT).decode('utf-8').strip()
+        codec = result.lower()
+        print(f'Detected video codec: {codec}')
+        return codec
+    except Exception as e:
+        print(f'Could not detect video codec: {e}')
+        return 'unknown'
+
+
+def needs_reencoding(video_path: str) -> bool:
+    """Check if video needs re-encoding for Roboflow compatibility.
+    
+    DJI drones and some cameras use H.265/HEVC which Roboflow may not accept.
+    This function detects incompatible codecs.
+    
+    Returns True if video should be re-encoded to H.264.
+    """
+    codec = get_video_codec(video_path)
+    
+    # Incompatible codecs that need re-encoding
+    incompatible_codecs = ['hevc', 'h265', 'vp9', 'av1', 'mpeg2video']
+    
+    if codec in incompatible_codecs:
+        print(f'⚠️  Video codec {codec} is incompatible with Roboflow, re-encoding required')
+        return True
+    
+    print(f'✅ Video codec {codec} is compatible with Roboflow')
+    return False
+
+
 def get_video_fps(video_path: str) -> float:
     """Get the FPS (frames per second) of a video file.
     
     Tries OpenCV first (faster), falls back to ffprobe if unavailable.
-    Returns the video FPS, or DEFAULT_VIDEO_FPS if unable to detect.
+    Returns the video FPS, or 30.0 if unable to detect.
     """
-    from .config import DEFAULT_VIDEO_FPS
-    
     # Try OpenCV first (no external dependencies)
     if _HAS_OPENCV and _cv2 is not None:
         try:
@@ -204,16 +292,15 @@ def get_video_fps(video_path: str) -> float:
         
         # Sanity check: FPS should be between 1 and 120
         if 1 <= fps <= 120:
-            print(f'Detected original video FPS: {fps:.2f}')
+            print(f'Detected original video FPS (ffprobe): {fps:.2f}')
             return fps
         else:
-            print(f'Unusual FPS detected ({fps}), using default: {DEFAULT_VIDEO_FPS}')
-            return float(DEFAULT_VIDEO_FPS)
+            print(f'Unusual FPS detected ({fps}), using fallback: 30.0')
+            return 30.0
             
     except Exception as e:
-        print(f'Could not detect video FPS: {e}, using default: {DEFAULT_VIDEO_FPS}')
-        from .config import DEFAULT_VIDEO_FPS
-        return float(DEFAULT_VIDEO_FPS)
+        print(f'Could not detect video FPS: {e}, using fallback: 30.0')
+        return 30.0
 
 
 def get_video_duration(video_path: str) -> Optional[float]:
@@ -319,15 +406,30 @@ def extract_frames_cv2(video_path: str, target_fps: Optional[float] = None, max_
         
         print(f"OpenCV video info: {video_fps:.2f} FPS, {total_frames} total frames")
         
-        # Calculate frame skip interval
+        # Calculate which frames to extract (match Roboflow's frame selection)
+        # Use time-based calculation to avoid drift
         if target_fps is None or target_fps >= video_fps:
-            skip_interval = 1  # Extract all frames
+            # Extract all frames
+            frame_indices = list(range(min(total_frames, max_frames)))
             effective_fps = video_fps
         else:
-            skip_interval = int(video_fps / target_fps)
+            # Extract frames at target FPS using time-based calculation
+            # Match Roboflow's method: frame at time t = t * target_fps
+            video_duration = total_frames / video_fps
+            num_frames = int(video_duration * target_fps)
+            num_frames = min(num_frames, max_frames)
+            
+            # Calculate exact frame indices (same as Roboflow)
+            frame_indices = []
+            for i in range(num_frames):
+                timestamp = i / target_fps  # Time in seconds
+                frame_idx = round(timestamp * video_fps)  # Corresponding video frame
+                if frame_idx < total_frames:
+                    frame_indices.append(frame_idx)
+            
             effective_fps = target_fps
         
-        print(f"Extracting frames at {effective_fps:.2f} FPS (every {skip_interval} frame(s))")
+        print(f"Extracting frames at {effective_fps:.2f} FPS ({len(frame_indices)} frames total)")
         
         # Create temp directory for frames
         tmpdir = tempfile.mkdtemp(prefix='cv2_frames_')
@@ -335,14 +437,15 @@ def extract_frames_cv2(video_path: str, target_fps: Optional[float] = None, max_
         
         frame_idx = 0
         extracted_count = 0
+        frame_indices_set = set(frame_indices)  # For O(1) lookup
         
-        while cap.isOpened() and extracted_count < max_frames:
+        while cap.isOpened() and extracted_count < len(frame_indices):
             ret, frame = cap.read()
             if not ret:
                 break
             
-            # Extract frame at interval
-            if frame_idx % skip_interval == 0:
+            # Extract only the specific frames we need
+            if frame_idx in frame_indices_set:
                 frame_path = os.path.join(tmpdir, f'frame_{extracted_count + 1:06d}.jpg')
                 _cv2.imwrite(frame_path, frame, [_cv2.IMWRITE_JPEG_QUALITY, 95])
                 frame_paths.append(frame_path)
@@ -460,9 +563,9 @@ def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_patter
                     '-y',  # Overwrite output
                     '-i', output_path,  # Input: uncompressed mp4v
                     '-c:v', 'libx264',  # H.264 codec (web-compatible)
-                    '-preset', 'medium',  # Balance speed vs compression
-                    '-crf', '23',  # High quality (lower = better, 23 is excellent)
-                    '-maxrate', '8M',  # Max bitrate 8 Mbps
+                    '-preset', 'faster',  # Faster encoding (was 'medium')
+                    '-crf', '20',  # Very high quality (was 23, lower = better quality)
+                    '-maxrate', '12M',  # Higher max bitrate for better quality (was 8M)
                     '-bufsize', '16M',
                     '-pix_fmt', 'yuv420p',  # Browser compatibility
                     '-movflags', '+faststart',  # Web streaming optimization

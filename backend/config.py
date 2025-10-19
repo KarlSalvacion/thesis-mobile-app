@@ -3,29 +3,41 @@
 Fill in your own Roboflow and Cloudinary credentials below.
 """
 
+import os
+
+# Detect deployment environment
+IS_RENDER = os.getenv('RENDER') is not None
+IS_LOCAL = not IS_RENDER
+
 # Your Roboflow API key
-ROBOFLOW_API_KEY = "RpeaIrOXAbnFIfwEbbdB"
+ROBOFLOW_API_KEY = "yAsiXl4Gm06xmHs5nyye"
 
 # Your Roboflow project name
-ROBOFLOW_PROJECT = "thesis-online-gathered-ds-y6uy4"
+ROBOFLOW_PROJECT = "thesis_testing-gf8bn"
 
 # Optional: specify workspace explicitly if API key has multiple workspaces
 # Leave blank to use default workspace associated with the API key
 # Roboflow workspace slug (not numeric id). If unknown, leave empty.
 ROBOFLOW_WORKSPACE = ""
 
-# Model version to use (e.g., 9 for "thesis-online-gathered-ds-y6uy4/9")
-ROBOFLOW_VERSION = "13"
+# Model version to use (e.g., 2 for "thesis_testing-gf8bn/2")
+ROBOFLOW_VERSION = "2"
 
 # Default inference parameters
-DEFAULT_CONFIDENCE = 0.3  # Match Roboflow preview defaults
+DEFAULT_CONFIDENCE = 0.1  # Match Roboflow preview defaults
 DEFAULT_OVERLAP = 0.7  # Higher overlap threshold = more aggressive NMS, fewer duplicate boxes (Roboflow preview uses ~0.7)
-DEFAULT_VIDEO_FPS = 30  # Balanced FPS for API stability (too high causes API timeouts)
+DEFAULT_VIDEO_FPS = 10  # 10 FPS for good balance between speed and smoothness. Set to None to auto-detect.
 
 # Inference optimization settings
 USE_LOCAL_INFERENCE = False  # Use Roboflow hosted API (no local inference package needed on Render)
 COMPRESS_FRAMES_BEFORE_INFERENCE = True  # Reduce image size before sending (faster upload)
 INFERENCE_IMAGE_SIZE = 640  # Resize to this width/height before inference (640 is optimal for YOLO)
+
+# Compression strategy (environment-aware)
+# On Render free tier: Limited RAM (512 MB) and CPU (0.5 core) makes FFmpeg compression slow/unstable
+# Solution: Skip pre-compression, let Roboflow handle large files (or reject if >100 MB)
+ENABLE_PRECOMPRESSION = IS_LOCAL  # Only compress locally, not on Render free tier
+MAX_VIDEO_SIZE_WITHOUT_COMPRESSION_MB = 100  # Warn user if video >100 MB on Render
 
 # Frame interval for video detection (process every Nth frame for speed)
 # 1 = detect on every frame, 2 = detect every 2nd frame, 3 = every 3rd frame, etc.
@@ -41,10 +53,15 @@ SMART_SKIP_WINDOW = 15  # If detection found, process next N frames fully
 # Video annotation optimization mode
 # 'fast' = Only process frames at detection FPS, use FFmpeg drawtext overlay (10-20x faster)
 # 'quality' = Extract all frames, annotate individually, stitch back (slower, higher quality)
-VIDEO_ANNOTATION_MODE = 'quality'  # Use 'quality' for better compatibility with long videos
+VIDEO_ANNOTATION_MODE = 'fast'  # Use 'fast' for 10-20x faster processing (OpenCV drawing)
 
-# Maximum annotations to show (prevent FFmpeg command line overflow on Windows)
-MAX_ANNOTATIONS_FAST_MODE = 50  # Limit annotations in fast mode to prevent command line overflow
+# Detection persistence for video annotations (how long bounding boxes stay visible)
+# For drone weed detection: Match persistence to detection interval to avoid stacking
+# Formula: original_fps / detection_fps (e.g., 30 FPS / 5 FPS = 6 frames)
+# This creates seamless coverage without overlapping boxes
+DETECTION_PERSISTENCE_FRAMES = None  # Auto-calculate based on FPS (original_fps / detection_fps)
+DETECTION_PERSISTENCE_MULTIPLIER = 1.0  # Multiply by this for overlap (1.0 = seamless, 1.5 = 50% overlap)
+
 
 # Maximum frames to process (set high to avoid truncating videos)
 MAX_VIDEO_FRAMES = 10000  # Support videos up to 5+ minutes at 30 FPS
@@ -63,8 +80,9 @@ FORCE_LOCAL_VIDEO_PROCESSING = False
 # ============================================================================
 
 # Object tracking - Track detected objects across frames for smoother bounding boxes
-# Reduces jitter and helps maintain consistent detection of the same object
-ENABLE_OBJECT_TRACKING = True  # Uses OpenCV KCF tracker
+# NOTE: Disabled for drone weed detection since weeds are static (don't move)
+# Tracking is for moving objects like people/vehicles, not needed for static weeds
+ENABLE_OBJECT_TRACKING = False  # Disabled for static weed detection
 TRACKING_CONFIDENCE_DECAY = 0.95  # How quickly confidence decays when object not detected (0.9-0.99)
 
 # Temporal consistency filtering - Require objects to appear in multiple frames
@@ -74,8 +92,9 @@ TEMPORAL_MIN_APPEARANCES = 2  # Object must appear in at least N frames to be va
 TEMPORAL_MAX_GAP = 5  # Maximum frames between appearances
 
 # Background subtraction - Identify moving vs static objects
-# Useful for filtering out static background elements (e.g., posts, fences)
-ENABLE_BACKGROUND_SUBTRACTION = True
+# NOTE: Disabled for drone weed detection since weeds ARE the static background
+# This feature is for filtering out static objects when detecting moving ones
+ENABLE_BACKGROUND_SUBTRACTION = False  # Disabled - weeds are part of the ground/background
 BG_LEARNING_RATE = 0.01  # How quickly background model adapts (0.001-0.1)
 BG_VAR_THRESHOLD = 16  # Foreground detection sensitivity (lower = more sensitive)
 

@@ -46,5 +46,9 @@ yarn-error.*
 # local env files
 .env*.local
 
+
 # typescript
 *.tsbuildinfo
+
+# Uploads folder (contains user-uploaded videos/images)
+uploads/

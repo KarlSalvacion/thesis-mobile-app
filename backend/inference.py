@@ -56,6 +56,13 @@ try:
     from .config import VIDEO_ANNOTATION_MODE
 except ImportError:
     VIDEO_ANNOTATION_MODE = 'fast'  # Default to fast mode
+
+try:
+    from .config import DETECTION_PERSISTENCE_FRAMES, DETECTION_PERSISTENCE_MULTIPLIER
+except ImportError:
+    DETECTION_PERSISTENCE_FRAMES = None  # Auto-calculate
+    DETECTION_PERSISTENCE_MULTIPLIER = 1.0
+
 from .config import FFMPEG_BINARY
 from .video_utils import get_video_fps, get_video_duration, get_video_frame_count
 from .video_utils import extract_frames_cv2, stitch_video_cv2, MotionDetectionSkipper
@@ -138,9 +145,9 @@ def calculate_iou(box1, box2):
 def merge_detections(existing_dets, new_dets):
     """Merge new detections into existing ones, replacing overlapping boxes.
     
-    Uses low IoU threshold to aggressively replace boxes for smooth tracking.
+    Uses IoU threshold to detect overlapping boxes and keep only the highest confidence one.
     """
-    IOU_THRESHOLD = 0.15  # If boxes overlap >15%, they're the same object (more aggressive merging)
+    IOU_THRESHOLD = 0.3  # If boxes overlap >30%, they're the same object (keep highest confidence)
     merged = []
     used_new = set()
     
@@ -220,6 +227,15 @@ def _parse_roboflow_video_response(results: Any) -> List[Any]:
 
 
 # ---------- Annotation helpers ----------
+# Try OpenCV first (5-10x faster than PIL)
+try:
+    import cv2 as _cv2
+    _HAS_CV2 = True
+    print("OpenCV successfully imported for image annotation")
+except Exception:
+    _HAS_CV2 = False
+
+# PIL fallback
 try:
     from PIL import Image as _PILImage
     from PIL import ImageDraw as _PILDraw
@@ -231,13 +247,63 @@ except Exception as e:
     print(f"Warning: PIL/Pillow not available for image annotation: {e}")
 
 def _annotate_image_file(input_path: str, detections: List[Dict[str, Any]]) -> Optional[bytes]:
-    """Draw boxes, labels, and confidence on an image; return JPEG bytes."""
-    if not _HAS_PIL:
-        print("Warning: PIL/Pillow is not available, cannot annotate image")
-        return None
+    """Draw boxes, labels, and confidence on an image; return JPEG bytes.
+    Uses OpenCV (5-10x faster than PIL) with PIL fallback.
+    """
     if not detections:
         print("Warning: No detections to annotate")
         return None
+    
+    # Prefer OpenCV for 5-10x faster annotation
+    if _HAS_CV2:
+        try:
+            # Read image with OpenCV
+            img = _cv2.imread(input_path)
+            if img is None:
+                raise ValueError(f"Failed to load image: {input_path}")
+            
+            for det in detections:
+                x, y, w, h = det.get('bbox', [0, 0, 0, 0])
+                cls = str(det.get('class', ''))
+                conf = det.get('confidence', 0.0)
+                
+                # Convert to integers for OpenCV
+                x, y, w, h = int(x), int(y), int(w), int(h)
+                
+                # Draw rectangle (BGR: red = (0, 0, 255))
+                _cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 3)
+                
+                # Draw label background and text
+                label = f"{cls} {conf:.2f}"
+                font = _cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 0.6
+                thickness = 2
+                
+                # Get text size for background rectangle
+                (text_w, text_h), baseline = _cv2.getTextSize(label, font, font_scale, thickness)
+                
+                # Draw label background
+                _cv2.rectangle(img, (x, y - text_h - 8), (x + text_w + 6, y), (0, 0, 255), -1)
+                
+                # Draw text
+                _cv2.putText(img, label, (x + 3, y - 4), font, font_scale, (255, 255, 255), thickness)
+            
+            # Encode to JPEG bytes
+            success, buffer = _cv2.imencode('.jpg', img, [_cv2.IMWRITE_JPEG_QUALITY, 85])
+            if success:
+                return buffer.tobytes()
+            else:
+                raise ValueError("Failed to encode image to JPEG")
+                
+        except Exception as e:
+            print(f"OpenCV annotation failed, falling back to PIL: {e}")
+            # Fall through to PIL
+    
+    # PIL fallback (slower but works if OpenCV unavailable)
+    if not _HAS_PIL:
+        print("Warning: Neither OpenCV nor PIL/Pillow available, cannot annotate image")
+        return None
+    
     try:
         img = _PILImage.open(input_path).convert('RGB')
         draw = _PILDraw.Draw(img)
@@ -370,7 +436,14 @@ def _create_annotated_video_fast(
         filter_parts = []
         
         # For smooth tracking: persist detections across frames
-        persistence_frames = max(1, int(original_fps / detection_fps))
+        # Auto-calculate persistence to match detection interval (avoid stacking boxes)
+        if DETECTION_PERSISTENCE_FRAMES is None:
+            # Auto-calculate: original_fps / detection_fps gives frame interval between detections
+            # Use round() not int() to avoid truncation (2.997 → 3, not 2)
+            persistence_frames = max(1, round((original_fps / detection_fps) * DETECTION_PERSISTENCE_MULTIPLIER))
+        else:
+            persistence_frames = DETECTION_PERSISTENCE_FRAMES
+        print(f'Detection persistence: {persistence_frames} frames (~{persistence_frames / original_fps:.2f}s, multiplier: {DETECTION_PERSISTENCE_MULTIPLIER}x)')
         
         total_annotations = 0
         for frame_idx, frame_dets in enumerate(detections_by_frame):
@@ -416,6 +489,17 @@ def _create_annotated_video_fast(
         # Combine all filters
         vf_filter = ','.join(filter_parts)
         
+        # Check if command will exceed Windows command line limit (~8191 chars)
+        # Estimate: base command ~200 chars + filter length
+        estimated_cmd_length = 200 + len(vf_filter)
+        
+        if estimated_cmd_length > 8000:
+            print(f'⚠️  Command too long ({estimated_cmd_length} chars) for Windows FFmpeg')
+            print(f'   Windows limit: ~8191 characters')
+            print(f'   Total annotations: {total_annotations}')
+            print(f'   Falling back to quality mode (OpenCV) for reliability')
+            return False  # Fallback to quality mode
+        
         # Run FFmpeg with filter
         cmd_args = [
             FFMPEG_BINARY,
@@ -429,8 +513,11 @@ def _create_annotated_video_fast(
             output_path,
         ]
         
+        print(f'Command length: {estimated_cmd_length} chars (within Windows limit)')
         print('Running FFmpeg annotation (this may take a moment for complex filters)...')
         result = subprocess.check_output(cmd_args, stderr=subprocess.STDOUT, timeout=300)
+        print('FFmpeg annotation completed successfully')
+
         print('FFmpeg annotation completed successfully')
         
         if os.path.exists(output_path):
@@ -839,10 +926,12 @@ def run_video_inference(
             # Quality mode or fallback from fast mode
             if not use_fast_mode:
                 print('Using QUALITY annotation mode (OpenCV frame extraction)')
+                print('⚡ Optimized mode: Only extracting frames at detection FPS for speed')
                 try:
-                    # Use OpenCV for frame extraction (no FFmpeg dependency)
-                    print(f'Extracting frames with OpenCV at {original_fps:.2f} FPS...')
-                    frame_paths = extract_frames_cv2(video_path, target_fps=original_fps, max_frames=MAX_VIDEO_FRAMES)
+                    # OPTIMIZATION: Only extract frames at detection FPS, not all frames
+                    # This dramatically reduces processing time (312 frames vs 1873 frames)
+                    print(f'Extracting frames with OpenCV at {api_fps} FPS (detection rate)...')
+                    frame_paths = extract_frames_cv2(video_path, target_fps=api_fps, max_frames=MAX_VIDEO_FRAMES)
                     
                     if frame_paths is None:
                         # OpenCV not available - cannot proceed without FFmpeg
@@ -854,68 +943,35 @@ def run_video_inference(
                     tmpdir = os.path.dirname(frame_paths[0]) if frame_paths else None
                     
                     total_frames = len(files)
-                    print(f'Extracted {total_frames} frames from original video')
+                    print(f'Extracted {total_frames} frames at {api_fps} FPS (optimized for speed)')
                     
-                    # Create a mapping of which frames have detections
-                    # Roboflow API returns detections at api_fps (e.g., 10 FPS)
-                    # Map API frame indices to actual video frame indices
-                    # Use proper rounding to avoid accumulating errors
-                    
-                    # Instead of using frame_skip, map each API frame directly to video frames
-                    # API frame i corresponds to video timestamp: i / api_fps
-                    # Video frame for that timestamp: (i / api_fps) * original_fps
-                    
-                    # Temporal smoothing: Make detections persist across multiple frames
-                    persistence_frames = max(1, int(original_fps / api_fps))  # Persist for frame skip duration
-                    print(f'Detection persistence: {persistence_frames} frames (~{persistence_frames / original_fps:.2f}s)')
-                    
-                    detection_map = {}
-                    for det_idx, frame_dets in enumerate(all_detections):
-                        if frame_dets:  # Only map frames with actual detections
-                            # Map API frame index to actual video frame index
-                            # API frame det_idx represents time: det_idx / api_fps seconds
-                            # Video frame at that time: (det_idx / api_fps) * original_fps
-                            # Use round() to get nearest frame, not int() which truncates
-                            base_frame_idx = round((det_idx / api_fps) * original_fps)
-                            
-                            # Apply detections to the base frame AND subsequent frames for persistence
-                            for offset in range(persistence_frames):
-                                actual_frame_idx = base_frame_idx + offset
-                                if actual_frame_idx < total_frames:
-                                    # If frame already has detections, merge them intelligently (replace overlapping boxes)
-                                    if actual_frame_idx in detection_map:
-                                        detection_map[actual_frame_idx] = merge_detections(
-                                            detection_map[actual_frame_idx], frame_dets
-                                        )
-                                    else:
-                                        detection_map[actual_frame_idx] = frame_dets.copy()
-                    
-                    print(f'Mapping {len(detection_map)} detection frames across {total_frames} total frames (with temporal smoothing)')
+                    # SIMPLIFIED MAPPING: Since we extracted at detection FPS, indices match 1:1
+                    # all_detections[i] corresponds directly to files[i]
+                    print(f'Creating 1:1 mapping: {len(all_detections)} detection frames → {total_frames} extracted frames')
                     
                     # Create annotated frames directory
                     ann_frames_dir = tempfile.mkdtemp(prefix='rf_robo_ann_')
                     print(f'Created temp directory for annotated frames: {ann_frames_dir}')
                     
-                    # Process all frames: annotate those with detections, copy others unchanged
+                    # Process frames: annotate those with detections
                     annotated_count = 0
-                    detection_frame_nums = []  # Track which frames got annotated for summary
                     
                     for i, frame_file in enumerate(files):
                         out_path = os.path.join(ann_frames_dir, f'ann_{i+1:06d}.jpg')
                         
-                        if i in detection_map:
+                        # Check if this frame has detections (1:1 mapping)
+                        if i < len(all_detections) and all_detections[i]:
                             # This frame has detections - annotate it
                             try:
-                                ann_bytes = _annotate_image_file(frame_file, detection_map[i])
+                                ann_bytes = _annotate_image_file(frame_file, all_detections[i])
                                 if ann_bytes:
                                     with open(out_path, 'wb') as f:
                                         f.write(ann_bytes)
                                     annotated_count += 1
-                                    detection_frame_nums.append(i)
                                     
                                     # Show sample detections for first few frames only
                                     if annotated_count <= 3:
-                                        num_dets = len(detection_map[i])
+                                        num_dets = len(all_detections[i])
                                         print(f'  Frame {i+1}: annotated with {num_dets} detection(s)')
                                 else:
                                     # Annotation failed, use original
@@ -935,12 +991,13 @@ def run_video_inference(
                     
                     print(f'Annotated {annotated_count} frames with detections out of {total_frames} total frames')
                     
-                    # Stitch into video using OpenCV (no FFmpeg dependency)
+                    # Stitch into video using OpenCV at DETECTION FPS (not original FPS)
+                    # This creates a shorter, faster-loading video at detection rate
                     ann_video_path = tempfile.mktemp(suffix='_annotated.mp4')
-                    print(f'Stitching full video with OpenCV at {original_fps:.2f} FPS...')
+                    print(f'Stitching video with OpenCV at {api_fps} FPS (detection rate)...')
                     
-                    # Use OpenCV stitching
-                    stitch_success = stitch_video_cv2(ann_frames_dir, original_fps, ann_video_path, frame_pattern='ann_%06d.jpg')
+                    # Use OpenCV stitching at detection FPS
+                    stitch_success = stitch_video_cv2(ann_frames_dir, api_fps, ann_video_path, frame_pattern='ann_%06d.jpg')
                     
                     if not stitch_success:
                         # OpenCV failed - cannot proceed without FFmpeg
@@ -1035,22 +1092,44 @@ def run_inference_auto(file_path: str, confidence: Optional[int] = None, overlap
         file_size_mb = file_size / (1024 * 1024)
         print(f'Processing video: {file_size_mb:.1f} MB')
         
-        # Compress large videos before Roboflow upload to avoid timeouts
+        # Compress only if enabled (disabled on Render free tier to avoid RAM/CPU issues)
+        from .config import ENABLE_PRECOMPRESSION
         compressed_path = None
         inference_path = file_path
         try:
             if file_size_mb > 100:
-                print(f'Video exceeds 100 MB, compressing for Roboflow upload...')
-                compressed_path = compress_for_inference(file_path, max_size_mb=100)
-                inference_path = compressed_path
-                print(f'Using compressed video for inference: {os.path.getsize(compressed_path) / (1024 * 1024):.1f} MB')
+                if ENABLE_PRECOMPRESSION:
+                    print(f'Video exceeds 100 MB, compressing for Roboflow upload...')
+                    from .video_utils import compress_for_inference
+                    compressed_path = compress_for_inference(file_path, max_size_mb=100, force=False)
+                    if compressed_path != file_path:
+                        inference_path = compressed_path
+                        print(f'Using compressed video for inference: {os.path.getsize(compressed_path) / (1024 * 1024):.1f} MB')
+                else:
+                    print(f'⚠️  Video exceeds 100 MB ({file_size_mb:.1f} MB)')
+                    print(f'   Pre-compression disabled (likely on Render free tier)')
+                    print(f'   Uploading original video to Roboflow (may be slow or fail)')
+                    # Note: Roboflow may reject videos >100 MB or take very long to upload
             
-            # Always start with configured default FPS for Roboflow batch-video
-            result = run_video_inference(inference_path, fps=DEFAULT_VIDEO_FPS, confidence=confidence, overlap=overlap)
+            # Auto-detect FPS if DEFAULT_VIDEO_FPS is None
+            if DEFAULT_VIDEO_FPS is None:
+                from .video_utils import get_video_fps
+                import math
+                detected_fps = get_video_fps(inference_path)
+                # Round DOWN for Roboflow API compatibility (29.97 → 29, not 30)
+                # Roboflow requires FPS <= actual video FPS
+                api_fps = int(math.floor(detected_fps))
+                print(f'Auto-detected FPS: {detected_fps:.2f} → Using {api_fps} for Roboflow API (rounded down)')
+            else:
+                api_fps = DEFAULT_VIDEO_FPS
+                print(f'Using configured FPS: {api_fps}')
+            
+            # Run video inference with detected/configured FPS
+            result = run_video_inference(inference_path, fps=api_fps, confidence=confidence, overlap=overlap)
             return result
         finally:
             # Clean up compressed file if created
-            if compressed_path and os.path.exists(compressed_path):
+            if compressed_path and compressed_path != file_path and os.path.exists(compressed_path):
                 try:
                     os.remove(compressed_path)
                     print(f'Cleaned up compressed file: {compressed_path}')
