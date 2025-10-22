@@ -2,7 +2,9 @@ import os
 import datetime
 import time
 import sqlite3
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+import uuid
+from typing import Dict, Any
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,16 +46,314 @@ if os.path.isdir(UPLOAD_DIR):
 # Initialize DB
 init_db()
 
+# Job storage for background processing
+processing_jobs: Dict[str, Dict[str, Any]] = {}
+
+def process_media_background(
+    job_id: str,
+    media_path: str,
+    media_filename: str,
+    media_bytes: bytes,
+    srt_content: bytes = None,
+    srt_filename: str = None,
+    is_video: bool = False,
+    is_image: bool = False,
+    skip_cloud: bool = False,
+    confidence: int = None,
+    overlap: int = None
+):
+    """Process media file in background."""
+    try:
+        start_time = time.time()
+        processing_jobs[job_id]["status"] = "processing"
+        processing_jobs[job_id]["progress"] = "Running inference..."
+        
+        # Run inference
+        print(f"[Job {job_id}] Starting inference...")
+        detections, annotated_source = run_inference_auto(media_path, confidence=confidence, overlap=overlap)
+        print(f"[Job {job_id}] Inference completed in {time.time() - start_time:.2f} seconds")
+        
+        processing_jobs[job_id]["progress"] = "Uploading to cloud storage..."
+        
+        # Get file type and process results
+        actual_file_type = detect_file_type(media_path)
+        processing_time = time.time() - start_time
+        input_size_bytes = len(media_bytes)
+        
+        try:
+            result_size_bytes = len(json.dumps(detections).encode('utf-8')) if detections is not None else 0
+        except Exception:
+            result_size_bytes = None
+
+        # Calculate detection summary
+        if isinstance(detections, list) and len(detections) > 0:
+            if isinstance(detections[0], list):  # Video results
+                total_frames = len(detections)
+                total_detections = sum(len(frame) for frame in detections)
+                summary = f"Detected {total_detections} objects across {total_frames} frames"
+            else:  # Image results
+                total_frames = 1
+                total_detections = len(detections)
+                summary = f"Detected {total_detections} objects"
+        else:
+            total_frames = 1 if actual_file_type == "image" else 0
+            total_detections = 0
+            summary = "No objects detected"
+        
+        timestamp = datetime.datetime.now().isoformat()
+        has_srt_data = srt_content is not None
+
+        # Upload original media to Cloudinary
+        cloud_result = None
+        cloud_resource_type = None
+        try:
+            if skip_cloud:
+                cloud_result = None
+                cloud_resource_type = None
+            elif is_image:
+                cloud_result = upload_image_bytes(media_filename, media_bytes, folder="weed-detections/originals", annotate=True)
+                cloud_resource_type = "image"
+            else:
+                upload_path_for_cloud = media_path
+                used_compressed = False
+                try:
+                    size = os.path.getsize(media_path)
+                    from .config import MAX_CLOUDINARY_UPLOAD_SIZE
+                    
+                    if size > MAX_CLOUDINARY_UPLOAD_SIZE:
+                        print(f"[Job {job_id}] File too large ({size / (1024*1024):.2f} MB), compressing with FFmpeg...")
+                        try:
+                            upload_path_for_cloud = transcode_video_to_preview(media_path)
+                            used_compressed = True
+                            if os.path.getsize(upload_path_for_cloud) > MAX_CLOUDINARY_UPLOAD_SIZE:
+                                raise Exception(f"Transcoded file still too large for Cloudinary")
+                        except FileNotFoundError:
+                            raise Exception(f"File size too large for Cloudinary. Install ffmpeg to proceed")
+                except Exception:
+                    try:
+                        upload_path_for_cloud = transcode_video_to_preview(media_path)
+                        used_compressed = True
+                    except FileNotFoundError:
+                        upload_path_for_cloud = media_path
+
+                if not skip_cloud:
+                    cloud_result = upload_video_streaming(upload_path_for_cloud, media_filename, folder="weed-detections/originals", annotate=True)
+                    cloud_resource_type = "video"
+        except Exception as e:
+            print(f"[Job {job_id}] Cloud upload failed: {e}")
+            traceback.print_exc()
+
+        # Annotate image if applicable
+        if is_image and isinstance(detections, list) and len(detections) > 0:
+            try:
+                ann_bytes = _annotate_image_file(media_path, detections)
+                if ann_bytes:
+                    uploaded = upload_image_bytes(f"{os.path.splitext(media_filename)[0]}-annotated.jpg", ann_bytes, folder="weed-detections/annotated", annotate=False)
+                    annotated_source = uploaded.get('secure_url')
+            except Exception as e:
+                print(f"[Job {job_id}] Error annotating image: {e}")
+
+        # Determine annotated URL
+        annotated_url = None
+        temp_video_path = None  # For client-side compression
+        
+        try:
+            if annotated_source:
+                # Check if it's a local file path (for client-side compression)
+                if isinstance(annotated_source, str) and not annotated_source.startswith('http') and os.path.exists(annotated_source):
+                    # This is a temp video file path - store it for client download
+                    temp_video_path = annotated_source
+                    processing_jobs[job_id]["temp_video_path"] = temp_video_path
+                    processing_jobs[job_id]["original_filename"] = media_filename
+                    print(f"[Job {job_id}] Temp video ready for client compression: {temp_video_path}")
+                    annotated_url = None  # Will be set after client uploads compressed version
+                elif isinstance(annotated_source, str) and annotated_source.startswith('http'):
+                    if 'res.cloudinary.com' in annotated_source:
+                        annotated_url = annotated_source
+                    else:
+                        try:
+                            remote_uploaded = upload_remote_url(annotated_source, media_filename, folder="weed-detections/annotated", resource_type=("video" if is_video else "image"), annotate=True)
+                            annotated_url = remote_uploaded.get('annotated_url') or remote_uploaded.get('secure_url')
+                        except Exception:
+                            annotated_url = annotated_source
+                elif isinstance(annotated_source, (bytes, bytearray)) and not is_video:
+                    try:
+                        base, _ext = os.path.splitext(media_filename)
+                        uploaded = upload_image_bytes(f"{base}-annotated.jpg", annotated_source, folder="weed-detections/annotated", annotate=True)
+                        annotated_url = uploaded.get('annotated_url') or uploaded.get('secure_url')
+                    except Exception:
+                        annotated_url = None
+
+            if not annotated_url and cloud_result:
+                if isinstance(cloud_result, dict) and cloud_result.get('eager'):
+                    eager = cloud_result.get('eager')
+                    if isinstance(eager, list) and len(eager) > 0 and eager[0].get('secure_url'):
+                        annotated_url = eager[0].get('secure_url')
+                if not annotated_url:
+                    annotated_url = cloud_result.get('secure_url')
+        except Exception:
+            annotated_url = cloud_result.get('secure_url') if cloud_result else None
+
+        processing_jobs[job_id]["progress"] = "Saving to database..."
+        
+        # Insert detection record
+        detection_id = insert_detection(
+            filename=media_filename,
+            timestamp=timestamp,
+            file_type=actual_file_type,
+            summary=summary,
+            total_frames=total_frames,
+            total_detections=total_detections,
+            processing_time=processing_time,
+            input_size_bytes=input_size_bytes,
+            result_size_bytes=result_size_bytes,
+            has_srt_data=has_srt_data,
+            cloud_public_id=(cloud_result.get("public_id") if cloud_result else None),
+            cloud_resource_type=cloud_resource_type if cloud_result else None,
+            cloud_secure_url=(cloud_result.get("secure_url") if cloud_result else None),
+            cloud_annotated_url=annotated_url,
+        )
+
+        # Store detection details
+        if detections and len(detections) > 0:
+            batch_details = []
+            for frame_idx, frame_detections in enumerate(detections if isinstance(detections[0], list) else [detections]):
+                for det in frame_detections:
+                    batch_details.append({
+                        'frame_number': frame_idx + 1,
+                        'weed_class': det.get('class', 'unknown'),
+                        'confidence': det.get('confidence', 0.0),
+                        'bbox_x': det.get('bbox', [0, 0, 0, 0])[0],
+                        'bbox_y': det.get('bbox', [0, 0, 0, 0])[1],
+                        'bbox_width': det.get('bbox', [0, 0, 0, 0])[2],
+                        'bbox_height': det.get('bbox', [0, 0, 0, 0])[3],
+                        'detection_timestamp': timestamp
+                    })
+            
+            if batch_details:
+                from backend.database import batch_insert_detection_details
+                batch_insert_detection_details(detection_id, batch_details)
+
+        # Process SRT file if provided
+        srt_message = ""
+        if srt_content:
+            try:
+                srt_text = srt_content.decode('utf-8')
+                
+                if not validate_srt_file(srt_text):
+                    raise Exception("Invalid SRT file format")
+                
+                frames = parse_srt_file(srt_text)
+                if not frames:
+                    raise Exception("No valid frame data found in SRT file")
+
+                coords = []
+                min_lat = min_lon = float("inf")
+                max_lat = max_lon = float("-inf")
+                compact_frames = []
+                
+                for f in frames:
+                    lat = f.get('latitude')
+                    lon = f.get('longitude')
+                    if lat is None or lon is None:
+                        continue
+                    coords.append([lon, lat])
+                    if lat < min_lat: min_lat = lat
+                    if lat > max_lat: max_lat = lat
+                    if lon < min_lon: min_lon = lon
+                    if lon > max_lon: max_lon = lon
+                    compact_frames.append({
+                        'i': f.get('frame_number'),
+                        't': f.get('timestamp'),
+                        'lat': lat,
+                        'lon': lon,
+                        'alt': f.get('altitude')
+                    })
+
+                if coords:
+                    start_time_srt = frames[0].get('timestamp') if frames else None
+                    end_time_srt = frames[-1].get('timestamp') if frames else None
+
+                    bounds_geojson = json.dumps({
+                        'type': 'Feature',
+                        'properties': {},
+                        'geometry': {
+                            'type': 'Polygon',
+                            'coordinates': [[
+                                [min_lon, min_lat],
+                                [max_lon, min_lat],
+                                [max_lon, max_lat],
+                                [min_lon, max_lat],
+                                [min_lon, min_lat]
+                            ]]
+                        }
+                    })
+
+                    path_geojson = json.dumps({
+                        'type': 'Feature',
+                        'properties': {'detection_id': detection_id},
+                        'geometry': {'type': 'LineString', 'coordinates': coords}
+                    })
+
+                    frames_json = json.dumps(compact_frames)
+
+                    upsert_srt_track(detection_id, len(coords), start_time_srt, end_time_srt, bounds_geojson, path_geojson, frames_json)
+                    srt_message = f" with {len(coords)} GPS points"
+                else:
+                    srt_message = " (SRT file contained no GPS coordinates)"
+                    
+            except Exception as e:
+                srt_message = f" (SRT processing failed: {str(e)})"
+                update_srt_status(detection_id, False)
+
+        # Cleanup temp files
+        try:
+            os.remove(media_path)
+        except Exception:
+            pass
+
+        # Mark as completed
+        processing_jobs[job_id]["status"] = "completed"
+        processing_jobs[job_id]["result"] = {
+            "message": f"File uploaded and processed successfully{srt_message}",
+            "detection_id": detection_id,
+            "summary": summary,
+            "processing_time": f"{processing_time:.2f}s",
+            "has_srt_data": has_srt_data and srt_message and "failed" not in srt_message,
+            "cloud_public_id": cloud_result.get("public_id") if cloud_result else None,
+            "cloud_resource_type": cloud_resource_type if cloud_result else None,
+            "cloud_secure_url": cloud_result.get("secure_url") if cloud_result else None,
+            "cloud_annotated_url": annotated_url,
+            "needs_client_compression": temp_video_path is not None,  # Flag for mobile app
+        }
+        print(f"[Job {job_id}] Processing completed successfully")
+        
+        if temp_video_path:
+            print(f"[Job {job_id}] ⚠️  Waiting for client to compress and upload annotated video")
+        
+    except Exception as e:
+        print(f"[Job {job_id}] Processing failed: {e}")
+        traceback.print_exc()
+        processing_jobs[job_id]["status"] = "failed"
+        processing_jobs[job_id]["error"] = str(e)
+        
+        # Cleanup temp files
+        try:
+            if os.path.exists(media_path):
+                os.remove(media_path)
+        except Exception:
+            pass
+
 @app.post("/upload-combined/")
 async def upload_combined_files(
+    background_tasks: BackgroundTasks,
     media_file: UploadFile = File(..., description="Video or image file"),
     srt_file: UploadFile = File(None, description="Optional SRT file for video"),
     skip_cloud: bool = Query(False, description="Skip Cloudinary upload for speed"),
     confidence: int = Query(None, description="Confidence threshold (0-100)"),
     overlap: int = Query(None, description="Overlap threshold (0-100)")
 ):
-    """Upload and process media file with optional SRT file for enhanced validation."""
-    start_time = time.time()
+    """Upload media file and process in background. Returns job_id immediately for status polling."""
     
     # Validate file types
     media_filename = media_file.filename.lower()
@@ -70,318 +370,184 @@ async def upload_combined_files(
     if srt_file and not srt_file.filename.lower().endswith('.srt'):
         raise HTTPException(status_code=400, detail="SRT file must have .srt extension")
     
-    # Read media bytes (for images) or stream to temp file (for very large videos)
+    # Read media bytes
     media_bytes = await media_file.read()
     if not media_bytes:
         raise HTTPException(status_code=400, detail="Empty media file")
-    # Prepare a temp file path for inference
-    if is_video:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_file.filename)[1])
-        tmp.write(media_bytes)
-        tmp.flush()
-        tmp.close()
-        media_path = tmp.name
-    else:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_file.filename)[1])
-        tmp.write(media_bytes)
-        tmp.flush()
-        tmp.close()
-        media_path = tmp.name
     
-    # Run inference
-    print("Starting inference...")
-    detections, annotated_source = run_inference_auto(media_path, confidence=confidence, overlap=overlap)
-    print(f"Inference completed in {time.time() - start_time:.2f} seconds")
-    
-    # Get file type and process results
-    actual_file_type = detect_file_type(media_path)
-    processing_time = time.time() - start_time
-    input_size_bytes = len(media_bytes)
-    
-    try:
-        result_size_bytes = len(json.dumps(detections).encode('utf-8')) if detections is not None else 0
-    except Exception:
-        result_size_bytes = None
-
-    # Calculate detection summary
-    if isinstance(detections, list) and len(detections) > 0:
-        if isinstance(detections[0], list):  # Video results
-            total_frames = len(detections)
-            total_detections = sum(len(frame) for frame in detections)
-            summary = f"Detected {total_detections} objects across {total_frames} frames"
-        else:  # Image results
-            total_frames = 1
-            total_detections = len(detections)
-            summary = f"Detected {total_detections} objects"
-    else:
-        total_frames = 1 if actual_file_type == "image" else 0
-        total_detections = 0
-        summary = "No objects detected"
-    
-    timestamp = datetime.datetime.now().isoformat()
-    has_srt_data = srt_file is not None
-
-    # Upload original media to Cloudinary with delivery compression for previews (optional)
-    cloud_result = None
-    try:
-        if skip_cloud:
-            cloud_result = None
-            cloud_resource_type = None
-        elif is_image:
-            cloud_result = upload_image_bytes(media_file.filename, media_bytes, folder="weed-detections/originals", annotate=True)
-            cloud_resource_type = "image"
-        else:
-            # For videos, ensure the file is within Cloudinary's upload limit.
-            upload_path_for_cloud = media_path
-            used_compressed = False
-            try:
-                size = os.path.getsize(media_path)
-                from .config import MAX_CLOUDINARY_UPLOAD_SIZE
-                if size > MAX_CLOUDINARY_UPLOAD_SIZE:
-                    # Transcode down to meet Cloudinary limits (requires ffmpeg)
-                    try:
-                        upload_path_for_cloud = transcode_video_to_preview(media_path)
-                        used_compressed = True
-                        # Re-check size
-                        if os.path.getsize(upload_path_for_cloud) > MAX_CLOUDINARY_UPLOAD_SIZE:
-                            raise HTTPException(status_code=400, detail=f"Transcoded file still too large for Cloudinary (>{MAX_CLOUDINARY_UPLOAD_SIZE} bytes)")
-                    except FileNotFoundError:
-                        # ffmpeg not available and file too large — return helpful error
-                        raise HTTPException(status_code=400, detail=f"File size too large for Cloudinary ({size}). Install ffmpeg or upload a smaller file to proceed")
-            except HTTPException:
-                raise
-            except Exception:
-                # If we can't stat size, attempt to transcode and proceed
-                try:
-                    upload_path_for_cloud = transcode_video_to_preview(media_path)
-                    used_compressed = True
-                except FileNotFoundError:
-                    upload_path_for_cloud = media_path
-
-            try:
-                if not skip_cloud:
-                    cloud_result = upload_video_streaming(upload_path_for_cloud, media_file.filename, folder="weed-detections/originals", annotate=True)
-                    cloud_resource_type = "video"
-                else:
-                    cloud_result = None
-                    cloud_resource_type = None
-            except Exception as e:
-                # Print full traceback and re-raise with clearer message
-                print("Cloud upload failed (video) with exception:")
-                traceback.print_exc()
-                raise
-    except Exception as e:
-        # Clean temp file before raising
-        try:
-            os.remove(media_path)
-        except Exception:
-            pass
-        # Ensure we include a readable representation of the error
-        err_msg = repr(e) or str(e)
-        raise HTTPException(status_code=500, detail=f"Cloud storage failed: {err_msg}")
-
-    # Always render local annotated image when applicable to guarantee annotated asset
-    if is_image and isinstance(detections, list) and len(detections) > 0:
-        try:
-            print(f"Attempting to annotate image. Detections count: {len(detections)}, Type: {type(detections)}")
-            if detections:
-                print(f"First detection sample: {detections[0]}")
-            ann_bytes = _annotate_image_file(media_path, detections)
-            if ann_bytes:
-                uploaded = upload_image_bytes(f"{os.path.splitext(media_file.filename)[0]}-annotated.jpg", ann_bytes, folder="weed-detections/annotated", annotate=False)
-                annotated_source = uploaded.get('secure_url')
-                print(f"Annotated image uploaded successfully: {annotated_source}")
-            else:
-                print("Warning: _annotate_image_file returned None (PIL may not be available or no detections)")
-        except Exception as e:
-            print(f"Error creating/uploading annotated image: {e}")
-            traceback.print_exc()
-
-    # Insert detection record
-    # Determine annotated delivery URL. Priority:
-    # 1) annotated_source returned by inference (URL or bytes)
-    # 2) cloud_result eager annotated preview
-    annotated_url = None
-    try:
-        if annotated_source:
-            # If inference returned a remote URL, tell Cloudinary to fetch/store it so it lives in our account
-            if isinstance(annotated_source, str) and annotated_source.startswith('http'):
-                # If it's already a Cloudinary URL, use it directly
-                if 'res.cloudinary.com' in annotated_source:
-                    annotated_url = annotated_source
-                else:
-                    try:
-                        remote_uploaded = upload_remote_url(annotated_source, media_file.filename, folder="weed-detections/annotated", resource_type=("video" if is_video else "image"), annotate=True)
-                        annotated_url = remote_uploaded.get('annotated_url') or remote_uploaded.get('secure_url')
-                    except Exception:
-                        # fall back to using remote URL directly
-                        annotated_url = annotated_source
-            # If inference returned raw bytes (data URL decoded), upload bytes to Cloudinary
-            elif isinstance(annotated_source, (bytes, bytearray)) and not is_video:
-                try:
-                    base, _ext = os.path.splitext(media_file.filename)
-                    uploaded = upload_image_bytes(f"{base}-annotated.jpg", annotated_source, folder="weed-detections/annotated", annotate=True)
-                    annotated_url = uploaded.get('annotated_url') or uploaded.get('secure_url')
-                except Exception:
-                    annotated_url = None
-
-        # If nothing from inference, prefer eager from the original cloud upload
-        if not annotated_url and cloud_result:
-            if isinstance(cloud_result, dict) and cloud_result.get('eager'):
-                eager = cloud_result.get('eager')
-                if isinstance(eager, list) and len(eager) > 0 and eager[0].get('secure_url'):
-                    annotated_url = eager[0].get('secure_url')
-            if not annotated_url:
-                annotated_url = cloud_result.get('secure_url')
-    except Exception:
-        annotated_url = cloud_result.get('secure_url') if cloud_result else None
-
-    detection_id = insert_detection(
-        filename=media_file.filename,
-        timestamp=timestamp,
-        file_type=actual_file_type,
-        summary=summary,
-        total_frames=total_frames,
-        total_detections=total_detections,
-        processing_time=processing_time,
-        input_size_bytes=input_size_bytes,
-        result_size_bytes=result_size_bytes,
-        has_srt_data=has_srt_data,
-        cloud_public_id=(cloud_result.get("public_id") if cloud_result else None),
-        cloud_resource_type=cloud_resource_type if cloud_result else None,
-        cloud_secure_url=(cloud_result.get("secure_url") if cloud_result else None),
-        cloud_annotated_url=annotated_url,
-    )
-
-    # Store detection details
-    if detections and len(detections) > 0:
-        print(f"Storing detection details...")
-        # Batch insert detection details (much faster than individual inserts)
-        detail_count = 0
-        batch_details = []
-        for frame_idx, frame_detections in enumerate(detections if isinstance(detections[0], list) else [detections]):
-            for det in frame_detections:
-                batch_details.append({
-                    'frame_number': frame_idx + 1,
-                    'weed_class': det.get('class', 'unknown'),
-                    'confidence': det.get('confidence', 0.0),
-                    'bbox_x': det.get('bbox', [0, 0, 0, 0])[0],
-                    'bbox_y': det.get('bbox', [0, 0, 0, 0])[1],
-                    'bbox_width': det.get('bbox', [0, 0, 0, 0])[2],
-                    'bbox_height': det.get('bbox', [0, 0, 0, 0])[3],
-                    'detection_timestamp': timestamp
-                })
-                detail_count += 1
-        
-        # Single batch insert instead of N individual inserts (10x faster)
-        if batch_details:
-            from backend.database import batch_insert_detection_details
-            batch_insert_detection_details(detection_id, batch_details)
-        print(f"Stored {detail_count} detection details in batch")
-
-    # Process SRT file if provided
-    srt_message = ""
+    # Read SRT if provided
+    srt_content = None
+    srt_filename_str = None
     if srt_file:
-        try:
-            srt_content = await srt_file.read()
-            srt_text = srt_content.decode('utf-8')
-            
-            if not validate_srt_file(srt_text):
-                raise HTTPException(status_code=400, detail="Invalid SRT file format")
-            
-            frames = parse_srt_file(srt_text)
-            if not frames:
-                raise HTTPException(status_code=400, detail="No valid frame data found in SRT file")
-
-            # Build compact track
-            coords = []
-            min_lat = min_lon = float("inf")
-            max_lat = max_lon = float("-inf")
-            compact_frames = []
-            
-            for f in frames:
-                lat = f.get('latitude')
-                lon = f.get('longitude')
-                if lat is None or lon is None:
-                    continue
-                coords.append([lon, lat])
-                if lat < min_lat: min_lat = lat
-                if lat > max_lat: max_lat = lat
-                if lon < min_lon: min_lon = lon
-                if lon > max_lon: max_lon = lon
-                compact_frames.append({
-                    'i': f.get('frame_number'),
-                    't': f.get('timestamp'),
-                    'lat': lat,
-                    'lon': lon,
-                    'alt': f.get('altitude')
-                })
-
-            if coords:
-                start_time_srt = frames[0].get('timestamp') if frames else None
-                end_time_srt = frames[-1].get('timestamp') if frames else None
-
-                bounds_geojson = json.dumps({
-                    'type': 'Feature',
-                    'properties': {},
-                    'geometry': {
-                        'type': 'Polygon',
-                        'coordinates': [[
-                            [min_lon, min_lat],
-                            [max_lon, min_lat],
-                            [max_lon, max_lat],
-                            [min_lon, max_lat],
-                            [min_lon, min_lat]
-                        ]]
-                    }
-                })
-
-                path_geojson = json.dumps({
-                    'type': 'Feature',
-                    'properties': {'detection_id': detection_id},
-                    'geometry': {'type': 'LineString', 'coordinates': coords}
-                })
-
-                frames_json = json.dumps(compact_frames)
-
-                upsert_srt_track(detection_id, len(coords), start_time_srt, end_time_srt, bounds_geojson, path_geojson, frames_json)
-                srt_message = f" with {len(coords)} GPS points"
-            else:
-                srt_message = " (SRT file contained no GPS coordinates)"
-                
-        except Exception as e:
-            # Don't fail the entire upload if SRT processing fails
-            srt_message = f" (SRT processing failed: {str(e)})"
-            update_srt_status(detection_id, False)
-
-    # Cleanup temp file(s)
-    try:
-        os.remove(media_path)
-    except Exception:
-        pass
-    try:
-        # Only remove the transcoded file if it was created and is different from the original
-        if 'upload_path_for_cloud' in locals() and used_compressed and upload_path_for_cloud and os.path.exists(upload_path_for_cloud) and upload_path_for_cloud != media_path:
-            os.remove(upload_path_for_cloud)
-    except Exception:
-        pass
-
+        srt_content = await srt_file.read()
+        srt_filename_str = srt_file.filename
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Save media to temp file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(media_file.filename)[1])
+    tmp.write(media_bytes)
+    tmp.flush()
+    tmp.close()
+    media_path = tmp.name
+    
+    # Initialize job status
+    processing_jobs[job_id] = {
+        "status": "queued",
+        "progress": "Uploaded, starting processing...",
+        "result": None,
+        "error": None
+    }
+    
+    # Start background processing
+    background_tasks.add_task(
+        process_media_background,
+        job_id=job_id,
+        media_path=media_path,
+        media_filename=media_file.filename,
+        media_bytes=media_bytes,
+        srt_content=srt_content,
+        srt_filename=srt_filename_str,
+        is_video=is_video,
+        is_image=is_image,
+        skip_cloud=skip_cloud,
+        confidence=confidence,
+        overlap=overlap
+    )
+    
+    # Return immediately with job ID
     return JSONResponse({
-        "message": f"File uploaded and processed successfully{srt_message}",
-        "detection_id": detection_id,
-        "summary": summary,
-        "processing_time": f"{processing_time:.2f}s",
-        "has_srt_data": has_srt_data and srt_message and "failed" not in srt_message,
-        "cloud_public_id": cloud_result.get("public_id") if cloud_result else None,
-        "cloud_resource_type": cloud_resource_type if cloud_result else None,
-        "cloud_secure_url": cloud_result.get("secure_url") if cloud_result else None,
-        "cloud_annotated_url": annotated_url,
+        "job_id": job_id,
+        "status": "processing",
+        "message": "File uploaded successfully. Processing in background. Use /job-status/{job_id} to check progress."
     })
 
+@app.get("/job-status/{job_id}")
+async def get_job_status(job_id: str):
+    """Check the status of a background processing job."""
+    if job_id not in processing_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job_data = processing_jobs[job_id]
+    
+    return JSONResponse({
+        "job_id": job_id,
+        "status": job_data["status"],
+        "progress": job_data.get("progress"),
+        "result": job_data.get("result"),
+        "error": job_data.get("error"),
+        "temp_video_path": job_data.get("temp_video_path")  # For client-side compression
+    })
+
+@app.get("/download-temp-video/{job_id}")
+async def download_temp_video(job_id: str):
+    """Download temporary annotated video for client-side compression."""
+    from fastapi.responses import FileResponse
+    
+    if job_id not in processing_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job_data = processing_jobs[job_id]
+    temp_video_path = job_data.get("temp_video_path")
+    
+    if not temp_video_path or not os.path.exists(temp_video_path):
+        raise HTTPException(status_code=404, detail="Temp video not found")
+    
+    return FileResponse(
+        temp_video_path,
+        media_type="video/mp4",
+        filename=f"annotated_{job_id}.mp4"
+    )
+
+@app.post("/upload-compressed-video/{job_id}")
+async def upload_compressed_video(
+    job_id: str,
+    compressed_video: UploadFile = File(..., description="Client-compressed video")
+):
+    """Receive compressed video from client and upload to Cloudinary."""
+    if job_id not in processing_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job_data = processing_jobs[job_id]
+    
+    try:
+        # Read compressed video
+        video_bytes = await compressed_video.read()
+        video_size_mb = len(video_bytes) / (1024 * 1024)
+        print(f"[Job {job_id}] Received compressed video: {video_size_mb:.2f} MB")
+        
+        # Save to temp file
+        temp_compressed = tempfile.mktemp(suffix='_compressed.mp4')
+        with open(temp_compressed, 'wb') as f:
+            f.write(video_bytes)
+        
+        # Upload to Cloudinary
+        from .cloudinary_utils import upload_video_streaming
+        detection_id = job_data.get("result", {}).get("detection_id")
+        original_filename = job_data.get("original_filename", "video.mp4")
+        
+        uploaded = upload_video_streaming(
+            temp_compressed,
+            original_filename,
+            folder="weed-detections/annotated",
+            annotate=False
+        )
+        
+        annotated_url = uploaded.get('secure_url')
+        print(f"[Job {job_id}] Compressed video uploaded to Cloudinary: {annotated_url}")
+        
+        # Update database with annotated URL
+        if detection_id:
+            import sqlite3
+            from .database import DB_NAME
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE detections SET cloud_annotated_url = ? WHERE id = ?",
+                    (annotated_url, detection_id)
+                )
+                conn.commit()
+                print(f"[Job {job_id}] Database updated with annotated URL")
+            except Exception as e:
+                print(f"[Job {job_id}] Failed to update annotated URL: {e}")
+            finally:
+                conn.close()
+        
+        # Update job result
+        if "result" in job_data:
+            job_data["result"]["cloud_annotated_url"] = annotated_url
+        
+        # Cleanup temp files
+        try:
+            os.remove(temp_compressed)
+            temp_video_path = job_data.get("temp_video_path")
+            if temp_video_path and os.path.exists(temp_video_path):
+                os.remove(temp_video_path)
+                job_data["temp_video_path"] = None
+        except Exception:
+            pass
+        
+        return JSONResponse({
+            "success": True,
+            "message": "Compressed video uploaded successfully",
+            "annotated_url": annotated_url
+        })
+        
+    except Exception as e:
+        print(f"[Job {job_id}] Error uploading compressed video: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/upload/")
-async def upload_file(file: UploadFile = File(...), skip_cloud: bool = Query(False, description="Skip Cloudinary upload for speed"), confidence: int = Query(None, description="Confidence threshold (0-100)"), overlap: int = Query(None, description="Overlap threshold (0-100)")):
-    """Upload and process a video or image file for weed detection (legacy endpoint)."""
-    start_time = time.time()
+async def upload_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...), 
+    skip_cloud: bool = Query(False, description="Skip Cloudinary upload for speed"), 
+    confidence: int = Query(None, description="Confidence threshold (0-100)"), 
+    overlap: int = Query(None, description="Overlap threshold (0-100)")
+):
+    """Upload and process a video or image file for weed detection. Returns job_id immediately for status polling."""
     
     # Read file
     file_bytes = await file.read()
@@ -401,228 +567,49 @@ async def upload_file(file: UploadFile = File(...), skip_cloud: bool = Query(Fal
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid or corrupted image file")
     
-    # Save to temp for inference
+    # Determine file type
+    is_video = file.filename.lower().endswith(('.mp4', '.mov', '.avi', '.mkv'))
+    is_image = file.filename.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff'))
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Save to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
     tmp.write(file_bytes)
     tmp.flush()
     tmp.close()
     file_path = tmp.name
-
-    # Auto-detect file type and run appropriate inference with optimization
-    print("Starting inference...")
-    detections, annotated_source = run_inference_auto(file_path, confidence=confidence, overlap=overlap)
-    print(f"Inference completed in {time.time() - start_time:.2f} seconds")
     
-    # Get the actual file type based on file extension
-    actual_file_type = detect_file_type(file_path)
+    # Initialize job status
+    processing_jobs[job_id] = {
+        "status": "queued",
+        "progress": "Uploaded, starting processing...",
+        "result": None,
+        "error": None
+    }
     
-    # Calculate processing time and sizes
-    processing_time = time.time() - start_time
-    input_size_bytes = len(file_bytes) if file_bytes else None
-    try:
-        result_size_bytes = len(json.dumps(detections).encode('utf-8')) if detections is not None else 0
-    except Exception:
-        result_size_bytes = None
-
-    # Handle both image and video results
-    if isinstance(detections, list) and len(detections) > 0:
-        if isinstance(detections[0], list):  # Video results (list of frames)
-            total_frames = len(detections)
-            total_detections = sum(len(frame) for frame in detections)
-            summary = f"Detected {total_detections} objects across {total_frames} frames"
-        else:  # Image results (single list)
-            total_frames = 1
-            total_detections = len(detections)
-            summary = f"Detected {total_detections} objects"
-    else:
-        total_frames = 1 if actual_file_type == "image" else 0
-        total_detections = 0
-        summary = "No objects detected"
-    
-    timestamp = datetime.datetime.now().isoformat()
-
-    # Upload original media to Cloudinary (optional)
-    try:
-        if skip_cloud:
-            cloud_result = None
-            cloud_resource_type = None
-        else:
-            if actual_file_type == "image":
-                cloud_result = upload_image_bytes(file.filename, file_bytes, folder="weed-detections/originals", annotate=True)
-                cloud_resource_type = "image"
-            else:
-                # Ensure large videos are transcoded to fit Cloudinary limits before uploading.
-                upload_path_for_cloud = file_path
-                used_compressed = False
-                try:
-                    size = os.path.getsize(file_path)
-                    from .config import MAX_CLOUDINARY_UPLOAD_SIZE
-                    if size > MAX_CLOUDINARY_UPLOAD_SIZE:
-                        try:
-                            upload_path_for_cloud = transcode_video_to_preview(file_path)
-                            used_compressed = True
-                            if os.path.getsize(upload_path_for_cloud) > MAX_CLOUDINARY_UPLOAD_SIZE:
-                                raise HTTPException(status_code=400, detail=f"Transcoded file still too large for Cloudinary (>{MAX_CLOUDINARY_UPLOAD_SIZE} bytes)")
-                        except FileNotFoundError:
-                            raise HTTPException(status_code=400, detail=f"File size too large for Cloudinary ({size}). Install ffmpeg or upload a smaller file to proceed")
-                except HTTPException:
-                    raise
-                except Exception:
-                    # Couldn't stat size; attempt to transcode as best-effort
-                    try:
-                        upload_path_for_cloud = transcode_video_to_preview(file_path)
-                        used_compressed = True
-                    except FileNotFoundError:
-                        upload_path_for_cloud = file_path
-
-                try:
-                    if not skip_cloud:
-                        cloud_result = upload_video_streaming(upload_path_for_cloud, file.filename, folder="weed-detections/originals", annotate=True)
-                        cloud_resource_type = "video"
-                    else:
-                        cloud_result = None
-                        cloud_resource_type = None
-                except Exception as e:
-                    print("Cloud upload failed (video) with exception:")
-                    traceback.print_exc()
-                    try:
-                        os.remove(file_path)
-                    except Exception:
-                        pass
-                    # Improve error message clarity
-                    err_msg = repr(e) if repr(e) else (str(e) if str(e) else "unknown error")
-                    raise HTTPException(status_code=500, detail=f"Cloud storage failed: {err_msg}")
-    except Exception as e:
-        try:
-            os.remove(file_path)
-        except Exception:
-            pass
-        # Ensure message not empty in response
-        err_msg = repr(e) if repr(e) else (str(e) if str(e) else "unknown error")
-        raise HTTPException(status_code=500, detail=f"Cloud storage failed: {err_msg}")
-
-    # Ensure annotated image asset exists when detections found (legacy endpoint)
-    if actual_file_type == "image" and isinstance(detections, list) and len(detections) > 0:
-        try:
-            from .inference import _annotate_image_file
-            ann_bytes = _annotate_image_file(file_path, detections)
-            if ann_bytes:
-                base, _ext = os.path.splitext(file.filename)
-                uploaded = upload_image_bytes(f"{base}-annotated.jpg", ann_bytes, folder="weed-detections/annotated", annotate=False)
-                annotated_source = uploaded.get('secure_url')
-                print(f"Annotated image uploaded successfully (legacy endpoint): {annotated_source}")
-            else:
-                print("Warning: _annotate_image_file returned None (PIL may not be available or no detections)")
-        except Exception as e:
-            print(f"Error creating/uploading annotated image (legacy endpoint): {e}")
-            traceback.print_exc()
-
-    # Insert main detection record (legacy endpoint - no SRT data)
-    # Determine annotated delivery URL. Prefer annotated_source from inference when available.
-    annotated_url = None
-    try:
-        if annotated_source:
-            if isinstance(annotated_source, str) and annotated_source.startswith('http'):
-                if 'res.cloudinary.com' in annotated_source:
-                    annotated_url = annotated_source
-                else:
-                    try:
-                        remote_uploaded = upload_remote_url(annotated_source, file.filename, folder="weed-detections/annotated", resource_type=("video" if actual_file_type == "video" else "image"), annotate=True)
-                        annotated_url = remote_uploaded.get('annotated_url') or remote_uploaded.get('secure_url')
-                    except Exception:
-                        annotated_url = annotated_source
-            elif isinstance(annotated_source, (bytes, bytearray)) and actual_file_type == "image":
-                try:
-                    base, _ext = os.path.splitext(file.filename)
-                    uploaded = upload_image_bytes(f"{base}-annotated.jpg", annotated_source, folder="weed-detections/annotated", annotate=True)
-                    annotated_url = uploaded.get('annotated_url') or uploaded.get('secure_url')
-                except Exception:
-                    annotated_url = None
-
-        if not annotated_url and cloud_result:
-            if isinstance(cloud_result, dict) and cloud_result.get('eager'):
-                eager = cloud_result.get('eager')
-                if isinstance(eager, list) and len(eager) > 0 and eager[0].get('secure_url'):
-                    annotated_url = eager[0].get('secure_url')
-            if not annotated_url:
-                annotated_url = cloud_result.get('secure_url')
-    except Exception:
-        annotated_url = cloud_result.get('secure_url') if cloud_result else None
-
-    detection_id = insert_detection(
-        filename=file.filename,
-        timestamp=timestamp,
-        file_type=actual_file_type,
-        summary=summary,
-        total_frames=total_frames,
-        total_detections=total_detections,
-        processing_time=processing_time,
-        input_size_bytes=input_size_bytes,
-        result_size_bytes=result_size_bytes,
-        has_srt_data=False,
-        cloud_public_id=cloud_result.get("public_id"),
-        cloud_resource_type=cloud_resource_type,
-        cloud_secure_url=cloud_result.get("secure_url"),
-        cloud_annotated_url=annotated_url,
+    # Start background processing (reuse the same function)
+    background_tasks.add_task(
+        process_media_background,
+        job_id=job_id,
+        media_path=file_path,
+        media_filename=file.filename,
+        media_bytes=file_bytes,
+        srt_content=None,  # No SRT for single file upload
+        srt_filename=None,
+        is_video=is_video,
+        is_image=is_image,
+        skip_cloud=skip_cloud,
+        confidence=confidence,
+        overlap=overlap
     )
-
-    # Store individual detection details if any (with batch optimization)
-    if detections and len(detections) > 0:
-        print(f"Storing detection details...")
-        batch_details = []
-        
-        if isinstance(detections[0], list):  # Video
-            for frame_idx, frame_detections in enumerate(detections):
-                for detection in frame_detections:
-                    batch_details.append({
-                        'frame_number': frame_idx + 1,
-                        'weed_class': detection['class'],
-                        'confidence': detection['confidence'],
-                        'bbox_x': detection['bbox'][0],
-                        'bbox_y': detection['bbox'][1],
-                        'bbox_width': detection['bbox'][2],
-                        'bbox_height': detection['bbox'][3],
-                        'detection_timestamp': timestamp
-                    })
-        else:  # Image
-            for detection in detections:
-                batch_details.append({
-                    'frame_number': 1,
-                    'weed_class': detection['class'],
-                    'confidence': detection['confidence'],
-                    'bbox_x': detection['bbox'][0],
-                    'bbox_y': detection['bbox'][1],
-                    'bbox_width': detection['bbox'][2],
-                    'bbox_height': detection['bbox'][3],
-                    'detection_timestamp': timestamp
-                })
-        
-        # Single batch insert instead of N individual inserts (10x faster)
-        if batch_details:
-            from backend.database import batch_insert_detection_details
-            batch_insert_detection_details(detection_id, batch_details)
-            print(f"Stored {len(batch_details)} detection details in batch")
-
-    # Cleanup temp file
-    try:
-        os.remove(file_path)
-    except Exception:
-        pass
-
-    return JSONResponse(content={
-        "detection_id": detection_id,
-        "filename": file.filename,
-        "file_type": actual_file_type,
-        "summary": summary,
-        "total_frames": total_frames,
-        "total_detections": total_detections,
-        "processing_time": round(processing_time, 2),
-        "input_size_bytes": input_size_bytes,
-        "result_size_bytes": result_size_bytes,
-        "cloud_public_id": cloud_result.get("public_id"),
-        "cloud_resource_type": cloud_resource_type,
-        "cloud_secure_url": cloud_result.get("secure_url"),
-        "cloud_annotated_url": annotated_url,
+    
+    # Return immediately with job ID
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "processing",
+        "message": "File uploaded successfully. Processing in background. Use /job-status/{job_id} to check progress."
     })
 
 @app.post("/upload-srt/")

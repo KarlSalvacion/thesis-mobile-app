@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
-import { View, Text, Pressable, ActivityIndicator, ScrollView, RefreshControl } from 'react-native'
+import { View, Text, Pressable, ActivityIndicator, ScrollView, RefreshControl, Alert } from 'react-native'
 import * as DocumentPicker from 'expo-document-picker'
 import * as ImagePicker from 'expo-image-picker'
 import * as FileSystem from 'expo-file-system'
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons'
+import { Video } from 'react-native-compressor'
 import SrtDebugViewer from '../components/SrtDebugViewer'
 function guessMimeType(name: string): string {
   const lower = name.toLowerCase()
@@ -36,7 +37,103 @@ import { API_BASE } from '../config'
 
 console.log('API_BASE =', API_BASE)
 
-async function uploadFileToApi(uri: string, name: string) {
+// Automatic client-side video compression handler
+async function handleClientCompression(jobId: string, result: any, onProgress?: (message: string) => void): Promise<any> {
+  if (!result.needs_client_compression) {
+    // No compression needed (image or already has annotated URL)
+    console.log('ℹ️  [COMPRESS] No client compression needed')
+    return result
+  }
+  
+  try {
+    // Step 1: Download temp video from backend
+    onProgress?.('Downloading video for compression...')
+    const downloadUrl = `${API_BASE}/download-temp-video/${jobId}`
+    const localPath = `${FileSystem.cacheDirectory}temp_${jobId}.mp4`
+    
+    console.log(`📥 [COMPRESS] Downloading temp video from: ${downloadUrl}`)
+    const downloadResult = await FileSystem.downloadAsync(downloadUrl, localPath)
+    
+    if (downloadResult.status !== 200) {
+      throw new Error(`Download failed: ${downloadResult.status}`)
+    }
+    
+    const fileInfo = await FileSystem.getInfoAsync(localPath)
+    const downloadedSize = fileInfo.exists ? (fileInfo as any).size : 0
+    console.log(`📥 [COMPRESS] Downloaded: ${(downloadedSize / (1024*1024)).toFixed(2)} MB`)
+    
+    // Step 2: Compress with react-native-compressor
+    onProgress?.('Compressing video (high quality)...')
+    console.log('🗜️  [COMPRESS] Starting HIGH QUALITY compression with react-native-compressor')
+    
+    const compressedPath = await Video.compress(
+      localPath,
+      {
+        compressionMethod: 'auto',
+        maxSize: 1920, // Maintain 1080p resolution
+        bitrate: 8000000, // 8 Mbps - high quality for readable annotations
+        minimumFileSizeForCompress: 0, // Always compress
+      },
+      (progress) => {
+        const percent = (progress * 100).toFixed(0)
+        console.log(`🗜️  [COMPRESS] Progress: ${percent}%`)
+        onProgress?.(`Compressing video... ${percent}%`)
+      }
+    )
+    
+    const compressedInfo = await FileSystem.getInfoAsync(compressedPath)
+    const compressedSize = compressedInfo.exists ? (compressedInfo as any).size : 0
+    const compressionRatio = downloadedSize > 0 ? (downloadedSize / compressedSize).toFixed(1) : '0'
+    console.log(`✅ [COMPRESS] Compressed: ${(compressedSize / (1024*1024)).toFixed(2)} MB (${compressionRatio}x smaller)`)
+    
+    // Step 3: Upload compressed video back to backend
+    onProgress?.('Uploading compressed video...')
+    console.log('📤 [COMPRESS] Uploading compressed video to backend')
+    
+    const uploadResult = await FileSystem.uploadAsync(
+      `${API_BASE}/upload-compressed-video/${jobId}`,
+      compressedPath,
+      {
+        httpMethod: 'POST',
+        uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+        fieldName: 'compressed_video',
+        mimeType: 'video/mp4',
+        headers: { Accept: 'application/json' },
+      }
+    )
+    
+    if (uploadResult.status !== 200) {
+      throw new Error(`Upload failed: ${uploadResult.status}`)
+    }
+    
+    const uploadResponse = JSON.parse(uploadResult.body)
+    console.log('✅ [COMPRESS] Upload complete:', uploadResponse.annotated_url)
+    
+    // Step 4: Cleanup temp files
+    try {
+      await FileSystem.deleteAsync(localPath, { idempotent: true })
+      await FileSystem.deleteAsync(compressedPath, { idempotent: true })
+      console.log('🧹 [COMPRESS] Cleaned up temp files')
+    } catch (e) {
+      console.warn('⚠️  [COMPRESS] Cleanup warning:', e)
+    }
+    
+    // Update result with annotated URL from compressed video
+    result.cloud_annotated_url = uploadResponse.annotated_url
+    onProgress?.('Video compression complete!')
+    
+    return result
+    
+  } catch (error: any) {
+    console.error('❌ [COMPRESS] Error:', error)
+    onProgress?.(`Compression error: ${error.message || 'Unknown error'}`)
+    // Return original result even if compression fails
+    // The detection results are still valid, just no annotated video
+    return result
+  }
+}
+
+async function uploadFileToApi(uri: string, name: string, onProgress?: (message: string) => void) {
   console.log('📤 [UPLOAD] Starting upload...')
   console.log('📤 [UPLOAD] File:', name)
   console.log('📤 [UPLOAD] API Endpoint:', `${API_BASE}/upload/`)
@@ -68,15 +165,70 @@ async function uploadFileToApi(uri: string, name: string) {
     throw new Error(`Upload failed: ${result.status}`)
   }
   
-  const response = JSON.parse(result.body)
-  console.log('✅ [UPLOAD] Success!')
-  console.log('✅ [UPLOAD] Summary:', response.summary)
-  console.log('✅ [UPLOAD] Processing time:', response.processing_time)
+  const uploadResult = JSON.parse(result.body)
+  const jobId = uploadResult.job_id
+  console.log('✅ [UPLOAD] Upload successful! Job ID:', jobId)
+  console.log('✅ [UPLOAD] Message:', uploadResult.message)
   
-  return response
+  // Step 2: Poll for results
+  onProgress?.('Processing video... This may take 3-10 minutes')
+  console.log('📊 [POLLING] Starting to poll for results...')
+  
+  let pollCount = 0
+  const maxPolls = 40 // 20 minutes max (30 seconds * 40 = 1200s)
+  
+  while (pollCount < maxPolls) {
+    await new Promise(resolve => setTimeout(resolve, 30000)) // Wait 30 seconds
+    pollCount++
+    
+    console.log(`📊 [POLLING] Poll attempt ${pollCount}/${maxPolls}`)
+    
+    const statusResponse = await fetch(`${API_BASE}/job-status/${jobId}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    })
+    
+    if (!statusResponse.ok) {
+      console.error('❌ [POLLING] Status check failed:', statusResponse.status)
+      throw new Error(`Status check failed: ${statusResponse.status}`)
+    }
+    
+    const status = await statusResponse.json()
+    console.log(`📊 [POLLING] Status: ${status.status}, Progress: ${status.progress}`)
+    
+    // Update progress message
+    if (status.progress) {
+      onProgress?.(status.progress)
+    }
+    
+    if (status.status === 'completed') {
+      console.log('✅ [POLLING] Processing completed!')
+      console.log('✅ [POLLING] Summary:', status.result.summary)
+      console.log('✅ [POLLING] Detection ID:', status.result.detection_id)
+      
+      // AUTOMATIC CLIENT-SIDE COMPRESSION
+      // If backend flagged this job for client compression, handle it automatically
+      let finalResult = status.result
+      if (status.result.needs_client_compression) {
+        console.log('🗜️  [AUTO] Starting automatic client-side compression workflow')
+        finalResult = await handleClientCompression(jobId, status.result, onProgress)
+      }
+      
+      return finalResult
+    } else if (status.status === 'failed') {
+      console.error('❌ [POLLING] Processing failed:', status.error)
+      throw new Error(`Processing failed: ${status.error}`)
+    }
+    
+    // Update time remaining estimate
+    const minutesElapsed = (pollCount * 30) / 60
+    onProgress?.(`Processing... ${minutesElapsed.toFixed(1)} min elapsed`)
+  }
+  
+  throw new Error('Processing timeout - took longer than 20 minutes')
 }
 
-async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFile) {
+async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFile, onProgress?: (message: string) => void) {
   console.log('📤 [COMBINED] Starting combined upload...')
   console.log('📤 [COMBINED] Media file:', mediaFile.name)
   console.log('📤 [COMBINED] SRT file:', srtFile.name)
@@ -107,7 +259,8 @@ async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFil
   console.log('📤 [COMBINED] Sending request to backend...')
   const startTime = Date.now()
 
-  const response = await fetch(`${API_BASE}/upload-combined/`, {
+  // Step 1: Upload and get job ID
+  const uploadResponse = await fetch(`${API_BASE}/upload-combined/`, {
     method: 'POST',
     body: formData,
     headers: {
@@ -117,23 +270,76 @@ async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFil
   })
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(2)
-  console.log(`📤 [COMBINED] Response received in ${elapsed}s`)
-  console.log('📤 [COMBINED] Status:', response.status)
+  console.log(`📤 [COMBINED] Upload response received in ${elapsed}s`)
+  console.log('📤 [COMBINED] Status:', uploadResponse.status)
 
-  if (!response.ok) {
-    const errorText = await response.text()
-    console.error('❌ [COMBINED] Upload failed:', response.status, errorText)
-    throw new Error(`Upload failed: ${response.status} - ${errorText}`)
+  if (!uploadResponse.ok) {
+    const errorText = await uploadResponse.text()
+    console.error('❌ [COMBINED] Upload failed:', uploadResponse.status, errorText)
+    throw new Error(`Upload failed: ${uploadResponse.status} - ${errorText}`)
   }
 
-  const result = await response.json()
-  console.log('✅ [COMBINED] Success!')
-  console.log('✅ [COMBINED] Message:', result.message)
-  console.log('✅ [COMBINED] Summary:', result.summary)
-  console.log('✅ [COMBINED] Processing time:', result.processing_time)
-  console.log('✅ [COMBINED] Detection ID:', result.detection_id)
+  const uploadResult = await uploadResponse.json()
+  const jobId = uploadResult.job_id
+  console.log('✅ [COMBINED] Upload successful! Job ID:', jobId)
+  console.log('✅ [COMBINED] Message:', uploadResult.message)
 
-  return result
+  // Step 2: Poll for results
+  onProgress?.('Processing video... This may take 3-10 minutes')
+  console.log('📊 [POLLING] Starting to poll for results...')
+  
+  let pollCount = 0
+  const maxPolls = 40 // 20 minutes max (30 seconds * 40 = 1200s)
+  
+  while (pollCount < maxPolls) {
+    await new Promise(resolve => setTimeout(resolve, 30000)) // Wait 30 seconds
+    pollCount++
+    
+    console.log(`📊 [POLLING] Poll attempt ${pollCount}/${maxPolls}`)
+    
+    const statusResponse = await fetch(`${API_BASE}/job-status/${jobId}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    })
+    
+    if (!statusResponse.ok) {
+      console.error('❌ [POLLING] Status check failed:', statusResponse.status)
+      throw new Error(`Status check failed: ${statusResponse.status}`)
+    }
+    
+    const status = await statusResponse.json()
+    console.log(`📊 [POLLING] Status: ${status.status}, Progress: ${status.progress}`)
+    
+    // Update progress message
+    if (status.progress) {
+      onProgress?.(status.progress)
+    }
+    
+    if (status.status === 'completed') {
+      console.log('✅ [POLLING] Processing completed!')
+      console.log('✅ [POLLING] Summary:', status.result.summary)
+      console.log('✅ [POLLING] Detection ID:', status.result.detection_id)
+      
+      // AUTOMATIC CLIENT-SIDE COMPRESSION
+      // If backend flagged this job for client compression, handle it automatically
+      let finalResult = status.result
+      if (status.result.needs_client_compression) {
+        console.log('🗜️  [AUTO] Starting automatic client-side compression workflow')
+        finalResult = await handleClientCompression(jobId, status.result, onProgress)
+      }
+      
+      return finalResult
+    } else if (status.status === 'failed') {
+      console.error('❌ [POLLING] Processing failed:', status.error)
+      throw new Error(`Processing failed: ${status.error}`)
+    }
+    
+    // Update time remaining estimate
+    const minutesElapsed = (pollCount * 30) / 60
+    onProgress?.(`Processing... ${minutesElapsed.toFixed(1)} min elapsed`)
+  }
+  
+  throw new Error('Processing timeout - took longer than 20 minutes')
 }
 
 type SelectedFile = {
@@ -190,13 +396,16 @@ const Homescreen = () => {
         } catch {}
 
         if (asset.type === 'video' || asset.type === 'image') {
+          // Don't compress yet - just store the original file
+          // Compression will happen when user clicks Upload button
           setSelectedMedia({
             uri: asset.uri,
             name: inferredName,
-            size,
+            size: size,
             type: 'media'
           })
           setStatus('ready')
+          setMessage(`${asset.type === 'video' ? 'Video' : 'Image'} selected. Ready to upload.`)
         } else {
           setMessage('Please select a valid video or image file.')
           setStatus('error')
@@ -288,17 +497,78 @@ const Homescreen = () => {
       }
 
       setProgress(30)
+
+      // Compress video if needed (only for video files)
+      let mediaUriToUpload = selectedMedia?.uri
+      let mediaSizeToUpload = selectedMedia?.size || 0
+      
+      if (selectedMedia && isVideo) {
+        console.log('🎬 [COMPRESSION] Starting video compression...')
+        console.log('🎬 [COMPRESSION] Original size:', ((selectedMedia.size || 0) / (1024 * 1024)).toFixed(2), 'MB')
+        
+        setMessage('Compressing video...')
+        setProgress(35)
+        
+        try {
+          const compressedUri = await Video.compress(
+            selectedMedia.uri,
+            {
+              compressionMethod: 'auto',
+              maxSize: 1920,
+              bitrate: 5000000,
+            },
+            (progress) => {
+              const compressProgress = 35 + (progress * 0.25) // 35% to 60%
+              setProgress(compressProgress)
+              setMessage(`Compressing video... ${(progress * 100).toFixed(0)}%`)
+              console.log(`🎬 [COMPRESSION] Progress: ${(progress * 100).toFixed(0)}%`)
+            }
+          )
+          
+          const compressedInfo = await FileSystem.getInfoAsync(compressedUri)
+          const compressedSize = compressedInfo.exists ? compressedInfo.size : 0
+          
+          console.log('✅ [COMPRESSION] Compressed size:', (compressedSize / (1024 * 1024)).toFixed(2), 'MB')
+          
+          if (selectedMedia.size) {
+            console.log('✅ [COMPRESSION] Compression ratio:', ((compressedSize / selectedMedia.size) * 100).toFixed(1) + '%')
+          }
+          
+          mediaUriToUpload = compressedUri
+          mediaSizeToUpload = compressedSize
+          
+          setMessage('Compression complete. Uploading...')
+          setProgress(60)
+        } catch (compressionError) {
+          console.warn('⚠️ [COMPRESSION] Failed, using original video:', compressionError)
+          setMessage('Compression skipped. Uploading original...')
+        }
+      }
+
+      setProgress(isVideo ? 65 : 30)
       setMessage('Uploading to server...')
 
       // Use combined upload endpoint if both files are selected
       if (selectedMedia && selectedSrt) {
         console.log('📦 [MODE] Using combined upload (media + SRT)')
-        const result = await uploadCombinedFiles(selectedMedia, selectedSrt)
+        
+        // Create modified media object with compressed URI
+        const mediaToUpload = {
+          ...selectedMedia,
+          uri: mediaUriToUpload || selectedMedia.uri,
+          size: mediaSizeToUpload
+        }
+        
+        const result = await uploadCombinedFiles(mediaToUpload, selectedSrt, (progressMsg) => {
+          setMessage(progressMsg)
+        })
         setMessage(result.message || 'Upload complete with GPS data.')
       } else if (selectedMedia) {
         console.log('📦 [MODE] Using single file upload (media only)')
-        const result = await uploadFileToApi(selectedMedia.uri, selectedMedia.name)
-        setMessage(`${result.summary} (No GPS data - image only or video without SRT)`)
+        const result = await uploadFileToApi(mediaUriToUpload || selectedMedia.uri, selectedMedia.name, (progressMsg) => {
+          setMessage(progressMsg)
+        })
+        setMessage(result.message || `${result.summary} (No GPS data - image only or video without SRT)`)
       }
 
       const totalTime = ((Date.now() - uploadStartTime) / 1000).toFixed(2)

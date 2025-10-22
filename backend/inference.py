@@ -886,13 +886,13 @@ def run_video_inference(
                             upload_path = ann_video_path
                             
                             if video_size > MAX_CLOUDINARY_UPLOAD_SIZE:
-                                print(f'Annotated video too large ({video_size / (1024*1024):.2f} MB), compressing...')
+                                print(f'Annotated video too large ({video_size / (1024*1024):.2f} MB), compressing with FFmpeg...')
                                 try:
                                     upload_path = transcode_video_to_preview(ann_video_path)
                                     compressed_size = os.path.getsize(upload_path)
-                                    print(f'Compressed to {compressed_size / (1024*1024):.2f} MB')
+                                    print(f'FFmpeg compressed to {compressed_size / (1024*1024):.2f} MB')
                                 except Exception as compress_err:
-                                    print(f'Compression failed: {compress_err}, uploading original')
+                                    print(f'FFmpeg compression failed: {compress_err}, uploading original')
                                     upload_path = ann_video_path
                             
                             uploaded = upload_video_streaming(upload_path, os.path.basename(video_path), folder="weed-detections/annotated", annotate=False)
@@ -1004,46 +1004,18 @@ def run_video_inference(
                         raise RuntimeError('OpenCV video stitching failed. Please check opencv-python-headless installation.')
                     
                     print(f'Successfully stitched annotated video with OpenCV: {ann_video_path}')
-                    try:
-                        from .cloudinary_utils import upload_video_streaming
-                        from .config import MAX_CLOUDINARY_UPLOAD_SIZE
-                        from .video_utils import transcode_video_to_preview
-                        
-                        # Check file size and compress if needed
-                        video_size = os.path.getsize(ann_video_path)
-                        upload_path = ann_video_path
-                        
-                        if video_size > MAX_CLOUDINARY_UPLOAD_SIZE:
-                            print(f'Annotated video too large ({video_size / (1024*1024):.2f} MB), compressing...')
-                            try:
-                                upload_path = transcode_video_to_preview(ann_video_path)
-                                compressed_size = os.path.getsize(upload_path)
-                                print(f'Compressed to {compressed_size / (1024*1024):.2f} MB')
-                            except Exception as compress_err:
-                                print(f'Compression failed: {compress_err}, uploading original')
-                                upload_path = ann_video_path
-                        
-                        uploaded = upload_video_streaming(upload_path, os.path.basename(video_path), folder="weed-detections/annotated", annotate=False)
-                        annotated = uploaded.get('secure_url')
-                        print(f'Annotated video uploaded to Cloudinary: {annotated}')
-                        
-                        # Cleanup compressed file if different
-                        if upload_path != ann_video_path and os.path.exists(upload_path):
-                            try:
-                                os.remove(upload_path)
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        print(f'Failed to upload annotated video: {e}')
                     
-                    # Cleanup
+                    # Return the temp video path for client-side compression
+                    # Instead of uploading to Cloudinary here, let client compress first
+                    print(f'✅ Annotated video ready for client-side compression')
+                    annotated = ann_video_path  # Return the local path, not a URL
+                    
+                    # DON'T cleanup temp files yet - client needs to download this file
+                    # Cleanup will happen after client uploads compressed version
+                    # (tmpdir and ann_frames_dir can be cleaned up, but keep ann_video_path)
                     shutil.rmtree(tmpdir, ignore_errors=True)
                     shutil.rmtree(ann_frames_dir, ignore_errors=True)
-                    try:
-                        if os.path.exists(ann_video_path):
-                            os.remove(ann_video_path)
-                    except Exception:
-                        pass
+                    # Don't delete ann_video_path yet!
                         
                 except Exception as e:
                     print(f'Error creating annotated video from Roboflow results: {e}')
@@ -1092,24 +1064,26 @@ def run_inference_auto(file_path: str, confidence: Optional[int] = None, overlap
         file_size_mb = file_size / (1024 * 1024)
         print(f'Processing video: {file_size_mb:.1f} MB')
         
-        # Compress only if enabled (disabled on Render free tier to avoid RAM/CPU issues)
-        from .config import ENABLE_PRECOMPRESSION
+        # Compress using api.video if video exceeds 100 MB
         compressed_path = None
         inference_path = file_path
         try:
             if file_size_mb > 100:
+                print(f'Video exceeds 100 MB ({file_size_mb:.1f} MB), compressing for Roboflow upload...')
+                
+                # Use FFmpeg for compression
+                from .config import ENABLE_PRECOMPRESSION
                 if ENABLE_PRECOMPRESSION:
-                    print(f'Video exceeds 100 MB, compressing for Roboflow upload...')
+                    print('Using FFmpeg for compression...')
                     from .video_utils import compress_for_inference
                     compressed_path = compress_for_inference(file_path, max_size_mb=100, force=False)
                     if compressed_path != file_path:
-                        inference_path = compressed_path
-                        print(f'Using compressed video for inference: {os.path.getsize(compressed_path) / (1024 * 1024):.1f} MB')
-                else:
-                    print(f'⚠️  Video exceeds 100 MB ({file_size_mb:.1f} MB)')
-                    print(f'   Pre-compression disabled (likely on Render free tier)')
-                    print(f'   Uploading original video to Roboflow (may be slow or fail)')
-                    # Note: Roboflow may reject videos >100 MB or take very long to upload
+                            inference_path = compressed_path
+                            print(f'✅ Compressed with FFmpeg: {os.path.getsize(compressed_path) / (1024 * 1024):.1f} MB')
+                    else:
+                        print(f'⚠️ Pre-compression disabled and api.video not available')
+                        print(f'   Uploading original {file_size_mb:.1f} MB video to Roboflow (may be slow or fail)')
+                        # Note: Roboflow may reject videos >100 MB or take very long to upload
             
             # Auto-detect FPS if DEFAULT_VIDEO_FPS is None
             if DEFAULT_VIDEO_FPS is None:

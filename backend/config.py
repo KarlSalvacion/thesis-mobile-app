@@ -34,10 +34,9 @@ COMPRESS_FRAMES_BEFORE_INFERENCE = True  # Reduce image size before sending (fas
 INFERENCE_IMAGE_SIZE = 640  # Resize to this width/height before inference (640 is optimal for YOLO)
 
 # Compression strategy (environment-aware)
-# On Render free tier: Limited RAM (512 MB) and CPU (0.5 core) makes FFmpeg compression slow/unstable
-# Solution: Skip pre-compression, let Roboflow handle large files (or reject if >100 MB)
-ENABLE_PRECOMPRESSION = IS_LOCAL  # Only compress locally, not on Render free tier
-MAX_VIDEO_SIZE_WITHOUT_COMPRESSION_MB = 100  # Warn user if video >100 MB on Render
+# Using FFmpeg for video compression
+ENABLE_PRECOMPRESSION = True  # Enable FFmpeg compression for large files
+MAX_VIDEO_SIZE_WITHOUT_COMPRESSION_MB = 100  # Files >100 MB will be compressed with FFmpeg
 
 # Frame interval for video detection (process every Nth frame for speed)
 # 1 = detect on every frame, 2 = detect every 2nd frame, 3 = every 3rd frame, etc.
@@ -128,6 +127,9 @@ CLOUDINARY_CLOUD_NAME = "dl8ifxbsd"
 CLOUDINARY_API_KEY = "867463359734984"
 CLOUDINARY_API_SECRET = "ScOI-O32MQU8EkSOdS8yMPfLA_g"
 
+# ============================================================================
+# Video Compression Configuration
+# ============================================================================
 # Compression / Delivery preferences
 # Max width for annotated images
 ANNOTATED_IMAGE_MAX_WIDTH = 1280

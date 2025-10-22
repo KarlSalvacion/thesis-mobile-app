@@ -510,9 +510,18 @@ def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_patter
         height, width = first_frame.shape[:2]
         print(f"Video dimensions: {width}x{height}")
         
-        # OpenCV VideoWriter - use mp4v for fast encoding, compress with FFmpeg after
-        # Note: OpenCV's H.264 (avc1/x264) support is unreliable on Windows (requires OpenH264 DLL)
-        # Strategy: Use mp4v (fast, uncompressed) then compress with FFmpeg for H.264
+        # Keep 1080p resolution for quality (annotations need to be readable!)
+        # Client-side compression will handle file size optimization
+        # Ensure even dimensions (required for H.264 encoding later)
+        if width % 2 != 0:
+            width = width - 1
+        if height % 2 != 0:
+            height = height - 1
+        
+        print(f"Stitching at full resolution: {width}x{height} (maintaining quality for annotations)")
+        
+        # OpenCV VideoWriter - use mp4v for fast encoding
+        # Client will compress to H.264 with high quality settings
         fourcc = _cv2.VideoWriter_fourcc(*'mp4v')
         out = _cv2.VideoWriter(output_path, fourcc, fps, (width, height))
         
@@ -529,9 +538,8 @@ def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_patter
                 print(f"Warning: Failed to read frame {filename}, skipping")
                 continue
             
-            # Ensure frame dimensions match
-            if frame.shape[:2] != (height, width):
-                frame = _cv2.resize(frame, (width, height))
+            # Always resize to target dimensions (for resolution reduction + consistency)
+            frame = _cv2.resize(frame, (width, height))
             
             out.write(frame)
             
@@ -546,45 +554,8 @@ def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_patter
         if os.path.exists(output_path):
             uncompressed_size = os.path.getsize(output_path)
             size_mb = uncompressed_size / (1024 * 1024)
-            print(f"Uncompressed video size: {size_mb:.2f} MB")
-            
-            # ALWAYS compress with FFmpeg H.264 for web compatibility
-            # mp4v codec from OpenCV doesn't play in browsers/Cloudinary player
-            # H.264 compression also reduces file size 2-8x
-            try:
-                from .config import FFMPEG_BINARY
-                import subprocess
-                
-                compressed_path = output_path.replace('.mp4', '_compressed.mp4')
-                print(f"Compressing video with FFmpeg H.264 for web compatibility...")
-                
-                compress_cmd = [
-                    FFMPEG_BINARY,
-                    '-y',  # Overwrite output
-                    '-i', output_path,  # Input: uncompressed mp4v
-                    '-c:v', 'libx264',  # H.264 codec (web-compatible)
-                    '-preset', 'faster',  # Faster encoding (was 'medium')
-                    '-crf', '20',  # Very high quality (was 23, lower = better quality)
-                    '-maxrate', '12M',  # Higher max bitrate for better quality (was 8M)
-                    '-bufsize', '16M',
-                    '-pix_fmt', 'yuv420p',  # Browser compatibility
-                    '-movflags', '+faststart',  # Web streaming optimization
-                    compressed_path
-                ]
-                
-                subprocess.check_output(compress_cmd, stderr=subprocess.STDOUT)
-                
-                # Replace uncompressed with compressed
-                os.replace(compressed_path, output_path)
-                
-                compressed_size = os.path.getsize(output_path)
-                compression_ratio = uncompressed_size / compressed_size if compressed_size > 0 else 1
-                print(f"Compressed to {compressed_size / (1024*1024):.2f} MB ({compression_ratio:.1f}x smaller) - H.264 ready for web")
-                
-            except Exception as compress_error:
-                print(f"FFmpeg H.264 compression failed: {compress_error}")
-                print("WARNING: Video may not play in browsers (mp4v codec not web-compatible)")
-                # Continue with uncompressed mp4v file (will have playback issues)
+            print(f"Stitched video size: {size_mb:.2f} MB (720p, mp4v codec)")
+            print(f"✅ Skipping backend compression - client will compress with react-native-compressor")
             
             return True
         else:
