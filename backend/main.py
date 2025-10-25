@@ -217,7 +217,41 @@ def process_media_background(
         # Store detection details
         if detections and len(detections) > 0:
             batch_details = []
+            
+            # Calculate FPS for timestamp calculation
+            # If video, we need to calculate frame timestamps based on FPS
+            video_fps = None
+            if actual_file_type == "video":
+                try:
+                    # Try to get FPS from video metadata
+                    import cv2
+                    cap = cv2.VideoCapture(media_path)
+                    video_fps = cap.get(cv2.CAP_PROP_FPS)
+                    cap.release()
+                    if video_fps <= 0:
+                        video_fps = None
+                except Exception:
+                    pass
+                
+                # Fallback to config FPS if detection was done at specific FPS
+                if video_fps is None:
+                    from .config import DEFAULT_VIDEO_FPS
+                    video_fps = DEFAULT_VIDEO_FPS if DEFAULT_VIDEO_FPS else 30.0
+            
             for frame_idx, frame_detections in enumerate(detections if isinstance(detections[0], list) else [detections]):
+                # Calculate frame timestamp in milliseconds from start of video
+                frame_timestamp_ms = 0
+                if video_fps and video_fps > 0:
+                    # frame_idx is 0-based, so frame 0 = 0ms, frame 1 = 1000/fps ms, etc.
+                    frame_timestamp_ms = int((frame_idx / video_fps) * 1000)
+                
+                # Format as HH:MM:SS,mmm (SRT timestamp format)
+                hours = frame_timestamp_ms // 3600000
+                minutes = (frame_timestamp_ms % 3600000) // 60000
+                seconds = (frame_timestamp_ms % 60000) // 1000
+                milliseconds = frame_timestamp_ms % 1000
+                frame_timestamp_str = f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+                
                 for det in frame_detections:
                     batch_details.append({
                         'frame_number': frame_idx + 1,
@@ -227,7 +261,7 @@ def process_media_background(
                         'bbox_y': det.get('bbox', [0, 0, 0, 0])[1],
                         'bbox_width': det.get('bbox', [0, 0, 0, 0])[2],
                         'bbox_height': det.get('bbox', [0, 0, 0, 0])[3],
-                        'detection_timestamp': timestamp
+                        'detection_timestamp': frame_timestamp_str  # Video timestamp, not upload timestamp
                     })
             
             if batch_details:
@@ -855,7 +889,7 @@ async def get_gmap_polyline(detection_id: int):
     return { 'detection_id': detection_id, 'points': points, 'bounds': bounds }
 
 @app.post("/detection/{detection_id}/generate-heatmap")
-async def generate_heatmap(detection_id: int, grid_size_m: float = Query(10.0), persist: bool = Query(True)):
+async def generate_heatmap(detection_id: int, grid_size_m: float = Query(1.0), persist: bool = Query(True)):
     """Generate heatmap from detection_details mapped to SRT frames; optionally persist aggregated grid."""
     import sqlite3
     # Load srt frames
@@ -895,9 +929,14 @@ async def generate_heatmap(detection_id: int, grid_size_m: float = Query(10.0), 
     cell_deg_lng = grid_size_m / meters_per_deg_lng if meters_per_deg_lng > 0 else grid_size_m / 1.0
 
     grid = {}
+    # Determine origin (minimum lat/lng) so grid indices are relative to the field bounds
+    min_lat = min(p['lat'] for p in points)
+    min_lng = min(p['lng'] for p in points)
+
     for p in points:
-        key_lat = int(math.floor(p['lat'] / cell_deg_lat))
-        key_lng = int(math.floor(p['lng'] / cell_deg_lng))
+        # Use coordinates relative to the origin when computing integer grid indices
+        key_lat = int(math.floor((p['lat'] - min_lat) / cell_deg_lat))
+        key_lng = int(math.floor((p['lng'] - min_lng) / cell_deg_lng))
         key = f"{key_lat}:{key_lng}"
         cell = grid.get(key)
         if not cell:
@@ -908,9 +947,10 @@ async def generate_heatmap(detection_id: int, grid_size_m: float = Query(10.0), 
 
     # Convert grid to list with representative cell center
     cells = []
+    # Convert grid to list with representative cell center (offset by origin)
     for cell in grid.values():
-        center_lat = (cell['lat_idx'] + 0.5) * cell_deg_lat
-        center_lng = (cell['lng_idx'] + 0.5) * cell_deg_lng
+        center_lat = min_lat + (cell['lat_idx'] + 0.5) * cell_deg_lat
+        center_lng = min_lng + (cell['lng_idx'] + 0.5) * cell_deg_lng
         cells.append({
             'lat': center_lat,
             'lng': center_lng,
@@ -932,6 +972,347 @@ async def generate_heatmap(detection_id: int, grid_size_m: float = Query(10.0), 
             persisted = False
 
     return { 'detection_id': detection_id, 'points': points, 'grid': { 'grid_size_m': grid_size_m, 'cells': cells }, 'persisted': persisted }
+
+@app.get("/detection/{detection_id}/unique-weeds-heatmap")
+async def get_unique_weeds_heatmap(
+    detection_id: int,
+    iou_threshold: float = Query(0.3, description="IoU threshold for matching (0.0-1.0)"),
+    frame_gap: int = Query(10, description="Maximum frame gap for tracking"),
+    grid_size_m: float = Query(1.0, description="Grid cell size in meters"),
+    debug: bool = Query(False, description="When true, return matched detections and grid details for debugging")
+):
+    """Generate heatmap based on unique weed count per GPS location.
+    
+    This endpoint:
+    1. Gets all detections with their timestamps (not frame numbers)
+    2. Matches detection timestamps to SRT timestamps to get GPS coordinates
+    3. Calculates unique weeds using the tracking algorithm
+    4. Groups unique weeds by GPS grid cells
+    5. Returns heatmap points with weight based on unique weed count
+    
+    IMPORTANT: Matches by timestamp, not frame number, because:
+    - Original video: 30 FPS, 1900 frames
+    - Processed video: 10 FPS, 633 frames
+    - But timestamps align: frame 0 = 00:00:00,000 in both
+    """
+    import sqlite3
+    import math
+    
+    # Helper function to parse SRT timestamp to milliseconds
+    def srt_timestamp_to_ms(timestamp_str):
+        """Convert SRT timestamp 'HH:MM:SS,mmm' to milliseconds."""
+        try:
+            if not timestamp_str or not isinstance(timestamp_str, str):
+                return None
+            parts = timestamp_str.replace(',', ':').split(':')
+            if len(parts) != 4:
+                return None
+            hours, minutes, seconds, ms = map(int, parts)
+            return hours * 3600000 + minutes * 60000 + seconds * 1000 + ms
+        except Exception:
+            return None
+    
+    # Load SRT frames for GPS data
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT frames_json FROM srt_tracks WHERE detection_id = ?", (detection_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="SRT track not found for this detection")
+        
+        frames_json = row[0]
+        srt_frames = json.loads(frames_json)
+        
+        # Create timestamp -> (lat, lon) mapping
+        # SRT frames have 't' (timestamp in HH:MM:SS,mmm format)
+        timestamp_to_gps = {}
+        for frame_data in srt_frames:
+            timestamp_str = frame_data.get('t')  # SRT timestamp
+            lat = frame_data.get('lat')
+            lon = frame_data.get('lon')
+            if timestamp_str and lat is not None and lon is not None:
+                timestamp_ms = srt_timestamp_to_ms(timestamp_str)
+                if timestamp_ms is not None:
+                    timestamp_to_gps[timestamp_ms] = (lat, lon)
+        
+        print(f"[Heatmap] Loaded {len(timestamp_to_gps)} SRT GPS points")
+        
+        # Get all detection details with timestamps
+        cursor.execute("""
+            SELECT id, frame_number, weed_class, confidence,
+                   bbox_x, bbox_y, bbox_width, bbox_height,
+                   detection_timestamp
+            FROM detection_details
+            WHERE detection_id = ?
+            ORDER BY frame_number, id
+        """, (detection_id,))
+        
+        detections = cursor.fetchall()
+    
+    if not detections:
+        return {
+            'detection_id': detection_id,
+            'unique_weed_count': 0,
+            'points': [],
+            'message': 'No detections found'
+        }
+    
+    print(f"[Heatmap] Processing {len(detections)} detections")
+    
+    # Match detections to GPS by timestamp (with tolerance for slight mismatches)
+    TIMESTAMP_TOLERANCE_MS = 50  # Reduced to 50ms for more precise GPS matching (was 100ms)
+    
+    detections_with_gps = []
+    matched_count = 0
+    
+    for det in detections:
+        det_id, frame_num, weed_class, confidence, bbox_x, bbox_y, bbox_width, bbox_height, timestamp_str = det
+        
+        # Parse detection timestamp
+        det_timestamp_ms = srt_timestamp_to_ms(timestamp_str)
+        if det_timestamp_ms is None:
+            continue
+        
+        # Find closest SRT timestamp within tolerance
+        best_match = None
+        min_diff = float('inf')
+        
+        for srt_ms, (lat, lon) in timestamp_to_gps.items():
+            diff = abs(srt_ms - det_timestamp_ms)
+            if diff <= TIMESTAMP_TOLERANCE_MS and diff < min_diff:
+                min_diff = diff
+                best_match = (lat, lon)
+        
+        if best_match:
+            matched_count += 1
+            detections_with_gps.append({
+                'id': det_id,
+                'frame_num': frame_num,
+                'class': weed_class,
+                'confidence': confidence,
+                'bbox': [bbox_x, bbox_y, bbox_width, bbox_height],
+                'gps': best_match,
+                'timestamp_ms': det_timestamp_ms
+            })
+    
+    print(f"[Heatmap] Matched {matched_count}/{len(detections)} detections to GPS coordinates")
+    
+    # Calculate match percentage
+    match_percentage = (matched_count / len(detections) * 100) if len(detections) > 0 else 0
+    print(f"[Heatmap] Match rate: {match_percentage:.1f}%")
+    
+    if match_percentage < 80:
+        print(f"[Heatmap] ⚠️ WARNING: Low match rate (<80%). Consider increasing TIMESTAMP_TOLERANCE_MS or checking FPS calculation.")
+    
+    if not detections_with_gps:
+        return {
+            'detection_id': detection_id,
+            'unique_weed_count': 0,
+            'points': [],
+            'message': f'No GPS matches found. Matched {matched_count}/{len(detections)} detections.'
+        }
+    
+    # Calculate unique weeds with tracking
+    def calculate_iou(box1, box2):
+        """Calculate Intersection over Union between two bounding boxes."""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        
+        x_left = max(x1, x2)
+        y_top = max(y1, y2)
+        x_right = min(x1 + w1, x2 + w2)
+        y_bottom = min(y1 + h1, y2 + h2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+        
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+        box1_area = w1 * h1
+        box2_area = w2 * h2
+        union_area = box1_area + box2_area - intersection_area
+        
+        return intersection_area / union_area if union_area > 0 else 0.0
+    
+    # Track weeds across frames to identify unique individuals
+    tracks = []
+    
+    for det in detections_with_gps:
+        det_id = det['id']
+        frame_num = det['frame_num']
+        weed_class = det['class']
+        confidence = det['confidence']
+        box = det['bbox']
+        gps_coords = det['gps']
+        
+        # Try to match with existing tracks
+        matched = False
+        for track in tracks:
+            last_det = track['detections'][-1]
+            last_frame = last_det['frame_num']
+            last_class = last_det['class']
+            last_box = last_det['bbox']
+            
+            # Check if same class
+            if weed_class != last_class:
+                continue
+            
+            # Check frame gap
+            if frame_num - last_frame > frame_gap:
+                continue
+            
+            # Check spatial proximity (IoU)
+            iou = calculate_iou(box, last_box)
+            
+            if iou >= iou_threshold:
+                track['detections'].append(det)
+                track['last_frame'] = frame_num
+                track['avg_confidence'] = (track['avg_confidence'] * track['count'] + confidence) / (track['count'] + 1)
+                track['count'] += 1
+                
+                # Update GPS location
+                if gps_coords:
+                    track['gps_coords'].append(gps_coords)
+                
+                matched = True
+                break
+        
+        # Create new track if no match
+        if not matched:
+            new_track = {
+                'weed_class': weed_class,
+                'detections': [det],
+                'first_frame': frame_num,
+                'last_frame': frame_num,
+                'avg_confidence': confidence,
+                'count': 1,
+                'gps_coords': [gps_coords] if gps_coords else []
+            }
+            tracks.append(new_track)
+    
+    print(f"[Heatmap] Identified {len(tracks)} unique weeds from {len(detections_with_gps)} GPS-matched detections")
+    
+    # Now we have unique weeds (tracks), assign each to GPS grid cells
+    if not tracks or not any(t['gps_coords'] for t in tracks):
+        return {
+            'detection_id': detection_id,
+            'unique_weed_count': len(tracks),
+            'points': [],
+            'message': 'No GPS data available for heatmap'
+        }
+    
+    # Get all GPS points to calculate mean latitude
+    all_gps = []
+    for track in tracks:
+        if track['gps_coords']:
+            all_gps.extend(track['gps_coords'])
+    
+    if not all_gps:
+        return {
+            'detection_id': detection_id,
+            'unique_weed_count': len(tracks),
+            'points': [],
+            'message': 'No GPS coordinates found'
+        }
+    
+    mean_lat = sum(lat for lat, lon in all_gps) / len(all_gps)
+    meters_per_deg_lat = 111320.0
+    meters_per_deg_lng = 111320.0 * math.cos(math.radians(mean_lat))
+    cell_deg_lat = grid_size_m / meters_per_deg_lat
+    cell_deg_lng = grid_size_m / meters_per_deg_lng if meters_per_deg_lng > 0 else grid_size_m / 1.0
+    
+    # Find min/max bounds for grid origin
+    min_lat = min(lat for lat, lon in all_gps)
+    min_lng = min(lon for lat, lon in all_gps)
+    max_lat = max(lat for lat, lon in all_gps)
+    max_lng = max(lon for lat, lon in all_gps)
+    
+    print(f"[Heatmap] GPS Bounds: lat ({min_lat:.6f} to {max_lat:.6f}), lng ({min_lng:.6f} to {max_lng:.6f})")
+    print(f"[Heatmap] GPS Range: lat span={max_lat-min_lat:.8f}° ({(max_lat-min_lat)*111320:.1f}m), lng span={max_lng-min_lng:.8f}° ({(max_lng-min_lng)*111320*math.cos(math.radians(mean_lat)):.1f}m)")
+    print(f"[Heatmap] Grid origin: ({min_lat:.6f}, {min_lng:.6f}), cell size: {grid_size_m}m")
+    print(f"[Heatmap] Cell degrees: lat={cell_deg_lat:.8f}, lng={cell_deg_lng:.8f}")
+    
+    # Assign each unique weed to a grid cell based on its average GPS location
+    grid = {}
+    for track in tracks:
+        if not track['gps_coords']:
+            continue
+        
+        # Calculate average GPS position for this unique weed
+        avg_lat = sum(lat for lat, lon in track['gps_coords']) / len(track['gps_coords'])
+        avg_lon = sum(lon for lat, lon in track['gps_coords']) / len(track['gps_coords'])
+        
+        # Assign to grid cell (relative to min bounds)
+        key_lat = int(math.floor((avg_lat - min_lat) / cell_deg_lat))
+        key_lng = int(math.floor((avg_lon - min_lng) / cell_deg_lng))
+        key = f"{key_lat}:{key_lng}"
+        if key not in grid:
+            # Track both unique counts and raw GPS sums so we can compute
+            # a representative cell center as the average of actual points
+            grid[key] = {
+                'lat_idx': key_lat,
+                'lng_idx': key_lng,
+                'unique_count': 0,
+                'by_class': {},
+                'sum_lat': 0.0,
+                'sum_lng': 0.0,
+                'count_points': 0
+            }
+
+        grid[key]['unique_count'] += 1
+        grid[key]['sum_lat'] += avg_lat
+        grid[key]['sum_lng'] += avg_lon
+        grid[key]['count_points'] += 1
+
+        # Track by class
+        weed_class = track['weed_class']
+        if weed_class not in grid[key]['by_class']:
+            grid[key]['by_class'][weed_class] = 0
+        grid[key]['by_class'][weed_class] += 1
+    
+    # Convert grid to heatmap points. Use the average GPS of tracks in each cell
+    # as the representative point so heat markers land on actual detections.
+    points = []
+    for cell in grid.values():
+        if cell.get('count_points') and cell['count_points'] > 0:
+            center_lat = cell['sum_lat'] / cell['count_points']
+            center_lng = cell['sum_lng'] / cell['count_points']
+        else:
+            # Fallback to grid center if no raw points (shouldn't happen)
+            center_lat = min_lat + (cell['lat_idx'] + 0.5) * cell_deg_lat
+            center_lng = min_lng + (cell['lng_idx'] + 0.5) * cell_deg_lng
+
+        points.append({
+            'lat': center_lat,
+            'lng': center_lng,
+            'weight': cell['unique_count'],  # Weight based on number of unique weeds
+            'unique_count': cell['unique_count'],
+            'by_class': cell['by_class']
+        })
+    
+    print(f"[Heatmap] Generated {len(points)} heatmap points from {len(grid)} grid cells")
+    if len(points) > 0:
+        print(f"[Heatmap] Sample heatmap point: lat={points[0]['lat']:.6f}, lng={points[0]['lng']:.6f}, weight={points[0]['weight']}")
+    if len(detections_with_gps) > 0:
+        sample_det = detections_with_gps[0]
+        gps_lat, gps_lng = sample_det['gps']
+        print(f"[Heatmap] Sample detection GPS: lat={gps_lat:.6f}, lng={gps_lng:.6f}, frame={sample_det['frame_num']}")
+    
+    return {
+        'detection_id': detection_id,
+        'unique_weed_count': len(tracks),
+        'total_detections': len(detections),
+        'gps_matched_detections': len(detections_with_gps),
+        'reduction_percentage': round((1 - len(tracks) / len(detections)) * 100, 1) if len(detections) > 0 else 0,
+        'points': points,
+        'grid_size_m': grid_size_m,
+        'tracking_params': {
+            'iou_threshold': iou_threshold,
+            'frame_gap': frame_gap,
+            'timestamp_tolerance_ms': TIMESTAMP_TOLERANCE_MS
+        },
+        'message': f'Found {len(tracks)} unique weeds from {len(detections_with_gps)} GPS-matched detections (matched {matched_count}/{len(detections)} total detections by timestamp)'
+    , 'debug': ({'matched_detections': detections_with_gps, 'grid': grid} if debug else None)
+    }
 
 @app.get("/detection/{detection_id}/export")
 async def export_report(

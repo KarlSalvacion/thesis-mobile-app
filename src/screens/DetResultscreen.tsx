@@ -1,11 +1,12 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { View, Text, ActivityIndicator, ScrollView, RefreshControl, Image, TouchableOpacity, Modal, Dimensions, Alert, Linking, Platform } from 'react-native';
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
-import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { useNavigation } from '@react-navigation/native';
 import { Video, ResizeMode } from 'expo-av';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
-import { API_BASE } from '../config'
+import { API_BASE } from '../config';
+import { useSession } from '../context/SessionContext';
 
 type DetectionRow = [
   id: number,
@@ -69,12 +70,13 @@ function pickColorForClass(className: string): string {
 
 const DetectionResults = () => {
   const navigation = useNavigation()
-  const [loading, setLoading] = useState<boolean>(true)
+  const { selectedDetection, sessions, refreshSessions, setSelectedDetection } = useSession();
+  const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string>('')
-  const [latestDetection, setLatestDetection] = useState<DetectionRow | null>(null)
   const [details, setDetails] = useState<DetectionDetailRow[]>([])
   const [frames, setFrames] = useState<FrameMetadataRow[]>([])
   const [isModalVisible, setIsModalVisible] = useState<boolean>(false)
+  const [sessionModalVisible, setSessionModalVisible] = useState<boolean>(false)
   const [exporting, setExporting] = useState<boolean>(false)
   const [uniqueWeedCount, setUniqueWeedCount] = useState<number | null>(null)
   const [uniqueWeedData, setUniqueWeedData] = useState<any>(null)
@@ -85,15 +87,77 @@ const DetectionResults = () => {
   // DJI Mini 4 Pro aspect ratio is 4:3
   const djiAspectRatio = 4 / 3
 
+  const loadDetectionData = useCallback(async (detection: DetectionRow) => {
+    try {
+      setLoading(true);
+      setError('');
+      
+      const detId = detection[0];
+      const res = await fetch(`${API_BASE}/detection/${detId}`);
+      if (!res.ok) throw new Error(`Failed to load session ${detId}`);
+      const j = await res.json();
+      
+      // Attach cloud URLs returned by backend.detection tuple for consistent display
+      const detectionTuple = j?.detection ?? [];
+      ;(detection as any).cloud_public_id = detectionTuple[11];
+      ;(detection as any).cloud_resource_type = detectionTuple[12];
+      ;(detection as any).cloud_secure_url = detectionTuple[13];
+      ;(detection as any).cloud_annotated_url = detectionTuple[14];
+      
+      console.log('🔍 [DEBUG] Detection tuple length:', detectionTuple.length);
+      console.log('🔍 [DEBUG] Cloud URLs:', {
+        secure: detectionTuple[13],
+        annotated: detectionTuple[14]
+      });
+      
+      setFrames((j?.frame_metadata ?? []) as FrameMetadataRow[]);
+      setDetails((j?.detection_details ?? []) as DetectionDetailRow[]);
+
+      if (detection[3] === 'video') {
+        try {
+          const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds`);
+          if (res3.ok) {
+            const uniqueData = await res3.json();
+            setUniqueWeedCount(uniqueData.unique_weed_count);
+            setUniqueWeedData(uniqueData);
+          }
+        } catch (e) {
+          console.warn('Could not fetch unique weed count for session', detId, e);
+        }
+      } else {
+        setUniqueWeedCount(null);
+        setUniqueWeedData(null);
+      }
+    } catch (e: any) {
+      setError(e?.message || 'Failed to load session');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Load detection data when selected detection changes
+  useEffect(() => {
+    if (selectedDetection) {
+      loadDetectionData(selectedDetection);
+    } else {
+      // Clear all data when no detection is selected
+      setDetails([]);
+      setFrames([]);
+      setUniqueWeedCount(null);
+      setUniqueWeedData(null);
+      setError('');
+    }
+  }, [selectedDetection, loadDetectionData]);
+
   // Action Handlers
   const handleViewMap = useCallback(() => {
-    if (!latestDetection) {
+    if (!selectedDetection) {
       Alert.alert('No Data', 'No detection session available.')
       return
     }
     
-    const detectionId = latestDetection[0]
-    const hasGPS = latestDetection[10]
+    const detectionId = selectedDetection[0]
+    const hasGPS = selectedDetection[10]
     
     if (!hasGPS) {
       Alert.alert(
@@ -109,15 +173,20 @@ const DetectionResults = () => {
       detectionId,
       autoFocus: true 
     })
-  }, [latestDetection, navigation])
+  }, [selectedDetection, navigation])
+
+  const handleOpenSelectSession = useCallback(async () => {
+    await refreshSessions();
+    setSessionModalVisible(true);
+  }, [refreshSessions]);
 
   const handleExport = useCallback(async () => {
-    if (!latestDetection) {
+    if (!selectedDetection) {
       Alert.alert('No Data', 'No detection session available to export.')
       return
     }
 
-    const detectionId = latestDetection[0]
+    const detectionId = selectedDetection[0]
 
     Alert.alert(
       'Export Format',
@@ -141,7 +210,7 @@ const DetectionResults = () => {
         }
       ]
     )
-  }, [latestDetection])
+  }, [selectedDetection])
 
   const exportReport = async (detectionId: number, format: string) => {
     try {
@@ -203,12 +272,12 @@ const DetectionResults = () => {
   }
 
   const handleShare = useCallback(async () => {
-    if (!latestDetection) {
+    if (!selectedDetection) {
       Alert.alert('No Data', 'No detection session available to share.')
       return
     }
 
-    const detectionId = latestDetection[0]
+    const detectionId = selectedDetection[0]
 
     try {
       setExporting(true)
@@ -226,14 +295,14 @@ const DetectionResults = () => {
       console.log('✅ Share package created:', shareData)
       
       const shareMessage = shareData.share_message || 
-        `🌿 Weed Detection Results\n\nFile: ${latestDetection[1]}\nDetected: ${details.length} weeds\n\nView: ${shareData.media_urls?.annotated || 'N/A'}`
+        `🌿 Weed Detection Results\n\nFile: ${selectedDetection[1]}\nDetected: ${details.length} weeds\n\nView: ${shareData.media_urls?.annotated || 'N/A'}`
       
       // Check if native sharing is available
       const canShare = await Sharing.isAvailableAsync()
       
       if (canShare && shareData.media_urls?.annotated) {
         // Download annotated media first
-        const filename = `detection_${detectionId}_annotated.${latestDetection[3] === 'video' ? 'mp4' : 'jpg'}`
+        const filename = `detection_${detectionId}_annotated.${selectedDetection[3] === 'video' ? 'mp4' : 'jpg'}`
         const fileUri = `${FileSystem.cacheDirectory}${filename}`
         
         try {
@@ -241,7 +310,7 @@ const DetectionResults = () => {
           
           if (downloadResult.status === 200) {
             await Sharing.shareAsync(downloadResult.uri, {
-              mimeType: latestDetection[3] === 'video' ? 'video/mp4' : 'image/jpeg',
+              mimeType: selectedDetection[3] === 'video' ? 'video/mp4' : 'image/jpeg',
               dialogTitle: 'Share Detection Results'
             })
           } else {
@@ -295,82 +364,16 @@ const DetectionResults = () => {
     } finally {
       setExporting(false)
     }
-  }, [latestDetection, details])
-
-  const load = useCallback(async (opts?: { silent?: boolean }) => {
-    let cancelled = false
-    try {
-      if (!opts?.silent) setLoading(true)
-      setError('')
-      const res = await fetch(`${API_BASE}/detections/`)
-      const json = await res.json()
-      const rows: DetectionRow[] = json?.detections ?? []
-      const latest = rows?.[0] ?? null
-      if (!latest) {
-        setLatestDetection(null)
-        setDetails([])
-        setFrames([])
-        setError('No detection sessions found.')
-        return
-      }
-      const detId = latest[0]
-      const res2 = await fetch(`${API_BASE}/detection/${detId}`)
-      const j2 = await res2.json()
-      setLatestDetection(latest)
-      setFrames((j2?.frame_metadata ?? []) as FrameMetadataRow[])
-      setDetails((j2?.detection_details ?? []) as DetectionDetailRow[])
-      
-      // Fetch unique weed count for video detections
-      if (latest[3] === 'video') {
-        try {
-          const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds`)
-          if (res3.ok) {
-            const uniqueData = await res3.json()
-            setUniqueWeedCount(uniqueData.unique_weed_count)
-            setUniqueWeedData(uniqueData)
-            console.log('✅ Unique weeds:', uniqueData.unique_weed_count, 'from', uniqueData.total_detections, 'detections')
-          }
-        } catch (e) {
-          console.warn('Could not fetch unique weed count:', e)
-        }
-      } else {
-        // For images, unique count = total detections
-        setUniqueWeedCount(null)
-        setUniqueWeedData(null)
-      }
-      
-      // Attach cloud info if available (backend returns session with detection tuple)
-      // Detection tuple indices: id, filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data, cloud_public_id, cloud_resource_type, cloud_secure_url
-  // Map cloud fields from the backend detection tuple. New DB adds cloud_annotated_url at index 14.
-  ;(latest as any).cloud_public_id = (j2?.detection ?? [])[11]
-  ;(latest as any).cloud_resource_type = (j2?.detection ?? [])[12]
-  ;(latest as any).cloud_secure_url = (j2?.detection ?? [])[13]
-  ;(latest as any).cloud_annotated_url = (j2?.detection ?? [])[14]
-    } catch (e: any) {
-      setError(e?.message || 'Failed to load results')
-    } finally {
-      if (!opts?.silent) setLoading(false)
-    }
-    return () => {
-      cancelled = true
-    }
-  }, [])
-
-  // Auto-refresh when screen comes into focus
-  useFocusEffect(
-    useCallback(() => {
-      load()
-    }, [load])
-  )
+  }, [selectedDetection, details])
 
   const summary = useMemo(() => {
-    if (!latestDetection) return null
+    if (!selectedDetection) return null
     const totalDetections = details.length
     const avgConfidence =
       totalDetections > 0
         ? Math.round((details.reduce((s, d) => s + (d[4] ?? 0), 0) / totalDetections) * 1000) / 10
         : 0
-    const ts = latestDetection[2]
+    const ts = selectedDetection[2]
     const byClass: Record<string, { count: number; avg: number }> = {}
     details.forEach(d => {
       const name = d[3]
@@ -390,7 +393,7 @@ const DetectionResults = () => {
       .sort((a, b) => b.count - a.count)
       .slice(0, 6)
     return { totalWeeds: totalDetections, confidence: avgConfidence, timestamp: ts, species }
-  }, [latestDetection, details])
+  }, [selectedDetection, details])
 
   function formatAmPm(ts?: string | null) {
     if (!ts) return ''
@@ -406,7 +409,7 @@ const DetectionResults = () => {
 
   return (
     <ScrollView className="flex-1 bg-bgColor1" showsVerticalScrollIndicator={false}
-      refreshControl={<RefreshControl refreshing={loading} onRefresh={() => load()} />}>
+      refreshControl={<RefreshControl refreshing={loading} onRefresh={() => refreshSessions()} />}>
       <View className="flex-1 justify-start items-center pt-12 pb-8 px-4">
         {/* Media Container - Expandable with DJI Mini 4 Pro aspect ratio */}
         <View className="w-full items-center mb-6">
@@ -422,19 +425,19 @@ const DetectionResults = () => {
                 aspectRatio: djiAspectRatio 
               }}
             >
-              {latestDetection && latestDetection[3] === 'image' ? (
+              {selectedDetection && selectedDetection[3] === 'image' ? (
                 <Image
-                  source={{ uri: (latestDetection as any).cloud_annotated_url || (latestDetection as any).cloud_secure_url || `${API_BASE}/uploads/${latestDetection[1]}` }}
+                  source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
                   resizeMode="cover"
                   style={{ width: '100%', height: '100%' }}
                   onError={(error) => {
                     console.log('Image load error:', error)
-                    Alert.alert('Error', 'Failed to load image')
+                    Alert.alert('Error', 'Failed to load image from Cloudinary')
                   }}
                 />
-              ) : latestDetection && latestDetection[3] === 'video' && (latestDetection as any).cloud_secure_url ? (
+              ) : selectedDetection && selectedDetection[3] === 'video' && (selectedDetection as any).cloud_secure_url ? (
                 <Video
-                  source={{ uri: (latestDetection as any).cloud_annotated_url || (latestDetection as any).cloud_secure_url }}
+                  source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
                   style={{ width: '100%', height: '100%' }}
                   resizeMode={ResizeMode.COVER}
                   shouldPlay={false}
@@ -449,10 +452,10 @@ const DetectionResults = () => {
                 <View className="flex-1 items-center justify-center">
                   <Ionicons name="play-circle" size={64} color="white" />
                   <Text className="text-white text-lg font-medium mt-3 text-center">
-                    {latestDetection?.[3] === 'video' ? 'Detection Video' : 'Media preview unavailable'}
+                    {selectedDetection?.[3] === 'video' ? 'Detection Video' : 'Media preview unavailable'}
                   </Text>
                   <Text className="text-gray-300 text-xs mt-1 px-3 text-center">
-                    {latestDetection?.[3] === 'video'
+                    {selectedDetection?.[3] === 'video'
                       ? 'Tap to expand and play video'
                       : 'No media available for preview'}
                   </Text>
@@ -463,7 +466,38 @@ const DetectionResults = () => {
               <View className="absolute top-2 right-2 bg-black/50 rounded-full p-2">
                 <Ionicons name="expand" size={20} color="white" />
               </View>
-            </View>
+              </View>
+
+              {/* Session Selection Modal */}
+              <Modal visible={sessionModalVisible} transparent={true} animationType="slide" onRequestClose={() => setSessionModalVisible(false)}>
+                <View className="flex-1 bg-black/60 justify-end">
+                  <View className="bg-white rounded-t-2xl p-4 max-h-3/4">
+                    <Text className="text-lg font-semibold mb-2">Select Detection Session</Text>
+                    <ScrollView style={{ maxHeight: 360 }}>
+                      {sessions.length === 0 && (
+                        <View className="p-4"><Text className="text-gray-500">No sessions available.</Text></View>
+                      )}
+                      {sessions.map((s) => (
+                        <TouchableOpacity key={s[0]} className="p-3 border-b border-gray-100" onPress={() => {
+                          setSelectedDetection(s);
+                          setSessionModalVisible(false);
+                        }}>
+                          <View className="flex-row items-center justify-between">
+                            <View>
+                              <Text className="font-medium">{s[1]}</Text>
+                              <Text className="text-xs text-gray-500">{formatAmPm(s[2])} • {s[3]}</Text>
+                            </View>
+                            <Text className="text-sm text-gray-400">{s[6]} detections</Text>
+                          </View>
+                        </TouchableOpacity>
+                      ))}
+                    </ScrollView>
+                    <TouchableOpacity className="mt-3 p-3 bg-gray-100 rounded-lg" onPress={() => setSessionModalVisible(false)}>
+                      <Text className="text-center text-gray-700">Close</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              </Modal>
           </TouchableOpacity>
         </View>
 
@@ -490,9 +524,9 @@ const DetectionResults = () => {
                 maxWidth: screenWidth * 0.95
               }}
             >
-              {latestDetection && latestDetection[3] === 'image' ? (
+              {selectedDetection && selectedDetection[3] === 'image' ? (
                 <Image
-                  source={{ uri: (latestDetection as any).cloud_annotated_url || (latestDetection as any).cloud_secure_url || `${API_BASE}/uploads/${latestDetection[1]}` }}
+                  source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
                   resizeMode="contain"
                   style={{ width: '100%', height: '100%' }}
                   onError={(error) => {
@@ -500,9 +534,9 @@ const DetectionResults = () => {
                     Alert.alert('Error', 'Failed to load image in fullscreen')
                   }}
                 />
-              ) : latestDetection && latestDetection[3] === 'video' && (latestDetection as any).cloud_secure_url ? (
+              ) : selectedDetection && selectedDetection[3] === 'video' && (selectedDetection as any).cloud_secure_url ? (
                 <Video
-                  source={{ uri: (latestDetection as any).cloud_annotated_url || (latestDetection as any).cloud_secure_url }}
+                  source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
                   style={{ width: '100%', height: '100%' }}
                   resizeMode={ResizeMode.CONTAIN}
                   shouldPlay={true}
@@ -582,14 +616,14 @@ const DetectionResults = () => {
 
             <View className="bg-gray-50 rounded-lg p-3">
               <Text className="text-xs text-gray-600 text-center">
-                {latestDetection ? `File: ${latestDetection[1]} (${latestDetection[3]})` : ''}
+                {selectedDetection ? `File: ${selectedDetection[1]} (${selectedDetection[3]})` : ''}
               </Text>
               <Text className="text-xs text-gray-500 text-center mt-1">
                 {summary?.timestamp ? `Detected on ${formatAmPm(summary.timestamp)}` : 'No recent session'}
               </Text>
-              {latestDetection && (
+              {selectedDetection && (
                 <View className="flex-row items-center justify-center mt-2">
-                  {latestDetection[10] ? (
+                  {selectedDetection[10] ? (
                     <>
                       <View className="w-2 h-2 bg-green-500 rounded-full mr-1" />
                       <Text className='text-xs text-green-600 font-medium'>GPS Data Available</Text>
@@ -665,6 +699,20 @@ const DetectionResults = () => {
                     View on Map
                   </Text>
                   <Ionicons name="chevron-forward" size={20} color="rgb(37, 165, 120)" />
+                </View>
+              </TouchableOpacity>
+              
+              <TouchableOpacity 
+                className="bg-gray-50 border border-gray-200 rounded-lg p-3"
+                onPress={handleOpenSelectSession}
+                disabled={exporting}
+              >
+                <View className="flex-row items-center">
+                  <FontAwesome6 name="list" size={20} color="rgb(107, 114, 128)" />
+                  <Text className="text-gray-700 font-medium ml-3 flex-1">
+                    Select Session
+                  </Text>
+                  <Ionicons name="chevron-forward" size={20} color="rgb(107, 114, 128)" />
                 </View>
               </TouchableOpacity>
               

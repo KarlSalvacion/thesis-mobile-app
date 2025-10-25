@@ -1,7 +1,48 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import { View, Text, ActivityIndicator, Pressable, ScrollView, RefreshControl } from 'react-native';
-import { useFocusEffect } from '@react-navigation/native';
+import { View, Text, ActivityIndicator, Pressable, ScrollView, RefreshControl, Modal } from 'react-native';
+import { useRoute } from '@react-navigation/native';
 import { API_BASE } from '../config';
+import { useSession } from '../context/SessionContext';
+
+/**
+ * Mapscreen - Displays GPS-based heatmap of unique weed detections
+ * 
+ * This screen implements a sophisticated weed tracking and mapping system:
+ * 
+ * 1. SRT File Integration:
+ *    - Reads SRT subtitle files uploaded with MP4 videos
+ *    - Extracts GPS coordinates (latitude, longitude) + timestamps from each frame
+ *    - Matches timestamps (not frame numbers) with detection timestamps from Roboflow
+ * 
+ * 2. Why Timestamp Matching Instead of Frame Numbers:
+ *    - Original drone video: 30 FPS, 1900 frames
+ *    - SRT file: 1900 entries (one per original frame)
+ *    - Processed video: 10 FPS (config.py), only ~633 frames
+ *    - Frame mismatch: Detection frame 63 ≠ SRT frame 63
+ *    - Solution: Match by timestamp (both start at 00:00:00,000)
+ *    - Frame 63 at 10 FPS = 6.3s = matches SRT entry at 00:00:06,300 (frame ~189 at 30 FPS)
+ * 
+ * 3. Unique Weed Detection:
+ *    - Uses IoU (Intersection over Union) algorithm to track the same weed across multiple frames
+ *    - Prevents counting the same weed multiple times
+ *    - Groups detections within frame_gap (default: 10 frames) with similar bounding boxes
+ *    - Validates tracking using GPS distance (weeds shouldn't move >2 meters)
+ * 
+ * 4. Heatmap Generation:
+ *    - Groups unique weeds into spatial grid cells (default: 5m x 5m)
+ *    - Each grid cell shows the number of UNIQUE weeds detected in that area
+ *    - Color coding: Green (low: ≤2) -> Yellow (medium: 3-5) -> Red (high: >5)
+ *    - Uses Leaflet.heat library with custom gradient for visualization
+ * 
+ * 5. Data Flow:
+ *    - Backend: /detection/{id}/unique-weeds-heatmap endpoint
+ *    - Matches SRT timestamps with detection timestamps (±100ms tolerance)
+ *    - Calculates unique weeds using tracking algorithm
+ *    - Returns heatmap points with weight = unique weed count per location
+ * 
+ * Example: If the same weed appears in frames 10-20, it's counted as 1 unique weed,
+ * not 11 separate detections. The heatmap shows actual weed distribution, not detection density.
+ */
 
 // Types
 type DetectionRow = [
@@ -39,15 +80,18 @@ type DetectionDetailRow = [
 ];
 
 const Mapscreen = () => {
+  const { selectedDetection, sessions, refreshSessions, setSelectedDetection } = useSession();
   const [scrollEnabled, setScrollEnabled] = useState(true);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
-  const [latestDetection, setLatestDetection] = useState<DetectionRow | null>(null);
   const [details, setDetails] = useState<DetectionDetailRow[]>([]);
   const [polyline, setPolyline] = useState<GMapPoint[]>([]);
   const [bounds, setBounds] = useState<PolylineResponse['bounds']>(null);
   const [heatPoints, setHeatPoints] = useState<Array<{ lat: number, lng: number, weight: number }>>([]);
   const [mapsAvailable, setMapsAvailable] = useState<boolean>(false);
+  const [uniqueWeedCount, setUniqueWeedCount] = useState<number>(0);
+  const [totalDetections, setTotalDetections] = useState<number>(0);
+  const [sessionModalVisible, setSessionModalVisible] = useState<boolean>(false);
 
   // Check map library availability once, but force LeafletWebMap in Expo Go
   useEffect(() => {
@@ -65,95 +109,137 @@ const Mapscreen = () => {
     }
   }, []);
 
-  const load = useCallback(async (opts?: { silent?: boolean }) => {
+  const loadMapData = useCallback(async (detection: DetectionRow) => {
     try {
-      if (!opts?.silent) setLoading(true);
+      setLoading(true);
       setError('');
+
+      // Clear previous map/heat immediately to avoid stale display
+      setPolyline([]);
+      setHeatPoints([]);
+      setBounds(null);
+      setUniqueWeedCount(0);
+      setTotalDetections(0);
+
+      const detId = detection[0];
       
-      // First, get the most recent detection (regardless of SRT status)
-      const allRes = await fetch(`${API_BASE}/detections/`);
-      const allJson = await allRes.json();
-      const allRows: DetectionRow[] = allJson?.detections ?? [];
-      const mostRecent = allRows?.[0] ?? null;
-      
-      // Check if the most recent detection has SRT data
-      if (!mostRecent || !mostRecent[10]) { // has_srt_data is at index 10
-        const fileType = mostRecent ? mostRecent[3] : 'unknown';
-        const fileName = mostRecent ? mostRecent[1] : 'unknown';
-        setError(`Most recent detection (${fileName} - ${fileType}) has no GPS data. Upload a video with SRT file to view map data.`);
-        setLatestDetection(mostRecent); // Still show the detection info
-        setDetails([]);
-        setPolyline([]);
-        setBounds(null);
-        setHeatPoints([]);
-        return;
-      }
-      
-      // If most recent has SRT data, use it for mapping
-      const latest = mostRecent;
-      const detId = latest[0];
       // fetch session details (for detection_details stats)
       const res2 = await fetch(`${API_BASE}/detection/${detId}`);
+      if (!res2.ok) throw new Error('Failed to fetch detection session')
       const j2 = await res2.json();
-      setLatestDetection(latest);
+      
+      // Attach cloud urls to display
+      const detectionTuple = j2?.detection ?? [];
+      ;(detection as any).cloud_secure_url = detectionTuple[13];
+      ;(detection as any).cloud_annotated_url = detectionTuple[14];
+      
+      console.log('🔍 [MAP DEBUG] Detection tuple length:', detectionTuple.length);
+      console.log('🔍 [MAP DEBUG] Has SRT data:', detection[10]);
+      console.log('🔍 [MAP DEBUG] Cloud URLs:', {
+        secure: detectionTuple[13],
+        annotated: detectionTuple[14]
+      });
+      
       setDetails((j2?.detection_details ?? []) as DetectionDetailRow[]);
 
-      // fetch google-maps-ready polyline
-      const res3 = await fetch(`${API_BASE}/detection/${detId}/gmap-polyline`);
-      if (res3.ok) {
-        const j3: PolylineResponse = await res3.json();
-        setPolyline(j3?.points ?? []);
-        setBounds(j3?.bounds ?? null);
+      // Check if this detection has SRT data before trying to fetch it
+      if (detection[10]) { // has_srt_data field
+        // Try to get SRT polyline - if missing, clear previous polyline/heat
+        const res3 = await fetch(`${API_BASE}/detection/${detId}/gmap-polyline`);
+        if (res3.ok) {
+          const j3: PolylineResponse = await res3.json();
+          setPolyline(j3?.points ?? []);
+          setBounds(j3?.bounds ?? null);
+
+          // Generate heatmap based on unique weeds per GPS location (use smaller grid by default)
+          const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=1&iou_threshold=0.15&frame_gap=5`);
+          if (res4.ok) {
+            const j4 = await res4.json();
+            const heatmapPoints = (j4?.points ?? []).map((point: any) => ({ lat: point.lat, lng: point.lng, weight: point.unique_count || point.weight || 1 }));
+            setHeatPoints(heatmapPoints);
+            setUniqueWeedCount(j4?.unique_weed_count ?? 0);
+            setTotalDetections(j4?.total_detections ?? 0);
+          } else {
+            // fallback: clear heat
+            setHeatPoints([]);
+            setUniqueWeedCount(0);
+            setTotalDetections(0);
+          }
+        } else {
+          // SRT data exists but polyline fetch failed
+          setPolyline([]);
+          setBounds(null);
+          setHeatPoints([]);
+          setUniqueWeedCount(0);
+          setTotalDetections(0);
+        }
       } else {
+        // No SRT data: clear polyline and heat
         setPolyline([]);
         setBounds(null);
-      }
-
-      // generate heatmap points (do not persist)
-      const res4 = await fetch(`${API_BASE}/detection/${detId}/generate-heatmap?grid_size_m=10&persist=false`, { method: 'POST' });
-      if (res4.ok) {
-        const j4 = await res4.json();
-        setHeatPoints(Array.isArray(j4?.points) ? j4.points : []);
-      } else {
         setHeatPoints([]);
+        setUniqueWeedCount(0);
+        setTotalDetections(0);
       }
     } catch (e: any) {
       setError(e?.message || 'Failed to load map data');
     } finally {
-      if (!opts?.silent) setLoading(false);
+      setLoading(false);
     }
   }, []);
 
-  // Initial load
+  // Load map data when selected detection changes
   useEffect(() => {
-    load();
-  }, []);
+    if (selectedDetection) {
+      loadMapData(selectedDetection);
+    } else {
+      // Clear all data when no detection is selected
+      setPolyline([]);
+      setHeatPoints([]);
+      setBounds(null);
+      setDetails([]);
+      setUniqueWeedCount(0);
+      setTotalDetections(0);
+      setError('');
+    }
+  }, [selectedDetection, loadMapData]);
 
-  // Auto-refresh when screen comes into focus (after initial load)
-  useFocusEffect(
-    useCallback(() => {
-      // Only refresh if we're not loading initially and have some data or error
-      if (!loading) {
-        load({ silent: true });
+  // Handle navigation params
+  const route: any = useRoute();
+  useEffect(() => {
+    const idParam = route?.params?.detectionId;
+    if (typeof idParam === 'number') {
+      // Find the detection with this ID and set it as selected
+      const detection = sessions.find(s => s[0] === idParam);
+      if (detection) {
+        setSelectedDetection(detection);
       }
-    }, [loading])
-  );
+    }
+  }, [route?.params, sessions, setSelectedDetection]);
 
   const density = useMemo(() => {
-    const byFrame: Record<number, number> = {};
-    details.forEach(d => {
-      const f = d[2];
-      byFrame[f] = (byFrame[f] || 0) + 1;
-    });
+    // Use heatmap points to calculate density based on unique weed count
+    if (heatPoints.length === 0) {
+      return { low: 0, medium: 0, high: 0, gpsPoints: polyline.length };
+    }
+    
     let low = 0, medium = 0, high = 0;
-    Object.values(byFrame).forEach(count => {
-      if (count <= 2) low += 1;
-      else if (count <= 5) medium += 1;
-      else high += 1;
+    
+    // Categorize based on unique weed count per grid cell
+    heatPoints.forEach(point => {
+      const count = point.weight;  // Weight represents unique weed count
+      if (count <= 2) {
+        low += 1;
+      } else if (count <= 5) {
+        medium += 1;
+      } else {
+        high += 1;
+      }
     });
+    
     const gpsPoints = polyline.length;
     return { low, medium, high, gpsPoints };
-  }, [details, polyline]);
+  }, [heatPoints, polyline]);
 
   function formatAmPm(ts?: string | null) {
     if (!ts) return '';
@@ -174,7 +260,7 @@ const Mapscreen = () => {
       refreshControl={
         <RefreshControl
           refreshing={loading}
-          onRefresh={() => load()}
+          onRefresh={() => refreshSessions()}
           colors={['#2563eb']}
           tintColor="#2563eb"
         />
@@ -189,12 +275,50 @@ const Mapscreen = () => {
             <ActivityIndicator color="#2563eb" />
           ) : error ? (
             <Text className='text-center text-red-600 bg-white/80 px-4 py-2 rounded'>{error}</Text>
+          ) : selectedDetection && !selectedDetection[10] ? (
+            <Text className='text-center text-gray-600 bg-white/80 px-4 py-2 rounded'>No GPS data available for this session</Text>
           ) : null}
         </View>
       </View>
-      <Pressable onPress={() => load()} className='mt-4 px-6 py-2 bg-gray-700 rounded-md w-[95vw] max-w-[420px]'>
-        <Text className='text-white font-medium text-center'>Refresh</Text>
+      <Pressable onPress={() => refreshSessions()} className='mt-4 px-6 py-2 bg-gray-700 rounded-md w-[95vw] max-w-[420px]'>
+        <Text className='text-white font-medium text-center'>Refresh Sessions</Text>
       </Pressable>
+
+      <Pressable onPress={() => setSessionModalVisible(true)} className='mt-3 px-6 py-2 bg-gray-100 rounded-md w-[95vw] max-w-[420px]'>
+        <Text className='text-gray-700 font-medium text-center'>Select Session</Text>
+      </Pressable>
+
+
+      {/* Session Selection Modal */}
+      <Modal visible={sessionModalVisible} transparent={true} animationType="slide" onRequestClose={() => setSessionModalVisible(false)}>
+        <View className="flex-1 bg-black/60 justify-end">
+          <View className="bg-white rounded-t-2xl p-4 max-h-3/4">
+            <Text className="text-lg font-semibold mb-2">Select Detection Session</Text>
+            <ScrollView style={{ maxHeight: 360 }}>
+              {sessions.length === 0 && (
+                <View className="p-4"><Text className="text-gray-500">No sessions available.</Text></View>
+              )}
+              {sessions.map((s) => (
+                <Pressable key={s[0]} onPress={() => {
+                    setSessionModalVisible(false);
+                    setSelectedDetection(s);
+                  }} className="p-3 border-b border-gray-100">
+                  <View className="flex-row items-center justify-between">
+                    <View>
+                      <Text className="font-medium">{s[1]}</Text>
+                      <Text className="text-xs text-gray-500">{new Date(String(s[2])).toLocaleString()} • {s[3]}</Text>
+                    </View>
+                    <Text className="text-sm text-gray-400">{s[6]} detections</Text>
+                  </View>
+                </Pressable>
+              ))}
+            </ScrollView>
+            <Pressable className="mt-3 p-3 bg-gray-100 rounded-lg" onPress={() => setSessionModalVisible(false)}>
+              <Text className="text-center text-gray-700">Close</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
 
       <View className='flex-row items-center justify-between w-[95vw] max-w-[420px] mt-4 mb-2'>
         <View className='flex-row items-center'>
@@ -233,21 +357,58 @@ const Mapscreen = () => {
             <Text className='text-base font-medium'>{density.high}</Text>
           </View>
         </View>
-        {latestDetection && (
+        {selectedDetection && (
           <View className="mt-2">
             <Text className='text-xs text-gray-700 text-center'>
-              File: {latestDetection[1]} ({latestDetection[3]})
+              File: {selectedDetection[1]} ({selectedDetection[3]})
             </Text>
             <Text className='text-xs text-gray-500 text-center mt-1'>
-              Detected on {formatAmPm(latestDetection[2])}
+              Detected on {formatAmPm(selectedDetection[2])}
             </Text>
             <View className="flex-row items-center justify-center mt-1">
-              <View className="w-2 h-2 bg-green-500 rounded-full mr-1" />
-              <Text className='text-xs text-green-600 font-medium'>GPS Data Available</Text>
+              {selectedDetection[10] ? (
+                <>
+                  <View className="w-2 h-2 bg-green-500 rounded-full mr-1" />
+                  <Text className='text-xs text-green-600 font-medium'>GPS Data Available</Text>
+                </>
+              ) : (
+                <>
+                  <View className="w-2 h-2 bg-gray-400 rounded-full mr-1" />
+                  <Text className='text-xs text-gray-500 font-medium'>No GPS Data</Text>
+                </>
+              )}
             </View>
           </View>
         )}
       </View>
+
+      {/* Unique Weeds Information Card */}
+      {uniqueWeedCount > 0 && (
+        <View className="flex-col bg-white min-h-[100px] w-[95vw] max-w-[420px] rounded-2xl p-4 shadow-custom border-2 border-gray-300 mt-2">
+          <View className="bg-blue-600 shadow-custom mb-2 self-start w-fit px-4 py-2 rounded-3xl">
+            <Text className="text-left text-white text-md font-bold">Unique Weed Analysis</Text>
+          </View>
+          <View className="flex-row justify-between items-center mt-2 w-full">
+            <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2 bg-blue-50">
+              <Text className='text-xs font-bold text-gray-600'>Unique Weeds</Text>
+              <Text className='text-2xl font-bold text-blue-600'>{uniqueWeedCount}</Text>
+            </View>
+            <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2 bg-gray-50">
+              <Text className='text-xs font-bold text-gray-600'>Total Detections</Text>
+              <Text className='text-2xl font-bold text-gray-700'>{totalDetections}</Text>
+            </View>
+            <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2 bg-green-50">
+              <Text className='text-xs font-bold text-gray-600'>Reduction</Text>
+              <Text className='text-2xl font-bold text-green-600'>
+                {totalDetections > 0 ? Math.round((1 - uniqueWeedCount / totalDetections) * 100) : 0}%
+              </Text>
+            </View>
+          </View>
+          <Text className='text-xs text-gray-500 text-center mt-2'>
+            Heatmap shows unique weeds by tracking the same weed across frames
+          </Text>
+        </View>
+      )}
     </ScrollView>
   );
 };
@@ -270,6 +431,7 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoi
   const center = polyline[0] || { lat: 14.5995, lng: 120.9842 };
   const coordsJson = JSON.stringify(polyline.map(p => [p.lat, p.lng]));
   const heatJson = JSON.stringify(heat.map(h => [h.lat, h.lng, h.weight]));
+  
   // Use Google Satellite tiles
   const html = `<!DOCTYPE html>
   <html>
@@ -297,7 +459,34 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoi
       }
       const heat = ${heatJson};
       if (heat.length > 0) {
-        L.heatLayer(heat, { radius: 20, blur: 15, maxZoom: 18 }).addTo(map);
+        // Tighter heatmap for precise weed location (reduced radius and blur)
+        L.heatLayer(heat, { 
+          radius: 12,           // Smaller radius for more precise coverage (was 25)
+          blur: 10,             // Less blur for sharper boundaries (was 20)
+          maxZoom: 18,
+          max: 10,              // Adjust max intensity (10 unique weeds = max intensity)
+          gradient: {           // Custom gradient: green (low) -> yellow -> red (high)
+            0.0: 'green',
+            0.3: 'lime',
+            0.5: 'yellow',
+            0.7: 'orange',
+            1.0: 'red'
+          }
+        }).addTo(map);
+        
+        // Add small markers at exact grid cell centers for clarity
+        heat.forEach(point => {
+          const color = point.weight <= 2 ? '#22c55e' :   // green
+                        point.weight <= 5 ? '#eab308' :   // yellow
+                        '#ef4444';                         // red
+          L.circleMarker([point.lat, point.lng], {
+            radius: 4,
+            fillColor: color,
+            color: 'white',
+            weight: 1,
+            fillOpacity: 0.9
+          }).addTo(map).bindPopup(\`\${point.weight} unique weeds\`);
+        });
       }
       // Prevent parent scroll when interacting with map
       document.getElementById('map').addEventListener('touchstart', function() {

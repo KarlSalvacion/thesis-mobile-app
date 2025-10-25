@@ -6,6 +6,7 @@ import * as FileSystem from 'expo-file-system'
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons'
 import { Video } from 'react-native-compressor'
 import SrtDebugViewer from '../components/SrtDebugViewer'
+import { useSession } from '../context/SessionContext'
 function guessMimeType(name: string): string {
   const lower = name.toLowerCase()
   if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
@@ -171,7 +172,9 @@ async function uploadFileToApi(uri: string, name: string, onProgress?: (message:
   console.log('✅ [UPLOAD] Message:', uploadResult.message)
   
   // Step 2: Poll for results
-  onProgress?.('Processing video... This may take 3-10 minutes')
+  const isVideo = name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i)
+  const processingMessage = isVideo ? 'Processing video... This may take 3-10 minutes' : 'Processing image... This may take 1-3 minutes'
+  onProgress?.(processingMessage)
   console.log('📊 [POLLING] Starting to poll for results...')
   
   let pollCount = 0
@@ -285,7 +288,9 @@ async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFil
   console.log('✅ [COMBINED] Message:', uploadResult.message)
 
   // Step 2: Poll for results
-  onProgress?.('Processing video... This may take 3-10 minutes')
+  const isVideo = mediaFile.name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i)
+  const processingMessage = isVideo ? 'Processing video... This may take 3-10 minutes' : 'Processing image... This may take 1-3 minutes'
+  onProgress?.(processingMessage)
   console.log('📊 [POLLING] Starting to poll for results...')
   
   let pollCount = 0
@@ -350,6 +355,7 @@ type SelectedFile = {
 }
 
 const Homescreen = () => {
+  const { refreshSessions, setSelectedDetection, sessions } = useSession();
   const [selectedMedia, setSelectedMedia] = useState<SelectedFile | null>(null)
   const [selectedSrt, setSelectedSrt] = useState<SelectedFile | null>(null)
   const [status, setStatus] = useState<'idle' | 'picking' | 'ready' | 'uploading' | 'success' | 'error'>('idle')
@@ -548,6 +554,9 @@ const Homescreen = () => {
       setProgress(isVideo ? 65 : 30)
       setMessage('Uploading to server...')
 
+      // Declare result variable at higher scope
+      let result: any = null;
+
       // Use combined upload endpoint if both files are selected
       if (selectedMedia && selectedSrt) {
         console.log('📦 [MODE] Using combined upload (media + SRT)')
@@ -559,13 +568,13 @@ const Homescreen = () => {
           size: mediaSizeToUpload
         }
         
-        const result = await uploadCombinedFiles(mediaToUpload, selectedSrt, (progressMsg) => {
+        result = await uploadCombinedFiles(mediaToUpload, selectedSrt, (progressMsg) => {
           setMessage(progressMsg)
         })
         setMessage(result.message || 'Upload complete with GPS data.')
       } else if (selectedMedia) {
         console.log('📦 [MODE] Using single file upload (media only)')
-        const result = await uploadFileToApi(mediaUriToUpload || selectedMedia.uri, selectedMedia.name, (progressMsg) => {
+        result = await uploadFileToApi(mediaUriToUpload || selectedMedia.uri, selectedMedia.name, (progressMsg) => {
           setMessage(progressMsg)
         })
         setMessage(result.message || `${result.summary} (No GPS data - image only or video without SRT)`)
@@ -577,6 +586,24 @@ const Homescreen = () => {
 
       setProgress(100)
       setStatus('success')
+      
+      // Refresh sessions to include the new upload
+      await refreshSessions();
+      
+      // Auto-select the newly uploaded session
+      if (result?.detection_id) {
+        // Get the updated sessions list after refresh
+        const { API_BASE } = await import('../config');
+        const res = await fetch(`${API_BASE}/detections/`);
+        const json = await res.json();
+        const updatedSessions = json?.detections ?? [];
+        
+        const newSession = updatedSessions.find((s: any) => s[0] === result.detection_id);
+        if (newSession) {
+          setSelectedDetection(newSession);
+          console.log('✅ [AUTO-SELECT] Selected newly uploaded session:', result.detection_id);
+        }
+      }
     } catch (e: any) {
       console.error('❌ [UPLOAD ERROR] ================================================')
       console.error('❌ [UPLOAD ERROR]', e)
