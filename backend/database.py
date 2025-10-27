@@ -313,20 +313,23 @@ def batch_insert_detection_details(detection_id: int, detections_list: list, srt
 
 
 def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.3, frame_gap: int = 10) -> dict:
-    """Calculate unique weed count by tracking weeds across frames.
-    
+    """Calculate unique weed count by tracking weeds across frames using a simple online tracker.
+
+    This function iterates detections in temporal order and attempts to match each detection
+    to existing tracks using IoU and GPS proximity. If no match is found within the allowed
+    frame_gap, a new track is started.
+
     Args:
         detection_id: The detection session ID
         iou_threshold: IoU threshold for considering same weed (0.0-1.0)
         frame_gap: Maximum frame gap to consider for tracking (frames)
-    
+
     Returns:
-        dict with unique_weed_count, tracks, and breakdown by class
+        dict with unique_count, total_detections, tracks, and breakdown by class
     """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    # Get all detections sorted by frame
+
     cursor.execute("""
         SELECT id, frame_number, weed_class, confidence,
                bbox_x, bbox_y, bbox_width, bbox_height,
@@ -335,146 +338,132 @@ def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.3, frame_
         WHERE detection_id = ?
         ORDER BY frame_number, id
     """, (detection_id,))
-    
-    detections = cursor.fetchall()
+
+    rows = cursor.fetchall()
     conn.close()
-    
-    if not detections:
-        return {'unique_count': 0, 'total_detections': 0, 'tracks': [], 'by_class': {}}
-    
+
+    if not rows:
+        return {'unique_count': 0, 'total_detections': 0, 'tracks': [], 'by_class': {}, 'reduction_percentage': 0}
+
+    # Helper: IoU
     def calculate_iou(box1, box2):
-        """Calculate Intersection over Union between two bounding boxes."""
         x1, y1, w1, h1 = box1
         x2, y2, w2, h2 = box2
-        
-        # Calculate intersection
         x_left = max(x1, x2)
         y_top = max(y1, y2)
         x_right = min(x1 + w1, x2 + w2)
         y_bottom = min(y1 + h1, y2 + h2)
-        
-        if x_right < x_left or y_bottom < y_top:
+        if x_right <= x_left or y_bottom <= y_top:
             return 0.0
-        
-        intersection_area = (x_right - x_left) * (y_bottom - y_top)
-        box1_area = w1 * h1
-        box2_area = w2 * h2
-        union_area = box1_area + box2_area - intersection_area
-        
-        return intersection_area / union_area if union_area > 0 else 0.0
-    
+        inter = (x_right - x_left) * (y_bottom - y_top)
+        union = w1 * h1 + w2 * h2 - inter
+        return inter / union if union > 0 else 0.0
+
+    # Helper: GPS haversine distance (meters)
     def calculate_gps_distance(lat1, lon1, lat2, lon2):
-        """Calculate distance in meters between two GPS coordinates."""
-        if None in [lat1, lon1, lat2, lon2]:
+        if None in (lat1, lon1, lat2, lon2):
             return None
-        
-        from math import radians, cos, sin, asin, sqrt
-        
-        # Haversine formula
+        from math import radians, sin, cos, asin, sqrt
         lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
         dlat = lat2 - lat1
         dlon = lon2 - lon1
         a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
         c = 2 * asin(sqrt(a))
-        r = 6371000  # Radius of earth in meters
-        return c * r
-    
-    # Improved tracking algorithm: spatial clustering first, then temporal merging
-    # This handles 10 FPS better by clustering detections before tracking
-    
-    # Step 1: Create spatial clusters of detections
-    def get_detection_center(lat, lon, bbox_x, bbox_y, bbox_width, bbox_height):
-        """Get the center point of a bounding box for spatial comparison."""
-        if lat is not None and lon is not None:
-            # Use GPS as primary spatial identifier
-            return (lat, lon), 'gps'
-        # Fallback to bbox center
-        center_x = bbox_x + bbox_width / 2
-        center_y = bbox_y + bbox_height / 2
-        return (center_x, center_y), 'bbox'
-    
-    # Group detections into spatial clusters
-    spatial_clusters = {}
-    for det in detections:
-        det_id, frame_num, weed_class, confidence, bbox_x, bbox_y, bbox_width, bbox_height, lat, lon = det
-        
-        # Use GPS if available, else bbox center
-        center, center_type = get_detection_center(lat, lon, bbox_x, bbox_y, bbox_width, bbox_height)
-        
-        # Create spatial key with tolerance for GPS clustering
-        if center_type == 'gps':
-            # For GPS, use 4 decimal places (~11 meters) - balances accuracy with counting all weeds
-            spatial_key = (round(center[0], 4), round(center[1], 4))
-        else:
-            # For bbox, use pixel-based clustering
-            spatial_key = (round(center[0] / 20) * 20, round(center[1] / 20) * 20)  # ~20 pixel clusters
-        
-        full_key = (weed_class, spatial_key)
-        
-        if full_key not in spatial_clusters:
-            spatial_clusters[full_key] = []
-        
-        spatial_clusters[full_key].append({
+        return 6371000 * c
+
+    # Build detection list
+    detections = []
+    for r in rows:
+        det_id, frame_num, weed_class, confidence, bx, by, bw, bh, lat, lon = r
+        detections.append({
             'id': det_id,
             'frame': frame_num,
             'class': weed_class,
             'confidence': confidence,
-            'bbox': (bbox_x, bbox_y, bbox_width, bbox_height),
+            'bbox': (bx, by, bw, bh),
             'lat': lat,
             'lon': lon
         })
-    
-    # Step 2: Within each spatial cluster, track temporally
+
+    # Online tracker: tracks is a list of dicts with last seen bbox/frame and history
     tracks = []
-    
-    # Adjust frame gap for 10 FPS - a weed visible for 1 second at 30 FPS (30 frames) 
-    # appears for 10 frames at 10 FPS, so we need larger frame gap
-    adjusted_frame_gap = max(8, frame_gap * 3)  # Scale for 10 FPS: conservative
-    
-    for cluster_key, cluster_detections in spatial_clusters.items():
-        # Sort by frame number within cluster
-        cluster_detections.sort(key=lambda x: x['frame'])
-        
-        # Group temporally close detections in this spatial cluster
-        cluster_track = {
-            'weed_class': cluster_key[0],
-            'detections': [],
-            'detection_ids': [],
-            'frames': [],
-            'first_frame': cluster_detections[0]['frame'],
-            'last_frame': cluster_detections[-1]['frame'],
-            'avg_confidence': 0,
-            'count': 0
-        }
-        
-        for det in cluster_detections:
-            cluster_track['detections'].append({
-                'frame_num': det['frame'],
+    GPS_MATCH_THRESHOLD_M = 2.0  # meters
+
+    for det in detections:
+        matched_track = None
+        best_score = 0.0
+
+        # Try to match to existing tracks of same class
+        for tr in tracks:
+            if tr['class'] != det['class']:
+                continue
+
+            # Enforce temporal gap
+            if det['frame'] - tr['last_frame'] > frame_gap:
+                continue
+
+            # Compute IoU between current detection and track's last bbox
+            iou = calculate_iou(det['bbox'], tr['last_bbox'])
+
+            # Compute GPS distance if available
+            gps_dist = None
+            if det['lat'] is not None and tr.get('last_lat') is not None:
+                gps_dist = calculate_gps_distance(det['lat'], det['lon'], tr['last_lat'], tr['last_lon'])
+
+            # Matching criteria: IoU OR GPS proximity
+            score = 0.0
+            if iou >= iou_threshold:
+                score = iou
+            elif gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M:
+                # Favor small GPS distances (convert to a score between 0.0-1.0)
+                score = 1.0 / (1.0 + gps_dist)
+
+            # Prefer tracks with higher score
+            if score > best_score:
+                best_score = score
+                matched_track = tr
+
+        if matched_track is not None:
+            # Append detection to matched track, update last seen info
+            matched_track['detections'].append(det)
+            matched_track['detection_ids'].append(det['id'])
+            matched_track['last_frame'] = det['frame']
+            matched_track['last_bbox'] = det['bbox']
+            if det['lat'] is not None:
+                matched_track['last_lat'] = det['lat']
+                matched_track['last_lon'] = det['lon']
+            matched_track['count'] += 1
+            matched_track['avg_confidence'] = (matched_track['avg_confidence'] * (matched_track['count'] - 1) + det['confidence']) / matched_track['count']
+        else:
+            # Start a new track
+            new_tr = {
                 'class': det['class'],
-                'bbox': det['bbox'],
-                'lat': det['lat'],
-                'lon': det['lon']
-            })
-            cluster_track['detection_ids'].append(det['id'])
-            cluster_track['frames'].append(det['frame'])
-            cluster_track['avg_confidence'] = (cluster_track['avg_confidence'] * cluster_track['count'] + det['confidence']) / (cluster_track['count'] + 1)
-            cluster_track['count'] += 1
-        
-        tracks.append(cluster_track)
-    
-    # Calculate summary
+                'detections': [det],
+                'detection_ids': [det['id']],
+                'first_frame': det['frame'],
+                'last_frame': det['frame'],
+                'last_bbox': det['bbox'],
+                'last_lat': det['lat'],
+                'last_lon': det['lon'],
+                'count': 1,
+                'avg_confidence': det['confidence']
+            }
+            tracks.append(new_tr)
+
+    # Summarize
     unique_count = len(tracks)
     by_class = {}
-    for track in tracks:
-        weed_class = track['weed_class']
-        by_class[weed_class] = by_class.get(weed_class, 0) + 1
-    
+    for tr in tracks:
+        by_class[tr['class']] = by_class.get(tr['class'], 0) + 1
+
+    reduction = round((1 - unique_count / len(detections)) * 100, 1) if len(detections) > 0 else 0
+
     return {
         'unique_count': unique_count,
         'total_detections': len(detections),
         'tracks': tracks,
         'by_class': by_class,
-        'reduction_percentage': round((1 - unique_count / len(detections)) * 100, 1) if len(detections) > 0 else 0
+        'reduction_percentage': reduction
     }
 
 

@@ -118,13 +118,31 @@ const DetectionResults = () => {
 
       if (detection[3] === 'video') {
         try {
-          // Use same endpoint as Mapscreen for consistency: unique-weeds-heatmap
-          // This provides the most accurate count with GPS-based spatial clustering
-          const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=0.3&iou_threshold=0.6&frame_gap=2`);
-          if (res3.ok) {
-            const uniqueData = await res3.json();
-            setUniqueWeedCount(uniqueData.unique_weed_count);
-            setUniqueWeedData(uniqueData);
+          // Check if this detection has SRT data first
+          if (detection[10]) { // has_srt_data field
+            // Use unique-weeds-heatmap endpoint for videos with GPS data
+            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=0.3&iou_threshold=0.6&frame_gap=2`);
+            if (res3.ok) {
+              const uniqueData = await res3.json();
+              setUniqueWeedCount(uniqueData.unique_weed_count);
+              setUniqueWeedData(uniqueData);
+            } else {
+              // Fallback to basic unique weeds calculation without GPS
+              const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.6&frame_gap=2`);
+              if (res4.ok) {
+                const uniqueData = await res4.json();
+                setUniqueWeedCount(uniqueData.unique_weed_count);
+                setUniqueWeedData(uniqueData);
+              }
+            }
+          } else {
+            // For videos without SRT data, use the basic unique-weeds endpoint
+            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.6&frame_gap=2`);
+            if (res3.ok) {
+              const uniqueData = await res3.json();
+              setUniqueWeedCount(uniqueData.unique_weed_count);
+              setUniqueWeedData(uniqueData);
+            }
           }
         } catch (e) {
           console.warn('Could not fetch unique weed count for session', detId, e);
@@ -671,6 +689,9 @@ const DetectionResults = () => {
                 {uniqueWeedCount !== null && uniqueWeedData && (
                   <Text className="text-xs text-gray-500 text-center mt-1">
                     ({uniqueWeedData.total_detections} detections)
+                    {uniqueWeedData.no_gps_data && (
+                      <Text className="text-orange-600"> • No GPS data</Text>
+                    )}
                   </Text>
                 )}
               </View>

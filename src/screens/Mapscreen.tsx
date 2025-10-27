@@ -534,10 +534,10 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoi
       if (heat.length > 0) {
         // More precise heatmap to show individual detections along flight path
         L.heatLayer(heat, { 
-          radius: 10,           // Smaller radius to show individual detection points
-          blur: 8,              // Less blur for sharper, more visible points
+          radius: 6,            // Reduced radius for smaller, tighter heat points
+          blur: 6,              // Slightly less blur to keep points distinct
           maxZoom: 18,
-          max: 6,               // Lower max to make low-density areas more visible
+          max: 4,               // Lower max to make low-density areas more visible
           gradient: {           // Custom gradient: green (low) -> yellow -> red (high)
             0.0: 'green',
             0.3: 'lime',
@@ -553,12 +553,12 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoi
                         point.weight <= 5 ? '#eab308' :   // yellow
                         '#ef4444';                         // red
           L.circleMarker([point.lat, point.lng], {
-            radius: 5,
+            radius: 3, // smaller marker radius
             fillColor: color,
             color: 'white',
             weight: 1,
             fillOpacity: 0.85
-          }).addTo(map).bindPopup(\`\${point.weight} estimated unique weeds\`);
+          }).addTo(map).bindPopup(point.weight + ' estimated unique weeds');
         });
       }
       // Prevent parent scroll when interacting with map

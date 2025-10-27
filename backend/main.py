@@ -248,41 +248,68 @@ def process_media_background(
         # Store detection details
         if detections and len(detections) > 0:
             batch_details = []
-            
-            # Calculate FPS for timestamp calculation
-            # If video, we need to calculate frame timestamps based on FPS
-            video_fps = None
+
+            # Determine detection/frame rate for timestamp calculation.
+            # NOTE: `detections` for video is returned at the detection FPS (api_fps),
+            # which may be lower than the original video FPS. We must compute timestamps
+            # using the detection frame rate (detections_per_second) so saved timestamps
+            # map correctly to the video's timeline. Fall back to original FPS or
+            # configured DEFAULT_VIDEO_FPS if we cannot compute detection rate.
+            detection_rate = None
+            orig_video_fps = None
             if actual_file_type == "video":
                 try:
-                    # Try to get FPS from video metadata
+                    # Try to get original FPS from metadata
                     import cv2
                     cap = cv2.VideoCapture(media_path)
-                    video_fps = cap.get(cv2.CAP_PROP_FPS)
+                    orig_video_fps = cap.get(cv2.CAP_PROP_FPS)
                     cap.release()
-                    if video_fps <= 0:
-                        video_fps = None
+                    if orig_video_fps <= 0:
+                        orig_video_fps = None
                 except Exception:
-                    pass
-                
-                # Fallback to config FPS if detection was done at specific FPS
-                if video_fps is None:
-                    from .config import DEFAULT_VIDEO_FPS
-                    video_fps = DEFAULT_VIDEO_FPS if DEFAULT_VIDEO_FPS else 30.0
-            
+                    orig_video_fps = None
+
+                # Fallback to config FPS if original FPS not available
+                from .config import DEFAULT_VIDEO_FPS
+                if orig_video_fps is None:
+                    orig_video_fps = DEFAULT_VIDEO_FPS if DEFAULT_VIDEO_FPS else 30.0
+
+                # Prefer to compute detection_rate from returned detections and video duration
+                try:
+                    from .video_utils import get_video_duration
+                    duration_s = get_video_duration(media_path)
+                    # Count detection frames returned (for video results each item is a list)
+                    detection_frames_count = 0
+                    if isinstance(detections, list) and len(detections) > 0 and isinstance(detections[0], list):
+                        detection_frames_count = len(detections)
+                    elif detections:
+                        detection_frames_count = 1
+
+                    if detection_frames_count > 0 and duration_s and duration_s > 0:
+                        detection_rate = detection_frames_count / float(duration_s)
+                    else:
+                        detection_rate = orig_video_fps
+                except Exception:
+                    detection_rate = orig_video_fps
+
             for frame_idx, frame_detections in enumerate(detections if isinstance(detections[0], list) else [detections]):
                 # Calculate frame timestamp in milliseconds from start of video
                 frame_timestamp_ms = 0
-                if video_fps and video_fps > 0:
-                    # frame_idx is 0-based, so frame 0 = 0ms, frame 1 = 1000/fps ms, etc.
-                    frame_timestamp_ms = int((frame_idx / video_fps) * 1000)
-                
+                # Use detection_rate (frames per second used to generate detections) to compute timestamp
+                if detection_rate and detection_rate > 0:
+                    frame_timestamp_ms = int((frame_idx / detection_rate) * 1000)
+                else:
+                    # Fallback: use original video fps if available
+                    if orig_video_fps and orig_video_fps > 0:
+                        frame_timestamp_ms = int((frame_idx / orig_video_fps) * 1000)
+
                 # Format as HH:MM:SS,mmm (SRT timestamp format)
                 hours = frame_timestamp_ms // 3600000
                 minutes = (frame_timestamp_ms % 3600000) // 60000
                 seconds = (frame_timestamp_ms % 60000) // 1000
                 milliseconds = frame_timestamp_ms % 1000
                 frame_timestamp_str = f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
-                
+
                 for det in frame_detections:
                     batch_details.append({
                         'frame_number': frame_idx + 1,
@@ -855,8 +882,11 @@ async def get_detection_details(detection_id: int):
 @app.get("/detection/{detection_id}/unique-weeds")
 async def get_unique_weeds(
     detection_id: int,
-    iou_threshold: float = Query(0.6, description="IoU threshold for matching (0.0-1.0)"),
-    frame_gap: int = Query(2, description="Maximum frame gap for tracking")
+    # Lower the default IoU threshold to make matching across frames more permissive
+    # (reduces over-counting by treating lower-overlap detections as the same weed).
+    iou_threshold: float = Query(0.4, description="IoU threshold for matching (0.0-1.0)"),
+    # Allow a slightly larger frame gap to permit tracking across brief missed detections
+    frame_gap: int = Query(3, description="Maximum frame gap for tracking")
 ):
     """Calculate unique weed count by tracking across frames.
     
@@ -1148,7 +1178,56 @@ async def get_unique_weeds_heatmap(
         cursor.execute("SELECT frames_json FROM srt_tracks WHERE detection_id = ?", (detection_id,))
         row = cursor.fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="SRT track not found for this detection")
+            # No SRT data available - return basic unique weeds count without GPS mapping
+            cursor.execute("""
+                SELECT id, frame_number, weed_class, confidence,
+                       bbox_x, bbox_y, bbox_width, bbox_height,
+                       detection_timestamp
+                FROM detection_details
+                WHERE detection_id = ?
+                ORDER BY frame_number, id
+            """, (detection_id,))
+            
+            detections = cursor.fetchall()
+            
+            if not detections:
+                return {
+                    'detection_id': detection_id,
+                    'unique_weed_count': 0,
+                    'total_detections': 0,
+                    'gps_matched_detections': 0,
+                    'reduction_percentage': 0,
+                    'points': [],
+                    'grid_size_m': grid_size_m,
+                    'tracking_params': {
+                        'iou_threshold': iou_threshold,
+                        'frame_gap': frame_gap,
+                        'timestamp_tolerance_ms': 0
+                    },
+                    'message': 'No SRT data available - cannot generate GPS-based heatmap',
+                    'no_gps_data': True
+                }
+            
+            # Calculate unique weeds without GPS mapping
+            from .database import calculate_unique_weeds
+            unique_weeds = calculate_unique_weeds(detection_id, iou_threshold, frame_gap)
+            
+            return {
+                'detection_id': detection_id,
+                'unique_weed_count': unique_weeds['unique_count'],
+                'total_detections': unique_weeds['total_detections'],
+                'gps_matched_detections': 0,
+                'reduction_percentage': unique_weeds['reduction_percentage'],
+                'points': [],  # No GPS points available
+                'grid_size_m': grid_size_m,
+                'tracking_params': {
+                    'iou_threshold': iou_threshold,
+                    'frame_gap': frame_gap,
+                    'timestamp_tolerance_ms': 0
+                },
+                'message': f'Found {unique_weeds["unique_count"]} unique weeds from {unique_weeds["total_detections"]} total detections (no GPS data available)',
+                'no_gps_data': True
+            }
         
         frames_json = row[0]
         srt_frames = json.loads(frames_json)
