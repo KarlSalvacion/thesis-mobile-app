@@ -379,57 +379,88 @@ def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.3, frame_
         r = 6371000  # Radius of earth in meters
         return c * r
     
-    # Track weeds across frames
-    tracks = []  # Each track is a list of detection IDs
+    # Improved tracking algorithm: spatial clustering first, then temporal merging
+    # This handles 10 FPS better by clustering detections before tracking
     
+    # Step 1: Create spatial clusters of detections
+    def get_detection_center(lat, lon, bbox_x, bbox_y, bbox_width, bbox_height):
+        """Get the center point of a bounding box for spatial comparison."""
+        if lat is not None and lon is not None:
+            # Use GPS as primary spatial identifier
+            return (lat, lon), 'gps'
+        # Fallback to bbox center
+        center_x = bbox_x + bbox_width / 2
+        center_y = bbox_y + bbox_height / 2
+        return (center_x, center_y), 'bbox'
+    
+    # Group detections into spatial clusters
+    spatial_clusters = {}
     for det in detections:
         det_id, frame_num, weed_class, confidence, bbox_x, bbox_y, bbox_width, bbox_height, lat, lon = det
-        box = (bbox_x, bbox_y, bbox_width, bbox_height)
         
-        # Try to match with existing tracks
-        matched = False
-        for track in tracks:
-            last_det = track['detections'][-1]
-            last_frame, last_class, last_box, last_lat, last_lon = last_det
-            
-            # Check if same class
-            if weed_class != last_class:
-                continue
-            
-            # Check frame gap
-            if frame_num - last_frame > frame_gap:
-                continue
-            
-            # Check spatial proximity (IoU for bbox, GPS distance if available)
-            iou = calculate_iou(box, last_box)
-            gps_ok = True
-            
-            if lat is not None and lon is not None and last_lat is not None and last_lon is not None:
-                gps_dist = calculate_gps_distance(lat, lon, last_lat, last_lon)
-                # If GPS available, weed shouldn't move more than 2 meters
-                gps_ok = gps_dist is None or gps_dist < 2.0
-            
-            # Match if IoU is high enough and GPS check passes
-            if iou >= iou_threshold and gps_ok:
-                track['detections'].append((frame_num, weed_class, box, lat, lon))
-                track['detection_ids'].append(det_id)
-                track['last_frame'] = frame_num
-                track['avg_confidence'] = (track['avg_confidence'] * track['count'] + confidence) / (track['count'] + 1)
-                track['count'] += 1
-                matched = True
-                break
+        # Use GPS if available, else bbox center
+        center, center_type = get_detection_center(lat, lon, bbox_x, bbox_y, bbox_width, bbox_height)
         
-        # Create new track if no match
-        if not matched:
-            tracks.append({
-                'weed_class': weed_class,
-                'detections': [(frame_num, weed_class, box, lat, lon)],
-                'detection_ids': [det_id],
-                'first_frame': frame_num,
-                'last_frame': frame_num,
-                'avg_confidence': confidence,
-                'count': 1
+        # Create spatial key with tolerance for GPS clustering
+        if center_type == 'gps':
+            # For GPS, use 4 decimal places (~11 meters) - balances accuracy with counting all weeds
+            spatial_key = (round(center[0], 4), round(center[1], 4))
+        else:
+            # For bbox, use pixel-based clustering
+            spatial_key = (round(center[0] / 20) * 20, round(center[1] / 20) * 20)  # ~20 pixel clusters
+        
+        full_key = (weed_class, spatial_key)
+        
+        if full_key not in spatial_clusters:
+            spatial_clusters[full_key] = []
+        
+        spatial_clusters[full_key].append({
+            'id': det_id,
+            'frame': frame_num,
+            'class': weed_class,
+            'confidence': confidence,
+            'bbox': (bbox_x, bbox_y, bbox_width, bbox_height),
+            'lat': lat,
+            'lon': lon
+        })
+    
+    # Step 2: Within each spatial cluster, track temporally
+    tracks = []
+    
+    # Adjust frame gap for 10 FPS - a weed visible for 1 second at 30 FPS (30 frames) 
+    # appears for 10 frames at 10 FPS, so we need larger frame gap
+    adjusted_frame_gap = max(8, frame_gap * 3)  # Scale for 10 FPS: conservative
+    
+    for cluster_key, cluster_detections in spatial_clusters.items():
+        # Sort by frame number within cluster
+        cluster_detections.sort(key=lambda x: x['frame'])
+        
+        # Group temporally close detections in this spatial cluster
+        cluster_track = {
+            'weed_class': cluster_key[0],
+            'detections': [],
+            'detection_ids': [],
+            'frames': [],
+            'first_frame': cluster_detections[0]['frame'],
+            'last_frame': cluster_detections[-1]['frame'],
+            'avg_confidence': 0,
+            'count': 0
+        }
+        
+        for det in cluster_detections:
+            cluster_track['detections'].append({
+                'frame_num': det['frame'],
+                'class': det['class'],
+                'bbox': det['bbox'],
+                'lat': det['lat'],
+                'lon': det['lon']
             })
+            cluster_track['detection_ids'].append(det['id'])
+            cluster_track['frames'].append(det['frame'])
+            cluster_track['avg_confidence'] = (cluster_track['avg_confidence'] * cluster_track['count'] + det['confidence']) / (cluster_track['count'] + 1)
+            cluster_track['count'] += 1
+        
+        tracks.append(cluster_track)
     
     # Calculate summary
     unique_count = len(tracks)

@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import { View, Text, ActivityIndicator, Pressable, ScrollView, RefreshControl, Modal } from 'react-native';
+import { View, Text, ActivityIndicator, Pressable, ScrollView, RefreshControl, Modal, Alert } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { useRoute } from '@react-navigation/native';
 import { API_BASE } from '../config';
 import { useSession } from '../context/SessionContext';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 /**
  * Mapscreen - Displays GPS-based heatmap of unique weed detections
@@ -81,6 +83,7 @@ type DetectionDetailRow = [
 
 const Mapscreen = () => {
   const { selectedDetection, sessions, refreshSessions, setSelectedDetection } = useSession();
+  const insets = useSafeAreaInsets();
   const [scrollEnabled, setScrollEnabled] = useState(true);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
@@ -151,8 +154,9 @@ const Mapscreen = () => {
           setPolyline(j3?.points ?? []);
           setBounds(j3?.bounds ?? null);
 
-          // Generate heatmap based on unique weeds per GPS location (use smaller grid by default)
-          const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=1&iou_threshold=0.15&frame_gap=5`);
+          // Generate heatmap based on unique weeds per GPS location
+          // Smaller grid (0.3m) to show more individual detections along flight path
+          const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=0.3&iou_threshold=0.6&frame_gap=2`);
           if (res4.ok) {
             const j4 = await res4.json();
             const heatmapPoints = (j4?.points ?? []).map((point: any) => ({ lat: point.lat, lng: point.lng, weight: point.unique_count || point.weight || 1 }));
@@ -256,7 +260,7 @@ const Mapscreen = () => {
   return (
     <ScrollView 
       className="flex-1 bg-bgColor1"
-      contentContainerStyle={{ alignItems: 'center', paddingTop: 24, paddingBottom: 16 }}
+      contentContainerStyle={{ alignItems: 'center', paddingTop: insets.top + 24, paddingBottom: 16 }}
       refreshControl={
         <RefreshControl
           refreshing={loading}
@@ -304,11 +308,50 @@ const Mapscreen = () => {
                     setSelectedDetection(s);
                   }} className="p-3 border-b border-gray-100">
                   <View className="flex-row items-center justify-between">
-                    <View>
+                    <View className="flex-1">
                       <Text className="font-medium">{s[1]}</Text>
                       <Text className="text-xs text-gray-500">{new Date(String(s[2])).toLocaleString()} • {s[3]}</Text>
                     </View>
-                    <Text className="text-sm text-gray-400">{s[6]} detections</Text>
+                    <View className="flex-row items-center">
+                      <Text className="text-sm text-gray-400 mr-3">{s[6]} detections</Text>
+                      <Pressable
+                        onPress={(e) => {
+                          e.stopPropagation();
+                          Alert.alert(
+                            'Delete Session',
+                            `Are you sure you want to delete "${s[1]}"?\n\nThis will permanently delete all data including:\n• Detection details\n• GPS tracks\n• Heatmaps\n\nThis action cannot be undone.`,
+                            [
+                              { text: 'Cancel', style: 'cancel' },
+                              {
+                                text: 'Delete',
+                                style: 'destructive',
+                                onPress: async () => {
+                                  try {
+                                    const response = await fetch(`${API_BASE}/detection/${s[0]}`, {
+                                      method: 'DELETE',
+                                    });
+                                    if (response.ok) {
+                                      await refreshSessions();
+                                      if (selectedDetection && selectedDetection[0] === s[0]) {
+                                        setSelectedDetection(null);
+                                      }
+                                      Alert.alert('Success', 'Session deleted successfully');
+                                    } else {
+                                      Alert.alert('Error', 'Failed to delete session');
+                                    }
+                                  } catch (error) {
+                                    Alert.alert('Error', 'Failed to delete session');
+                                  }
+                                },
+                              },
+                            ]
+                          );
+                        }}
+                        className="p-2"
+                      >
+                        <Ionicons name="trash-outline" size={20} color="#ef4444" />
+                      </Pressable>
+                    </View>
                   </View>
                 </Pressable>
               ))}
@@ -320,22 +363,30 @@ const Mapscreen = () => {
         </View>
       </Modal>
 
-      <View className='flex-row items-center justify-between w-[95vw] max-w-[420px] mt-4 mb-2'>
-        <View className='flex-row items-center'>
+      <View className='flex-row flex-wrap items-center justify-between w-[95vw] max-w-[420px] mt-4 mb-2'>
+        <View className='flex-row items-center mb-1'>
           <View className='bg-green-700 h-[14px] w-[18px] rounded-md'/>
-          <Text className='text-s ml-2 font-medium text-gray-700'>Low</Text>
+          <Text className='text-xs ml-2 font-medium text-gray-700'>Low</Text>
         </View>
-        <View className='flex-row items-center'>
+        <View className='flex-row items-center mb-1'>
           <View className='bg-yellow-100 h-[14px] w-[18px] rounded-md'/>
-          <Text className='text-s ml-2 font-medium text-gray-700'>Medium</Text>
+          <Text className='text-xs ml-2 font-medium text-gray-700'>Medium</Text>
         </View>
-        <View className='flex-row items-center'>
+        <View className='flex-row items-center mb-1'>
           <View className='bg-red-600 h-[14px] w-[18px] rounded-md'/>
-          <Text className='text-s ml-2 font-medium text-gray-700'>High</Text>
+          <Text className='text-xs ml-2 font-medium text-gray-700'>High</Text>
         </View>
-        <View className='flex-row items-center'>
+        <View className='flex-row items-center mb-1'>
           <View className='bg-blue-700 h-[14px] w-[18px] rounded-md'/>
-          <Text className='text-s ml-2 font-medium text-gray-700'>Flight Path</Text>
+          <Text className='text-xs ml-2 font-medium text-gray-700'>Path</Text>
+        </View>
+        <View className='flex-row items-center mb-1'>
+          <View className='bg-green-500 h-[12px] w-[12px] rounded-full border-2 border-white shadow'/>
+          <Text className='text-xs ml-2 font-medium text-gray-700'>Start</Text>
+        </View>
+        <View className='flex-row items-center mb-1'>
+          <View className='bg-red-500 h-[12px] w-[12px] rounded-full border-2 border-white shadow'/>
+          <Text className='text-xs ml-2 font-medium text-gray-700'>End</Text>
         </View>
       </View>
 
@@ -390,7 +441,7 @@ const Mapscreen = () => {
           </View>
           <View className="flex-row justify-between items-center mt-2 w-full">
             <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2 bg-blue-50">
-              <Text className='text-xs font-bold text-gray-600'>Unique Weeds</Text>
+              <Text className='text-xs font-bold text-gray-600'>Estimated Unique Weeds</Text>
               <Text className='text-2xl font-bold text-blue-600'>{uniqueWeedCount}</Text>
             </View>
             <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2 bg-gray-50">
@@ -456,15 +507,37 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoi
       if (coords.length > 1) {
         const poly = L.polyline(coords, { color: '#2563eb', weight: 3 }).addTo(map);
         map.fitBounds(poly.getBounds(), { padding: [20, 20] });
+        
+        // Add start marker (green)
+        const startCoord = coords[0];
+        const startIcon = L.divIcon({
+          className: 'custom-icon',
+          html: \`<div style="background-color: #22c55e; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>\`,
+          iconSize: [20, 20],
+          iconAnchor: [10, 10]
+        });
+        L.marker([startCoord[0], startCoord[1]], { icon: startIcon }).addTo(map)
+          .bindPopup('Flight Start');
+        
+        // Add end marker (red)
+        const endCoord = coords[coords.length - 1];
+        const endIcon = L.divIcon({
+          className: 'custom-icon',
+          html: \`<div style="background-color: #ef4444; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>\`,
+          iconSize: [20, 20],
+          iconAnchor: [10, 10]
+        });
+        L.marker([endCoord[0], endCoord[1]], { icon: endIcon }).addTo(map)
+          .bindPopup('Flight End');
       }
       const heat = ${heatJson};
       if (heat.length > 0) {
-        // Tighter heatmap for precise weed location (reduced radius and blur)
+        // More precise heatmap to show individual detections along flight path
         L.heatLayer(heat, { 
-          radius: 12,           // Smaller radius for more precise coverage (was 25)
-          blur: 10,             // Less blur for sharper boundaries (was 20)
+          radius: 10,           // Smaller radius to show individual detection points
+          blur: 8,              // Less blur for sharper, more visible points
           maxZoom: 18,
-          max: 10,              // Adjust max intensity (10 unique weeds = max intensity)
+          max: 6,               // Lower max to make low-density areas more visible
           gradient: {           // Custom gradient: green (low) -> yellow -> red (high)
             0.0: 'green',
             0.3: 'lime',
@@ -480,12 +553,12 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoi
                         point.weight <= 5 ? '#eab308' :   // yellow
                         '#ef4444';                         // red
           L.circleMarker([point.lat, point.lng], {
-            radius: 4,
+            radius: 5,
             fillColor: color,
             color: 'white',
             weight: 1,
-            fillOpacity: 0.9
-          }).addTo(map).bindPopup(\`\${point.weight} unique weeds\`);
+            fillOpacity: 0.85
+          }).addTo(map).bindPopup(\`\${point.weight} estimated unique weeds\`);
         });
       }
       // Prevent parent scroll when interacting with map

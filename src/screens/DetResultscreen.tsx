@@ -7,6 +7,7 @@ import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import { API_BASE } from '../config';
 import { useSession } from '../context/SessionContext';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 type DetectionRow = [
   id: number,
@@ -71,6 +72,7 @@ function pickColorForClass(className: string): string {
 const DetectionResults = () => {
   const navigation = useNavigation()
   const { selectedDetection, sessions, refreshSessions, setSelectedDetection } = useSession();
+  const insets = useSafeAreaInsets();
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string>('')
   const [details, setDetails] = useState<DetectionDetailRow[]>([])
@@ -78,6 +80,7 @@ const DetectionResults = () => {
   const [isModalVisible, setIsModalVisible] = useState<boolean>(false)
   const [sessionModalVisible, setSessionModalVisible] = useState<boolean>(false)
   const [exporting, setExporting] = useState<boolean>(false)
+  const [exportCancelToken, setExportCancelToken] = useState<AbortController | null>(null)
   const [uniqueWeedCount, setUniqueWeedCount] = useState<number | null>(null)
   const [uniqueWeedData, setUniqueWeedData] = useState<any>(null)
 
@@ -115,7 +118,9 @@ const DetectionResults = () => {
 
       if (detection[3] === 'video') {
         try {
-          const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds`);
+          // Use same endpoint as Mapscreen for consistency: unique-weeds-heatmap
+          // This provides the most accurate count with GPS-based spatial clustering
+          const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=0.3&iou_threshold=0.6&frame_gap=2`);
           if (res3.ok) {
             const uniqueData = await res3.json();
             setUniqueWeedCount(uniqueData.unique_weed_count);
@@ -180,6 +185,15 @@ const DetectionResults = () => {
     setSessionModalVisible(true);
   }, [refreshSessions]);
 
+  const cancelExport = useCallback(() => {
+    if (exportCancelToken) {
+      exportCancelToken.abort()
+      setExportCancelToken(null)
+      setExporting(false)
+      console.log('🚫 Export cancelled by user')
+    }
+  }, [exportCancelToken])
+
   const handleExport = useCallback(async () => {
     if (!selectedDetection) {
       Alert.alert('No Data', 'No detection session available to export.')
@@ -215,6 +229,11 @@ const DetectionResults = () => {
   const exportReport = async (detectionId: number, format: string) => {
     try {
       setExporting(true)
+      
+      // Create abort controller for cancellation
+      const abortController = new AbortController()
+      setExportCancelToken(abortController)
+      
       const url = `${API_BASE}/detection/${detectionId}/export?format=${format}`
       
       console.log(`📥 Exporting ${format.toUpperCase()} report...`)
@@ -222,8 +241,14 @@ const DetectionResults = () => {
       const filename = `detection_report_${detectionId}.${format}`
       const fileUri = `${FileSystem.documentDirectory}${filename}`
       
-      // Download the file
+      // Download the file with abort signal
       const downloadResult = await FileSystem.downloadAsync(url, fileUri)
+      
+      // Check if export was cancelled after download
+      if (abortController.signal.aborted) {
+        console.log('🚫 Export cancelled during download')
+        return
+      }
       
       if (downloadResult.status === 200) {
         console.log('✅ Report downloaded:', downloadResult.uri)
@@ -253,6 +278,12 @@ const DetectionResults = () => {
     } catch (error: any) {
       console.error('❌ Export error:', error)
       
+      // Check if export was cancelled
+      if (error.name === 'AbortError' || error.message?.includes('aborted')) {
+        console.log('🚫 Export was cancelled')
+        return // Don't show error alert for cancellation
+      }
+      
       if (error.message?.includes('reportlab')) {
         Alert.alert(
           'PDF Export Unavailable',
@@ -268,6 +299,7 @@ const DetectionResults = () => {
       }
     } finally {
       setExporting(false)
+      setExportCancelToken(null)
     }
   }
 
@@ -410,7 +442,7 @@ const DetectionResults = () => {
   return (
     <ScrollView className="flex-1 bg-bgColor1" showsVerticalScrollIndicator={false}
       refreshControl={<RefreshControl refreshing={loading} onRefresh={() => refreshSessions()} />}>
-      <View className="flex-1 justify-start items-center pt-12 pb-8 px-4">
+      <View className="flex-1 justify-start items-center pt-12 pb-8 px-4" style={{ paddingTop: insets.top + 48 }}>
         {/* Media Container - Expandable with DJI Mini 4 Pro aspect ratio */}
         <View className="w-full items-center mb-6">
           <TouchableOpacity 
@@ -483,11 +515,50 @@ const DetectionResults = () => {
                           setSessionModalVisible(false);
                         }}>
                           <View className="flex-row items-center justify-between">
-                            <View>
+                            <View className="flex-1">
                               <Text className="font-medium">{s[1]}</Text>
                               <Text className="text-xs text-gray-500">{formatAmPm(s[2])} • {s[3]}</Text>
                             </View>
-                            <Text className="text-sm text-gray-400">{s[6]} detections</Text>
+                            <View className="flex-row items-center">
+                              <Text className="text-sm text-gray-400 mr-3">{s[6]} detections</Text>
+                              <TouchableOpacity
+                                onPress={(e) => {
+                                  e.stopPropagation();
+                                  Alert.alert(
+                                    'Delete Session',
+                                    `Are you sure you want to delete "${s[1]}"?\n\nThis will permanently delete all data including:\n• Detection details\n• GPS tracks\n• Heatmaps\n\nThis action cannot be undone.`,
+                                    [
+                                      { text: 'Cancel', style: 'cancel' },
+                                      {
+                                        text: 'Delete',
+                                        style: 'destructive',
+                                        onPress: async () => {
+                                          try {
+                                            const response = await fetch(`${API_BASE}/detection/${s[0]}`, {
+                                              method: 'DELETE',
+                                            });
+                                            if (response.ok) {
+                                              await refreshSessions();
+                                              if (selectedDetection && selectedDetection[0] === s[0]) {
+                                                setSelectedDetection(null);
+                                              }
+                                              Alert.alert('Success', 'Session deleted successfully');
+                                            } else {
+                                              Alert.alert('Error', 'Failed to delete session');
+                                            }
+                                          } catch (error) {
+                                            Alert.alert('Error', 'Failed to delete session');
+                                          }
+                                        },
+                                      },
+                                    ]
+                                  );
+                                }}
+                                className="p-2"
+                              >
+                                <Ionicons name="trash-outline" size={20} color="#ef4444" />
+                              </TouchableOpacity>
+                            </View>
                           </View>
                         </TouchableOpacity>
                       ))}
@@ -595,7 +666,7 @@ const DetectionResults = () => {
                   </Text>
                 </View>
                 <Text className="text-sm text-gray-600 text-center">
-                  {uniqueWeedCount !== null ? 'Unique Weeds' : 'Total Weeds'}
+                  {uniqueWeedCount !== null ? 'Estimated Unique Weeds' : 'Total Weeds'}
                 </Text>
                 {uniqueWeedCount !== null && uniqueWeedData && (
                   <Text className="text-xs text-gray-500 text-center mt-1">
@@ -718,16 +789,16 @@ const DetectionResults = () => {
               
               <TouchableOpacity 
                 className="bg-blue-50 border border-blue-200 rounded-lg p-3"
-                onPress={handleExport}
-                disabled={exporting}
+                onPress={exporting ? cancelExport : handleExport}
+                disabled={false}
               >
                 <View className="flex-row items-center">
-                  <FontAwesome6 name="download" size={20} color="rgb(59, 130, 246)" />
+                  <FontAwesome6 name={exporting ? "times" : "download"} size={20} color="rgb(59, 130, 246)" />
                   <Text className="text-blue-700 font-medium ml-3 flex-1">
-                    {exporting ? 'Exporting...' : 'Export Report'}
+                    {exporting ? 'Cancel Export' : 'Export Report'}
                   </Text>
                   {exporting ? (
-                    <ActivityIndicator size="small" color="rgb(59, 130, 246)" />
+                    <Ionicons name="close" size={20} color="rgb(239, 68, 68)" />
                   ) : (
                     <Ionicons name="chevron-forward" size={20} color="rgb(59, 130, 246)" />
                   )}

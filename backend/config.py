@@ -10,10 +10,10 @@ IS_RENDER = os.getenv('RENDER') is not None
 IS_LOCAL = not IS_RENDER
 
 # Your Roboflow API key
-ROBOFLOW_API_KEY = "yAsiXl4Gm06xmHs5nyye"
+ROBOFLOW_API_KEY = "ijyg4acaU8ukH7A5E8dy"
 
 # Your Roboflow project name
-ROBOFLOW_PROJECT = "thesis_testing-gf8bn"
+ROBOFLOW_PROJECT = "model8-6-yolov11-acc-8y3xc"
 
 # Optional: specify workspace explicitly if API key has multiple workspaces
 # Leave blank to use default workspace associated with the API key
@@ -21,10 +21,10 @@ ROBOFLOW_PROJECT = "thesis_testing-gf8bn"
 ROBOFLOW_WORKSPACE = ""
 
 # Model version to use (e.g., 2 for "thesis_testing-gf8bn/2")
-ROBOFLOW_VERSION = "2"
+ROBOFLOW_VERSION = "1"
 
 # Default inference parameters
-DEFAULT_CONFIDENCE = 0.1  # Match Roboflow preview defaults
+DEFAULT_CONFIDENCE = 0.35  # Match Roboflow preview defaults
 DEFAULT_OVERLAP = 0.7  # Higher overlap threshold = more aggressive NMS, fewer duplicate boxes (Roboflow preview uses ~0.7)
 DEFAULT_VIDEO_FPS = 10  # 10 FPS for good balance between speed and smoothness. Set to None to auto-detect.
 
@@ -52,7 +52,7 @@ SMART_SKIP_WINDOW = 15  # If detection found, process next N frames fully
 # Video annotation optimization mode
 # 'fast' = Only process frames at detection FPS, use FFmpeg drawtext overlay (10-20x faster)
 # 'quality' = Extract all frames, annotate individually, stitch back (slower, higher quality)
-VIDEO_ANNOTATION_MODE = 'fast'  # Use 'fast' for 10-20x faster processing (OpenCV drawing)
+VIDEO_ANNOTATION_MODE = 'quality'  # Use 'fast' for 10-20x faster processing (OpenCV drawing)
 
 # Detection persistence for video annotations (how long bounding boxes stay visible)
 # For drone weed detection: Match persistence to detection interval to avoid stacking
@@ -151,3 +151,14 @@ FFMPEG_BINARY = "ffmpeg"  # e.g. "C:/ffmpeg/bin/ffmpeg.exe"
 
 # Maximum upload size allowed by Cloudinary accounts (bytes). Default: 100 MB
 MAX_CLOUDINARY_UPLOAD_SIZE = 104_857_600
+
+# Render.com Standard Plan Optimizations (2GB RAM, 1 CPU)
+MAX_UPLOAD_SIZE_MB = 200  # Reduced from unlimited to 200MB
+MAX_CONCURRENT_JOBS = 1   # Process one job at a time to avoid OOM
+ENABLE_MEMORY_MONITORING = True  # Monitor memory usage
+MEMORY_CLEANUP_INTERVAL = 300  # Clean up temp files every 5 minutes
+
+# Video processing limits for Render.com
+MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes max
+MAX_VIDEO_RESOLUTION = 1080  # 1080p max (down from 1440p)
+COMPRESSION_AGGRESSIVE_MODE = True  # More aggressive compression

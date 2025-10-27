@@ -110,19 +110,19 @@ def compress_for_inference(input_path: str, max_size_mb: int = 100, force: bool 
     # Get current video size to determine compression strategy
     current_size_mb = os.path.getsize(input_path) / (1024 * 1024)
     
-    # Use 1440p for better quality, adjust CRF based on file size
-    target_height = 1440  # 2560x1440 resolution
+    # Use 1080p for Render.com Standard Plan (reduced from 1440p)
+    target_height = 1080  # 1920x1080 resolution (Render.com optimized)
     
-    if current_size_mb > 500:
+    if current_size_mb > 200:  # More aggressive threshold for Render.com
         # More aggressive CRF for very large files
-        crf = 30  # Still good quality, smaller file
-        bitrate_limit = '5M'  # Max bitrate cap (higher for 1440p)
-        print(f"Compressing large video (1440p, CRF 30) for {current_size_mb:.1f} MB video")
+        crf = 32  # Higher CRF for smaller files (was 30)
+        bitrate_limit = '3M'  # Lower bitrate cap for Render.com (was 5M)
+        print(f"Compressing large video (1080p, CRF 32) for {current_size_mb:.1f} MB video")
     else:
         # Standard compression for moderate files
-        crf = 28
+        crf = 30  # Higher CRF for Render.com (was 28)
         bitrate_limit = None
-        print(f"Using standard compression (1440p, CRF 28) for {current_size_mb:.1f} MB video")
+        print(f"Using standard compression (1080p, CRF 30) for {current_size_mb:.1f} MB video")
     
     # Compression settings optimized for detection quality
     cmd_args = [

@@ -49,6 +49,37 @@ init_db()
 # Job storage for background processing
 processing_jobs: Dict[str, Dict[str, Any]] = {}
 
+# Render.com Standard Plan: Job queue management
+from .config import MAX_CONCURRENT_JOBS
+active_jobs = 0
+job_queue = []
+
+def cleanup_temp_files():
+    """Clean up temporary files to prevent disk space issues on Render.com"""
+    import glob
+    import os
+    from .config import MEMORY_CLEANUP_INTERVAL
+    
+    temp_patterns = [
+        '/tmp/rf_robo_*',
+        '/tmp/tmp*',
+        '/tmp/*_annotated.mp4',
+        '/tmp/temp_*.mp4'
+    ]
+    
+    cleaned_count = 0
+    for pattern in temp_patterns:
+        for file_path in glob.glob(pattern):
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    cleaned_count += 1
+            except Exception as e:
+                print(f"Warning: Could not remove {file_path}: {e}")
+    
+    if cleaned_count > 0:
+        print(f"🧹 Cleaned up {cleaned_count} temporary files")
+
 def process_media_background(
     job_id: str,
     media_path: str,
@@ -590,6 +621,14 @@ async def upload_file(
     file_size_mb = len(file_bytes) / (1024 * 1024)
     print(f"Processing file: {file.filename} ({file_size_mb:.1f} MB)")
     
+    # Render.com Standard Plan: Enforce file size limits
+    from .config import MAX_UPLOAD_SIZE_MB
+    if file_size_mb > MAX_UPLOAD_SIZE_MB:
+        raise HTTPException(
+            status_code=413, 
+            detail=f"File too large: {file_size_mb:.1f}MB. Maximum allowed: {MAX_UPLOAD_SIZE_MB}MB for Render.com Standard Plan"
+        )
+    
     # Basic validation for images to avoid downstream crashes
     if file.filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".gif")):
         if Image is None:
@@ -737,6 +776,51 @@ async def upload_srt_file(
         "bounds": { 'min_lat': min_lat, 'min_lon': min_lon, 'max_lat': max_lat, 'max_lon': max_lon }
     })
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint with memory usage for Render.com monitoring"""
+    import psutil
+    import os
+    
+    try:
+        # Get memory usage
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent
+        memory_available_mb = memory.available / (1024 * 1024)
+        
+        # Get disk usage
+        disk = psutil.disk_usage('/')
+        disk_percent = disk.percent
+        disk_free_mb = disk.free / (1024 * 1024)
+        
+        # Count active jobs
+        active_count = sum(1 for job in processing_jobs.values() if job.get('status') == 'processing')
+        
+        return {
+            "status": "healthy",
+            "memory": {
+                "percent": memory_percent,
+                "available_mb": round(memory_available_mb, 1),
+                "total_mb": round(memory.total / (1024 * 1024), 1)
+            },
+            "disk": {
+                "percent": disk_percent,
+                "free_mb": round(disk_free_mb, 1)
+            },
+            "jobs": {
+                "active": active_count,
+                "queued": len(job_queue),
+                "total": len(processing_jobs)
+            },
+            "render_plan": "standard_2gb_1cpu"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "render_plan": "standard_2gb_1cpu"
+        }
+
 @app.get("/detections/")
 async def get_detections():
     """Get all detection sessions."""
@@ -771,8 +855,8 @@ async def get_detection_details(detection_id: int):
 @app.get("/detection/{detection_id}/unique-weeds")
 async def get_unique_weeds(
     detection_id: int,
-    iou_threshold: float = Query(0.3, description="IoU threshold for matching (0.0-1.0)"),
-    frame_gap: int = Query(10, description="Maximum frame gap for tracking")
+    iou_threshold: float = Query(0.6, description="IoU threshold for matching (0.0-1.0)"),
+    frame_gap: int = Query(2, description="Maximum frame gap for tracking")
 ):
     """Calculate unique weed count by tracking across frames.
     
@@ -797,6 +881,52 @@ async def get_unique_weeds(
         },
         "message": f"Found {unique_weeds['unique_count']} unique weeds from {unique_weeds['total_detections']} total detections ({unique_weeds['reduction_percentage']}% reduction)"
     }
+
+@app.delete("/detection/{detection_id}")
+async def delete_detection_session(detection_id: int):
+    """Delete a detection session and all associated data.
+    
+    This endpoint deletes:
+    - Detection record from detections table
+    - All detection_details (cascade)
+    - SRT tracks data
+    - Heatmap data
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    try:
+        # Check if detection exists
+        cursor.execute("SELECT id FROM detections WHERE id = ?", (detection_id,))
+        detection = cursor.fetchone()
+        
+        if not detection:
+            raise HTTPException(status_code=404, detail="Detection session not found")
+        
+        # Delete the detection (CASCADE will handle related records)
+        cursor.execute("DELETE FROM detections WHERE id = ?", (detection_id,))
+        
+        # Also explicitly delete from related tables in case CASCADE doesn't work
+        cursor.execute("DELETE FROM detection_details WHERE detection_id = ?", (detection_id,))
+        cursor.execute("DELETE FROM srt_tracks WHERE detection_id = ?", (detection_id,))
+        cursor.execute("DELETE FROM heatmaps WHERE detection_id = ?", (detection_id,))
+        
+        conn.commit()
+        
+        return {
+            "message": f"Detection session {detection_id} and all associated data deleted successfully",
+            "deleted_id": detection_id
+        }
+    
+    except HTTPException:
+        conn.close()
+        raise
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Failed to delete detection session: {str(e)}")
+    finally:
+        conn.close()
 
 @app.get("/statistics/")
 async def get_statistics():
@@ -976,9 +1106,9 @@ async def generate_heatmap(detection_id: int, grid_size_m: float = Query(1.0), p
 @app.get("/detection/{detection_id}/unique-weeds-heatmap")
 async def get_unique_weeds_heatmap(
     detection_id: int,
-    iou_threshold: float = Query(0.3, description="IoU threshold for matching (0.0-1.0)"),
-    frame_gap: int = Query(10, description="Maximum frame gap for tracking"),
-    grid_size_m: float = Query(1.0, description="Grid cell size in meters"),
+    iou_threshold: float = Query(0.6, description="IoU threshold for matching (0.0-1.0)"),
+    frame_gap: int = Query(2, description="Maximum frame gap for tracking"),
+    grid_size_m: float = Query(0.5, description="Grid cell size in meters"),
     debug: bool = Query(False, description="When true, return matched detections and grid details for debugging")
 ):
     """Generate heatmap based on unique weed count per GPS location.
@@ -1060,7 +1190,7 @@ async def get_unique_weeds_heatmap(
     print(f"[Heatmap] Processing {len(detections)} detections")
     
     # Match detections to GPS by timestamp (with tolerance for slight mismatches)
-    TIMESTAMP_TOLERANCE_MS = 50  # Reduced to 50ms for more precise GPS matching (was 100ms)
+    TIMESTAMP_TOLERANCE_MS = 200  # Increased to 200ms to handle frame rate differences between original (30fps) and processed (10fps) videos
     
     detections_with_gps = []
     matched_count = 0
@@ -1077,11 +1207,27 @@ async def get_unique_weeds_heatmap(
         best_match = None
         min_diff = float('inf')
         
+        # First try exact match or very close match
         for srt_ms, (lat, lon) in timestamp_to_gps.items():
             diff = abs(srt_ms - det_timestamp_ms)
             if diff <= TIMESTAMP_TOLERANCE_MS and diff < min_diff:
                 min_diff = diff
                 best_match = (lat, lon)
+        
+        # If no match found within tolerance, try a more lenient approach
+        # This handles cases where frame rates differ significantly
+        if best_match is None:
+            # Sort SRT timestamps and find the closest one
+            sorted_srt_times = sorted(timestamp_to_gps.keys())
+            for srt_ms in sorted_srt_times:
+                diff = abs(srt_ms - det_timestamp_ms)
+                if diff < min_diff:
+                    min_diff = diff
+                    best_match = timestamp_to_gps[srt_ms]
+            
+            # Only use this match if it's within a reasonable range (1 second)
+            if min_diff > 1000:  # 1 second
+                best_match = None
         
         if best_match:
             matched_count += 1
@@ -1101,8 +1247,8 @@ async def get_unique_weeds_heatmap(
     match_percentage = (matched_count / len(detections) * 100) if len(detections) > 0 else 0
     print(f"[Heatmap] Match rate: {match_percentage:.1f}%")
     
-    if match_percentage < 80:
-        print(f"[Heatmap] ⚠️ WARNING: Low match rate (<80%). Consider increasing TIMESTAMP_TOLERANCE_MS or checking FPS calculation.")
+    if match_percentage < 60:
+        print(f"[Heatmap] ⚠️ WARNING: Low match rate (<60%). Consider increasing TIMESTAMP_TOLERANCE_MS or checking FPS calculation.")
     
     if not detections_with_gps:
         return {
@@ -1133,8 +1279,26 @@ async def get_unique_weeds_heatmap(
         
         return intersection_area / union_area if union_area > 0 else 0.0
     
-    # Track weeds across frames to identify unique individuals
-    tracks = []
+    # GPS distance validation helper
+    def calculate_gps_distance(lat1, lon1, lat2, lon2):
+        """Calculate distance in meters between two GPS coordinates using Haversine formula."""
+        if None in [lat1, lon1, lat2, lon2]:
+            return None
+        
+        from math import radians, cos, sin, asin, sqrt
+        
+        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+        c = 2 * asin(sqrt(a))
+        r = 6371000  # Radius of earth in meters
+        return c * r
+    
+    # Improved tracking: Use spatial clustering for better accuracy with 10 FPS
+    # Group detections by GPS location first, then count unique spatial clusters
+    
+    spatial_clusters = {}
     
     for det in detections_with_gps:
         det_id = det['id']
@@ -1143,51 +1307,39 @@ async def get_unique_weeds_heatmap(
         confidence = det['confidence']
         box = det['bbox']
         gps_coords = det['gps']
+        gps_lat, gps_lon = gps_coords
         
-        # Try to match with existing tracks
-        matched = False
-        for track in tracks:
-            last_det = track['detections'][-1]
-            last_frame = last_det['frame_num']
-            last_class = last_det['class']
-            last_box = last_det['bbox']
-            
-            # Check if same class
-            if weed_class != last_class:
-                continue
-            
-            # Check frame gap
-            if frame_num - last_frame > frame_gap:
-                continue
-            
-            # Check spatial proximity (IoU)
-            iou = calculate_iou(box, last_box)
-            
-            if iou >= iou_threshold:
-                track['detections'].append(det)
-                track['last_frame'] = frame_num
-                track['avg_confidence'] = (track['avg_confidence'] * track['count'] + confidence) / (track['count'] + 1)
-                track['count'] += 1
-                
-                # Update GPS location
-                if gps_coords:
-                    track['gps_coords'].append(gps_coords)
-                
-                matched = True
-                break
+        # Create spatial cluster key based on GPS
+        # Using 6 decimal places (~0.1m) to preserve individual detection locations
+        # This ensures each unique weed location along the flight path is shown
+        spatial_key = (round(gps_lat, 6), round(gps_lon, 6))
+        full_key = (weed_class, spatial_key)
         
-        # Create new track if no match
-        if not matched:
-            new_track = {
+        if full_key not in spatial_clusters:
+            spatial_clusters[full_key] = {
                 'weed_class': weed_class,
-                'detections': [det],
+                'detections': [],
+                'detection_ids': [],
+                'frames': [],
+                'gps_coords': [],
+                'avg_confidence': 0,
+                'count': 0,
                 'first_frame': frame_num,
-                'last_frame': frame_num,
-                'avg_confidence': confidence,
-                'count': 1,
-                'gps_coords': [gps_coords] if gps_coords else []
+                'last_frame': frame_num
             }
-            tracks.append(new_track)
+        
+        cluster = spatial_clusters[full_key]
+        cluster['detections'].append(det)
+        cluster['detection_ids'].append(det_id)
+        cluster['frames'].append(frame_num)
+        cluster['gps_coords'].append(gps_coords)
+        cluster['avg_confidence'] = (cluster['avg_confidence'] * cluster['count'] + confidence) / (cluster['count'] + 1)
+        cluster['count'] += 1
+        cluster['last_frame'] = max(cluster['last_frame'], frame_num)
+        cluster['first_frame'] = min(cluster['first_frame'], frame_num)
+    
+    # Convert clusters to tracks format
+    tracks = list(spatial_clusters.values())
     
     print(f"[Heatmap] Identified {len(tracks)} unique weeds from {len(detections_with_gps)} GPS-matched detections")
     

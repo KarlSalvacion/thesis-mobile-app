@@ -1,12 +1,12 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react'
+import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { View, Text, Pressable, ActivityIndicator, ScrollView, RefreshControl, Alert } from 'react-native'
 import * as DocumentPicker from 'expo-document-picker'
 import * as ImagePicker from 'expo-image-picker'
 import * as FileSystem from 'expo-file-system'
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons'
-import { Video } from 'react-native-compressor'
-import SrtDebugViewer from '../components/SrtDebugViewer'
+import { Video, Image as CompressorImage } from 'react-native-compressor'
 import { useSession } from '../context/SessionContext'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
 function guessMimeType(name: string): string {
   const lower = name.toLowerCase()
   if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
@@ -63,24 +63,61 @@ async function handleClientCompression(jobId: string, result: any, onProgress?: 
     const downloadedSize = fileInfo.exists ? (fileInfo as any).size : 0
     console.log(`📥 [COMPRESS] Downloaded: ${(downloadedSize / (1024*1024)).toFixed(2)} MB`)
     
-    // Step 2: Compress with react-native-compressor
-    onProgress?.('Compressing video (high quality)...')
-    console.log('🗜️  [COMPRESS] Starting HIGH QUALITY compression with react-native-compressor')
+    // Step 2: Compress with react-native-compressor - balanced settings for all files
+    const fileSizeMB = downloadedSize / (1024 * 1024)
+    let compressionSettings: any
     
-    const compressedPath = await Video.compress(
-      localPath,
-      {
+    // Adjust compression settings based on file size for stability
+    if (fileSizeMB > 200) {
+      onProgress?.('Compressing large video (high quality)...')
+      console.log('🗜️  [COMPRESS] Starting HIGH QUALITY compression for large file:', fileSizeMB.toFixed(2), 'MB')
+      compressionSettings = {
         compressionMethod: 'auto',
-        maxSize: 1920, // Maintain 1080p resolution
-        bitrate: 8000000, // 8 Mbps - high quality for readable annotations
-        minimumFileSizeForCompress: 0, // Always compress
-      },
-      (progress) => {
-        const percent = (progress * 100).toFixed(0)
-        console.log(`🗜️  [COMPRESS] Progress: ${percent}%`)
-        onProgress?.(`Compressing video... ${percent}%`)
+        maxSize: 1080,  // Keep 1080p for better quality
+        bitrate: 7000000, // 7 Mbps for large files - high quality
+        minimumFileSizeForCompress: 0,
       }
-    )
+    } else if (fileSizeMB > 100) {
+      onProgress?.('Compressing video (high quality)...')
+      console.log('🗜️  [COMPRESS] Starting HIGH QUALITY compression:', fileSizeMB.toFixed(2), 'MB')
+      compressionSettings = {
+        compressionMethod: 'auto',
+        maxSize: 1080,  // 1080p
+        bitrate: 8000000, // 8 Mbps
+        minimumFileSizeForCompress: 0,
+      }
+    } else {
+      onProgress?.('Compressing video (maximum quality)...')
+      console.log('🗜️  [COMPRESS] Starting MAXIMUM QUALITY compression:', fileSizeMB.toFixed(2), 'MB')
+      compressionSettings = {
+        compressionMethod: 'auto',
+        maxSize: 1080,  // Standard 1080p
+        bitrate: 9000000, // 9 Mbps for smaller files
+        minimumFileSizeForCompress: 0,
+      }
+    }
+    
+    let compressedPath: string
+    try {
+      compressedPath = await Video.compress(
+        localPath,
+        compressionSettings,
+        (progress) => {
+          const percent = (progress * 100).toFixed(0)
+          console.log(`🗜️  [COMPRESS] Progress: ${percent}%`)
+          onProgress?.(`Compressing video... ${percent}%`)
+        }
+      )
+    } catch (compressError: any) {
+      console.error('❌ [COMPRESS] Compression failed:', compressError)
+      // Clean up downloaded file
+      try {
+        await FileSystem.deleteAsync(localPath, { idempotent: true })
+      } catch (e) {
+        console.warn('⚠️  [COMPRESS] Cleanup warning:', e)
+      }
+      throw new Error(`Compression failed: ${compressError.message || 'Unknown error'}`)
+    }
     
     const compressedInfo = await FileSystem.getInfoAsync(compressedPath)
     const compressedSize = compressedInfo.exists ? (compressedInfo as any).size : 0
@@ -356,6 +393,7 @@ type SelectedFile = {
 
 const Homescreen = () => {
   const { refreshSessions, setSelectedDetection, sessions } = useSession();
+  const insets = useSafeAreaInsets();
   const [selectedMedia, setSelectedMedia] = useState<SelectedFile | null>(null)
   const [selectedSrt, setSelectedSrt] = useState<SelectedFile | null>(null)
   const [status, setStatus] = useState<'idle' | 'picking' | 'ready' | 'uploading' | 'success' | 'error'>('idle')
@@ -394,7 +432,29 @@ const Homescreen = () => {
 
       const asset = result.assets?.[0]
       if (asset) {
-        const inferredName = asset.uri.split('/')?.pop() || (asset.type === 'video' ? 'video.mp4' : 'image.jpg')
+        // Try to preserve an actual filename provided by the picker (if present).
+        // Fall back to the URI last segment, sanitizing query params. If still missing,
+        // use a sensible default based on media type so the name stays stable.
+        const maybeFileName = (asset as any).fileName || (asset as any).filename || (asset as any).name
+        let inferredName = ''
+
+        if (maybeFileName && typeof maybeFileName === 'string' && maybeFileName.trim() !== '') {
+          inferredName = maybeFileName
+        } else if (asset.uri && typeof asset.uri === 'string') {
+          // strip query params and fragments
+          const uriPart = asset.uri.split('?')[0].split('#')[0]
+          inferredName = uriPart.split('/')?.pop() || ''
+        }
+
+        // Ensure we have a fallback name with an extension
+        if (!inferredName) {
+          inferredName = asset.type === 'video' ? 'video.mp4' : 'image.jpg'
+        }
+
+        // If name has no extension, append one based on asset.type
+        if (!/\.[a-z0-9]+$/i.test(inferredName)) {
+          inferredName = inferredName + (asset.type === 'video' ? '.mp4' : '.jpg')
+        }
         let size: number | null | undefined = undefined
         try {
           const info: any = await FileSystem.getInfoAsync(asset.uri)
@@ -502,6 +562,26 @@ const Homescreen = () => {
         throw new Error('SRT files can only be uploaded with video files, not images')
       }
 
+      // Validate that SRT and MP4 files have the exact same name except for extension
+      if (selectedSrt && selectedMedia && isVideo) {
+        const mediaName = selectedMedia.name.toLowerCase()
+        const srtName = selectedSrt.name.toLowerCase()
+        
+        // Remove extensions
+        const mediaBaseName = mediaName.replace(/\.(mp4|mov|avi|mkv)$/, '')
+        const srtBaseName = srtName.replace(/\.srt$/, '')
+        
+        console.log('📋 [VALIDATION] Media base name:', mediaBaseName)
+        console.log('📋 [VALIDATION] SRT base name:', srtBaseName)
+        
+        if (mediaBaseName !== srtBaseName) {
+          console.error('❌ [VALIDATION] File names do not match')
+          throw new Error(`File names must match exactly (except extension). Media: "${selectedMedia.name}", SRT: "${selectedSrt.name}"`)
+        }
+        
+        console.log('✅ [VALIDATION] File names match correctly')
+      }
+
       setProgress(30)
 
       // Compress video if needed (only for video files)
@@ -509,20 +589,42 @@ const Homescreen = () => {
       let mediaSizeToUpload = selectedMedia?.size || 0
       
       if (selectedMedia && isVideo) {
+        const fileSizeMB = (selectedMedia.size || 0) / (1024 * 1024)
         console.log('🎬 [COMPRESSION] Starting video compression...')
-        console.log('🎬 [COMPRESSION] Original size:', ((selectedMedia.size || 0) / (1024 * 1024)).toFixed(2), 'MB')
+        console.log('🎬 [COMPRESSION] Original size:', fileSizeMB.toFixed(2), 'MB')
         
         setMessage('Compressing video...')
         setProgress(35)
         
         try {
+          // Dynamic compression settings based on file size
+          let compressSettings: any
+          if (fileSizeMB > 200) {
+            console.log('🎬 [COMPRESSION] Using high quality settings for large file')
+            compressSettings = {
+              compressionMethod: 'auto',
+              maxSize: 1080,  // Keep 1080p for better quality
+              bitrate: 7000000, // 7 Mbps
+            }
+          } else if (fileSizeMB > 100) {
+            console.log('🎬 [COMPRESSION] Using high quality settings')
+            compressSettings = {
+              compressionMethod: 'auto',
+              maxSize: 1080,  // 1080p
+              bitrate: 8000000, // 8 Mbps
+            }
+          } else {
+            console.log('🎬 [COMPRESSION] Using maximum quality settings')
+            compressSettings = {
+              compressionMethod: 'auto',
+              maxSize: 1080,  // 1080p
+              bitrate: 9000000, // 9 Mbps
+            }
+          }
+          
           const compressedUri = await Video.compress(
             selectedMedia.uri,
-            {
-              compressionMethod: 'auto',
-              maxSize: 1920,
-              bitrate: 5000000,
-            },
+            compressSettings,
             (progress) => {
               const compressProgress = 35 + (progress * 0.25) // 35% to 60%
               setProgress(compressProgress)
@@ -545,9 +647,67 @@ const Homescreen = () => {
           
           setMessage('Compression complete. Uploading...')
           setProgress(60)
-        } catch (compressionError) {
+        } catch (compressionError: any) {
           console.warn('⚠️ [COMPRESSION] Failed, using original video:', compressionError)
-          setMessage('Compression skipped. Uploading original...')
+          setMessage('Compression failed. Uploading original...')
+          setProgress(60)
+        }
+      }
+
+      // Compress images client-side to avoid backend 413 errors (Roboflow size limits)
+      else if (selectedMedia && isImage) {
+        const fileSizeMB = (selectedMedia.size || 0) / (1024 * 1024)
+        console.log('🖼️ [COMPRESSION] Starting image compression...')
+        console.log('🖼️ [COMPRESSION] Original size:', fileSizeMB.toFixed(2), 'MB')
+
+        setMessage('Compressing image...')
+        setProgress(40)
+
+        try {
+          // Choose compression parameters based on size
+          let quality = 0.8
+          let maxWidth = 1920
+          if (fileSizeMB > 5) {
+            quality = 0.6
+            maxWidth = 1280
+          } else if (fileSizeMB > 2) {
+            quality = 0.75
+            maxWidth = 1600
+          }
+
+          // CompressorImage.compress returns a local URI for the compressed image
+          const compressedUri = await CompressorImage.compress(selectedMedia.uri, {
+            compressFormat: 'JPEG',
+            quality: quality,
+            maxWidth: maxWidth,
+            // let library choose maxHeight to preserve aspect ratio
+          } as any)
+
+          console.log('✅ [COMPRESSION] Compressed image URI:', compressedUri)
+
+          // Copy compressed file to cache with the original filename so upload preserves name
+          const cacheDest = `${FileSystem.cacheDirectory}${selectedMedia.name}`
+          try {
+            await FileSystem.copyAsync({ from: compressedUri, to: cacheDest })
+            const info = await FileSystem.getInfoAsync(cacheDest)
+            mediaUriToUpload = cacheDest
+            mediaSizeToUpload = info.exists ? info.size : mediaSizeToUpload
+            console.log('✅ [COMPRESSION] Copied compressed image to cache:', cacheDest)
+          } catch (copyErr) {
+            console.warn('⚠️ [COMPRESSION] Failed to copy compressed image to cache, using compressed URI directly', copyErr)
+            mediaUriToUpload = compressedUri
+            try {
+              const info = await FileSystem.getInfoAsync(compressedUri)
+              mediaSizeToUpload = info.exists ? info.size : mediaSizeToUpload
+            } catch {}
+          }
+
+          setMessage('Compression complete. Uploading...')
+          setProgress(60)
+        } catch (compressionError: any) {
+          console.warn('⚠️ [COMPRESSION] Image compression failed, uploading original:', compressionError)
+          setMessage('Image compression failed. Uploading original...')
+          setProgress(60)
         }
       }
 
@@ -634,6 +794,19 @@ const Homescreen = () => {
 
   const isBusy = status === 'picking' || status === 'uploading'
   const hasAnyFile = selectedMedia || selectedSrt
+  
+  // Check if file names match (for video + SRT combinations)
+  const fileNamesMatch = useMemo(() => {
+    if (!selectedSrt || !selectedMedia) return true // No SRT file, so no validation needed
+    if (!selectedMedia.name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i)) return true // Not a video file
+    
+    const mediaName = selectedMedia.name.toLowerCase()
+    const srtName = selectedSrt.name.toLowerCase()
+    const mediaBaseName = mediaName.replace(/\.(mp4|mov|avi|mkv)$/, '')
+    const srtBaseName = srtName.replace(/\.srt$/, '')
+    
+    return mediaBaseName === srtBaseName
+  }, [selectedMedia, selectedSrt])
 
   const onRefresh = useCallback(async () => {
     // Soft refresh UI state; optionally ping backend to ensure API_BASE is reachable
@@ -647,84 +820,79 @@ const Homescreen = () => {
   return (
     <View className="flex-1 bg-bgColor1">
       <ScrollView 
-        contentContainerStyle={{ alignItems: 'center', paddingVertical: 24 }}
+        contentContainerStyle={{ alignItems: 'center', paddingTop: insets.top + 16, paddingBottom: 16, paddingHorizontal: 16 }}
         showsVerticalScrollIndicator={false}
         refreshControl={<RefreshControl refreshing={false} onRefresh={onRefresh} />}>
-        <View className="justify-center items-center bg-white h-auto py-4 rounded-xl shadow-custom">
-        <Ionicons name="cloud-upload" size={64} color="rgb(37, 165, 120)" className="mt-4 mx-auto" />
-        <Text className="text-2xl font-bold text-gray-800 mb-4">
+        <View className="justify-center items-center bg-white w-full max-w-md h-auto py-6 px-4 rounded-2xl shadow-custom border-2 border-gray-200">
+        <Ionicons name="cloud-upload" size={56} color="rgb(37, 165, 120)" className="mb-3" />
+        <Text className="text-2xl font-bold text-gray-800 mb-2 text-center">
           Upload Media & Subtitles
         </Text>
-        <Text className="text-gray-600 text-center px-6 mb-6">
+        <Text className="text-gray-600 text-center px-4 mb-4">
           Pick a video/photo and upload SRT subtitle file.
         </Text>
 
-        {/* Media Picker */}
-        <View className="mb-4">
-          <Text className="text-lg font-semibold text-gray-700 mb-2 text-center">Media File</Text>
-          <Pressable
-            onPress={pickMedia}
-            disabled={isBusy}
-            className={`w-[310px] h-[150px] items-center justify-center rounded-md mb-3 border-2 border-greenColor ${isBusy ? 'bg-gray-300' : 'bg-bgColor1'}`}
-          >
-            <FontAwesome6 name='file-video' size={40} color='rgb(37, 165, 120)' />
-
-            <Text className="text-greenColor font-bold center text-base text-center mt-3">
-              {status === 'picking' ? 'Opening picker...' : 'Choose video/image file'}
-            </Text>
-          </Pressable>
-
-          {selectedMedia && (
-            <View className="w-72 bg-white border border-gray-200 rounded-md p-3 mb-3">
-              <Text className="text-gray-800 font-medium" numberOfLines={1}>{selectedMedia.name}</Text>
-              <Text className="text-gray-500 text-xs">
-                {selectedMedia.size ? `${(selectedMedia.size / (1024 * 1024)).toFixed(2)} MB` : 'Size unknown'}
+        {/* File Pickers - Side by Side */}
+        <View className="flex-row gap-4 mb-4 w-full">
+          {/* Media Picker */}
+          <View className="flex-1">
+            <Text className="text-sm font-semibold text-gray-700 mb-2.5 text-center">Media File</Text>
+            <Pressable
+              onPress={pickMedia}
+              disabled={isBusy}
+              className={`h-[100px] items-center justify-center rounded-lg border-2 border-greenColor ${isBusy ? 'bg-gray-300' : 'bg-bgColor1'}`}
+            >
+              <FontAwesome6 name='file-video' size={32} color='rgb(37, 165, 120)' />
+              <Text className="text-greenColor font-bold text-xs text-center mt-2 px-2">
+                {status === 'picking' ? 'Opening...' : 'Choose video/image'}
               </Text>
-            </View>
-          )}
-        </View>
+            </Pressable>
 
-        {/* SRT File Picker */}
-        <View className="mb-4 items-center">
-          <Text className="text-lg font-semibold text-gray-700 mb-2 text-center">Subtitle File (SRT)</Text>
-          <Text className="text-xs text-gray-500 text-center mb-2 px-4">
-            Optional for videos. Provides GPS coordinates for mapping. Cannot be used with images.
-          </Text>
-          <Pressable
-            onPress={pickSrt}
-            disabled={isBusy}
-            className={`w-[310px] h-[100px] items-center justify-center rounded-md mb-3 border-2 border-blue-500 ${isBusy ? 'bg-gray-300' : 'bg-blue-50'}`}
-          >
-            <FontAwesome6 name='file-lines' size={32} color='rgb(59, 130, 246)' />
+            {selectedMedia && (
+              <View className="bg-white border border-gray-200 rounded-lg p-2.5 mt-3">
+                <Text className="text-gray-800 font-medium text-xs" numberOfLines={1}>{selectedMedia.name}</Text>
+                <Text className="text-gray-500 text-xs mt-0.5">
+                  {selectedMedia.size ? `${(selectedMedia.size / (1024 * 1024)).toFixed(2)} MB` : 'Size unknown'}
+                </Text>
+              </View>
+            )}
+          </View>
 
-            <Text className="text-blue-600 font-bold center text-base text-center mt-2">
-              {status === 'picking' ? 'Opening picker...' : 'Choose SRT file (Optional)'}
-            </Text>
-          </Pressable>
-
-          {selectedSrt && (
-            <View className="w-72 bg-white border border-gray-200 rounded-md p-3 mb-3">
-              <Text className="text-gray-800 font-medium" numberOfLines={1}>{selectedSrt.name}</Text>
-              <Text className="text-gray-500 text-xs">
-                {selectedSrt.size ? `${(selectedSrt.size / 1024).toFixed(2)} KB` : 'Size unknown'}
+          {/* SRT File Picker */}
+          <View className="flex-1">
+            <Text className="text-sm font-semibold text-gray-700 mb-2.5 text-center">SRT (Optional)</Text>
+            <Pressable
+              onPress={pickSrt}
+              disabled={isBusy}
+              className={`h-[100px] items-center justify-center rounded-lg border-2 border-blue-500 ${isBusy ? 'bg-gray-300' : 'bg-blue-50'}`}
+            >
+              <FontAwesome6 name='file-lines' size={32} color='rgb(59, 130, 246)' />
+              <Text className="text-blue-600 font-bold text-xs text-center mt-2 px-2">
+                {status === 'picking' ? 'Opening...' : 'Choose SRT file'}
               </Text>
-            </View>
-          )}
+            </Pressable>
 
-          {/* Parsed SRT Preview */}
-          {selectedSrt && (
-            <SrtDebugViewer srtUri={selectedSrt.uri} srtName={selectedSrt.name} />
-          )}
+            {selectedSrt && (
+              <View className="bg-white border border-gray-200 rounded-lg p-2.5 mt-3">
+                <Text className="text-gray-800 font-medium text-xs" numberOfLines={1}>{selectedSrt.name}</Text>
+                <Text className="text-gray-500 text-xs mt-0.5">
+                  {selectedSrt.size ? `${(selectedSrt.size / 1024).toFixed(2)} KB` : 'Size unknown'}
+                </Text>
+              </View>
+            )}
+          </View>
         </View>
 
         <Pressable
           onPress={mockUpload}
           disabled={!hasAnyFile || status === 'uploading' || 
             (selectedSrt && !selectedMedia) ||
-            (selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i))}
-          className={`mt-4 h-[45px] w-[310px] justify-center items-center px-4 py-2 rounded-md mb-3 ${(!hasAnyFile || status === 'uploading' || 
+            (selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i)) ||
+            !fileNamesMatch}
+          className={`mt-3 h-[48px] w-full justify-center items-center px-4 py-2 rounded-lg mb-3 ${(!hasAnyFile || status === 'uploading' || 
             (selectedSrt && !selectedMedia) ||
-            (selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i))) ? 'bg-darkgrayColor' : 'bg-greenColor'}`}
+            (selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i)) ||
+            !fileNamesMatch) ? 'bg-darkgrayColor' : 'bg-greenColor'}`}
         >
           <View className="flex-row items-center">
             {status === 'uploading' && (
@@ -739,42 +907,65 @@ const Homescreen = () => {
         </Pressable>
 
         {status === 'uploading' && (
-          <View className="w-72 h-3 bg-gray-200 rounded-full overflow-hidden mb-3">
+          <View className="w-full h-3 bg-gray-200 rounded-full overflow-hidden mb-3">
             <View style={{ width: `${progress}%` }} className="h-3 bg-blue-600" />
           </View>
         )}
 
         {/* Validation warnings */}
         {selectedSrt && !selectedMedia && (
-          <View className="w-72 bg-yellow-50 border border-yellow-300 rounded-md p-3 mb-3">
+          <View className="w-full bg-yellow-50 border border-yellow-300 rounded-lg p-3 mb-3">
             <Text className="text-yellow-800 text-sm font-medium">⚠️ SRT file requires a media file</Text>
-            <Text className="text-yellow-700 text-xs">Please select a video or image file first.</Text>
+            <Text className="text-yellow-700 text-xs mt-1">Please select a video or image file first.</Text>
           </View>
         )}
         
         {selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(jpg|jpeg|png|bmp|gif)$/i) && (
-          <View className="w-72 bg-red-50 border border-red-300 rounded-md p-3 mb-3">
+          <View className="w-full bg-red-50 border border-red-300 rounded-lg p-3 mb-3">
             <Text className="text-red-800 text-sm font-medium">❌ SRT files cannot be used with images</Text>
-            <Text className="text-red-700 text-xs">SRT files provide GPS data for video mapping only.</Text>
+            <Text className="text-red-700 text-xs mt-1">SRT files provide GPS data for video mapping only.</Text>
           </View>
         )}
 
         {selectedMedia && !selectedSrt && !!selectedMedia.name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i) && (
-          <View className="w-72 bg-blue-50 border border-blue-300 rounded-md p-3 mb-3">
+          <View className="w-full bg-blue-50 border border-blue-300 rounded-lg p-3 mb-3">
             <Text className="text-blue-800 text-sm font-medium">ℹ️ Video without GPS data</Text>
-            <Text className="text-blue-700 text-xs">Upload an SRT file to enable map visualization of detection locations.</Text>
+            <Text className="text-blue-700 text-xs mt-1">Upload an SRT file to enable map visualization of detection locations.</Text>
           </View>
         )}
 
+        {/* File name validation warning */}
+        {selectedSrt && selectedMedia && !!selectedMedia.name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i) && (() => {
+          const mediaName = selectedMedia.name.toLowerCase()
+          const srtName = selectedSrt.name.toLowerCase()
+          const mediaBaseName = mediaName.replace(/\.(mp4|mov|avi|mkv)$/, '')
+          const srtBaseName = srtName.replace(/\.srt$/, '')
+          
+          if (mediaBaseName !== srtBaseName) {
+            return (
+              <View className="w-full bg-red-50 border border-red-300 rounded-lg p-3 mb-3">
+                <Text className="text-red-800 text-sm font-medium">❌ File names do not match</Text>
+                <Text className="text-red-700 text-xs mt-1">
+                  SRT and video files must have the exact same name (except extension). 
+                  Current: "{selectedMedia.name}" and "{selectedSrt.name}"
+                </Text>
+              </View>
+            )
+          }
+          return null
+        })()}
+
         {!!message && (
-          <Text className={`mt-1 ${status === 'success' ? 'text-green-700' : status === 'error' ? 'text-red-700' : 'text-gray-700'}`}>
-            {message}
-          </Text>
+          <View className="w-full bg-white border border-gray-200 rounded-lg p-3 mb-2">
+            <Text className={`text-sm text-center ${status === 'success' ? 'text-green-700' : status === 'error' ? 'text-red-700' : 'text-gray-700'}`}>
+              {message}
+            </Text>
+          </View>
         )}
 
         {(hasAnyFile || status === 'success' || status === 'error') && (
-          <Pressable onPress={reset} disabled={isBusy} className={`px-4 py-2 rounded-md mt-4 ${isBusy ? 'bg-gray-300' : 'bg-gray-600'}`}>
-            <Text className="text-white font-medium">Reset</Text>
+          <Pressable onPress={reset} disabled={isBusy} className={`px-6 py-3 rounded-lg mt-3 ${isBusy ? 'bg-gray-300' : 'bg-gray-600'}`}>
+            <Text className="text-white font-medium text-base">Reset</Text>
           </Pressable>
         )}
         </View>
