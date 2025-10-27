@@ -10,10 +10,10 @@ IS_RENDER = os.getenv('RENDER') is not None
 IS_LOCAL = not IS_RENDER
 
 # Your Roboflow API key
-ROBOFLOW_API_KEY = "ijyg4acaU8ukH7A5E8dy"
+ROBOFLOW_API_KEY = "2h7Re8zg4Nz9l4515516"
 
 # Your Roboflow project name
-ROBOFLOW_PROJECT = "model8-6-yolov11-acc-8y3xc"
+ROBOFLOW_PROJECT = "thesis_weed-nqcrs"
 
 # Optional: specify workspace explicitly if API key has multiple workspaces
 # Leave blank to use default workspace associated with the API key
