@@ -1,6 +1,9 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import { Dimensions } from 'react-native';
 import { View, Text, ActivityIndicator, Pressable, ScrollView, RefreshControl, Modal, Alert } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import * as Location from 'expo-location';
 import { useRoute } from '@react-navigation/native';
 import { API_BASE } from '../config';
 import { useSession } from '../context/SessionContext';
@@ -82,6 +85,74 @@ type DetectionDetailRow = [
 ];
 
 const Mapscreen = () => {
+  // User location state
+  const [showUserLocation, setShowUserLocation] = useState(false);
+  const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [locationError, setLocationError] = useState<string>('');
+  const [toggleDisabled, setToggleDisabled] = useState(false);
+  
+  // Real-time location tracking when toggled on
+  useEffect(() => {
+    let isMounted = true;
+    let locationSubscription: Location.LocationSubscription | null = null;
+    
+    const startLocationTracking = async () => {
+      setToggleDisabled(true);
+      if (!showUserLocation) {
+        // Stop tracking when toggled off
+        if (locationSubscription) {
+          locationSubscription.remove();
+          locationSubscription = null;
+        }
+        setUserLocation(null);
+        setLocationError('');
+        setToggleDisabled(false);
+        return;
+      }
+      
+      try {
+        setLocationError('');
+        let { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          setLocationError('Permission to access location was denied');
+          setShowUserLocation(false);
+          setToggleDisabled(false);
+          return;
+        }
+        
+        // Start watching location with real-time updates
+        locationSubscription = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.High,
+            timeInterval: 2000, // Update every 2 seconds
+            distanceInterval: 5, // Update when moved 5 meters
+          },
+          (loc) => {
+            if (isMounted) {
+              setUserLocation({ lat: loc.coords.latitude, lng: loc.coords.longitude });
+              console.log('📍 [LOCATION] Updated:', loc.coords.latitude, loc.coords.longitude);
+            }
+          }
+        );
+        
+        console.log('📍 [LOCATION] Started real-time tracking');
+      } catch (e: any) {
+        setLocationError(e?.message || 'Failed to get location');
+        setShowUserLocation(false);
+      }
+      setToggleDisabled(false);
+    };
+    
+    startLocationTracking();
+    
+    return () => {
+      isMounted = false;
+      if (locationSubscription) {
+        locationSubscription.remove();
+        console.log('📍 [LOCATION] Stopped real-time tracking');
+      }
+    };
+  }, [showUserLocation]);
   const { selectedDetection, sessions, refreshSessions, setSelectedDetection } = useSession();
   const insets = useSafeAreaInsets();
   const [scrollEnabled, setScrollEnabled] = useState(true);
@@ -155,8 +226,11 @@ const Mapscreen = () => {
           setBounds(j3?.bounds ?? null);
 
           // Generate heatmap based on unique weeds per GPS location
-          // Smaller grid (0.3m) to show more individual detections along flight path
-          const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=0.3&iou_threshold=0.6&frame_gap=2`);
+          // MORE AGGRESSIVE parameters for 10 FPS drone video:
+          // - grid_size_m=2.0: 2-meter grid cells for agricultural field scale
+          // - iou_threshold=0.5: More lenient matching (50% overlap allows for angle/distance changes)
+          // - frame_gap=20: At 10 FPS, 20 frames = 2.0 seconds (track same weed across longer timespan)
+          const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=2.0&iou_threshold=0.5&frame_gap=20`);
           if (res4.ok) {
             const j4 = await res4.json();
             const heatmapPoints = (j4?.points ?? []).map((point: any) => ({ lat: point.lat, lng: point.lng, weight: point.unique_count || point.weight || 1 }));
@@ -222,22 +296,23 @@ const Mapscreen = () => {
   }, [route?.params, sessions, setSelectedDetection]);
 
   const density = useMemo(() => {
-    // Use heatmap points to calculate density based on unique weed count
+    // Calculate density based on TOTAL UNIQUE WEEDS in each category, not grid cell count
     if (heatPoints.length === 0) {
       return { low: 0, medium: 0, high: 0, gpsPoints: polyline.length };
     }
     
     let low = 0, medium = 0, high = 0;
     
-    // Categorize based on unique weed count per grid cell
+    // Count total weeds (not grid cells) in each density category
     heatPoints.forEach(point => {
-      const count = point.weight;  // Weight represents unique weed count
-      if (count <= 2) {
-        low += 1;
-      } else if (count <= 5) {
-        medium += 1;
+      const weedCount = point.weight;  // Number of unique weeds in this location
+      
+      if (weedCount <= 2) {
+        low += weedCount;  // Add the actual number of weeds, not just 1
+      } else if (weedCount <= 5) {
+        medium += weedCount;
       } else {
-        high += 1;
+        high += weedCount;
       }
     });
     
@@ -258,27 +333,64 @@ const Mapscreen = () => {
   }
 
   return (
-    <ScrollView 
-      className="flex-1 bg-bgColor1"
-      contentContainerStyle={{ alignItems: 'center', paddingTop: insets.top + 24, paddingBottom: 16 }}
-      refreshControl={
-        <RefreshControl
-          refreshing={loading}
-          onRefresh={() => refreshSessions()}
-          colors={['#2563eb']}
-          tintColor="#2563eb"
-        />
-      }
-    >
+    <SafeAreaView className="flex-1 bg-bgColor1" edges={['top']}>
+      <ScrollView 
+        className="flex-1"
+        contentContainerStyle={{ alignItems: 'center', paddingTop: 24, paddingBottom: 16 }}
+        refreshControl={
+          <RefreshControl
+            refreshing={loading}
+            onRefresh={() => refreshSessions()}
+            colors={['#2563eb']}
+            tintColor="#2563eb"
+          />
+        }
+      >
       {/* Map view placed where the green section was */}
-      <View className='h-[310px] w-[95vw] max-w-[420px] rounded-lg overflow-hidden bg-white shadow-custom border-2 border-gray-300 items-center justify-center'>
-        <LeafletWebMap polyline={polyline} heat={heatPoints} setScrollEnabled={setScrollEnabled} />
+      <View style={{
+        height: 310,
+        width: 380,
+        borderRadius: 16,
+        overflow: 'hidden',
+        backgroundColor: 'white',
+        borderWidth: 2,
+        borderColor: '#d1d5db',
+        alignItems: 'center',
+        justifyContent: 'center',
+        shadowColor: '#000',
+        shadowOpacity: 0.08,
+        shadowRadius: 8,
+        shadowOffset: {width: 0, height: 2},
+        position: 'relative'
+      }}>
+        <LeafletWebMap 
+          polyline={polyline} 
+          heat={heatPoints} 
+          setScrollEnabled={setScrollEnabled}
+          userLocation={showUserLocation && userLocation ? userLocation : null}
+          centerOn={showUserLocation && userLocation ? userLocation : null}
+        />
+        {/* Toggle user location button overlay */}
+        <View style={{ position: 'absolute', top: 12, right: 12, zIndex: 10 }}>
+          <Pressable
+            onPress={() => {
+              if (toggleDisabled) return;
+              setShowUserLocation((v) => !v);
+            }}
+            style={{ backgroundColor: showUserLocation ? '#2563eb' : '#fff', borderRadius: 24, padding: 8, borderWidth: 1, borderColor: '#2563eb', elevation: 2, opacity: toggleDisabled ? 0.5 : 1 }}
+            disabled={toggleDisabled}
+          >
+            <Ionicons name="locate" size={24} color={showUserLocation ? '#fff' : '#2563eb'} />
+          </Pressable>
+        </View>
         {/* Overlay loading/error/info on top of map */}
         <View style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', alignItems: 'center', justifyContent: 'center', pointerEvents: 'box-none' }} pointerEvents="box-none">
           {loading ? (
             <ActivityIndicator color="#2563eb" />
           ) : error ? (
             <Text className='text-center text-red-600 bg-white/80 px-4 py-2 rounded'>{error}</Text>
+          ) : locationError ? (
+            <Text className='text-center text-red-600 bg-white/80 px-4 py-2 rounded'>{locationError}</Text>
           ) : selectedDetection && !selectedDetection[10] ? (
             <Text className='text-center text-gray-600 bg-white/80 px-4 py-2 rounded'>No GPS data available for this session</Text>
           ) : null}
@@ -396,16 +508,22 @@ const Mapscreen = () => {
         </View>
         <View className="flex-row justify-between items-center mt-2 w-full">
           <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2">
-            <Text className='text- font-bold'>Low</Text>
-            <Text className='text-base font-medium'>{density.low}</Text>
+            <Text className='text-xs font-bold text-gray-600'>Low Density</Text>
+            <Text className='text-[10px] text-gray-500'>(1-2 per area)</Text>
+            <Text className='text-base font-medium mt-1'>{density.low}</Text>
+            <Text className='text-[9px] text-gray-400'>weeds</Text>
           </View>
           <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2">
-            <Text className='text- font-bold'>Medium</Text>
-            <Text className='text-base font-medium'>{density.medium}</Text>
+            <Text className='text-xs font-bold text-gray-600'>Medium</Text>
+            <Text className='text-[10px] text-gray-500'>(3-5 per area)</Text>
+            <Text className='text-base font-medium mt-1'>{density.medium}</Text>
+            <Text className='text-[9px] text-gray-400'>weeds</Text>
           </View>
           <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2">
-            <Text className='text- font-bold'>High</Text>
-            <Text className='text-base font-medium'>{density.high}</Text>
+            <Text className='text-xs font-bold text-gray-600'>High Density</Text>
+            <Text className='text-[10px] text-gray-500'>(6+ per area)</Text>
+            <Text className='text-base font-medium mt-1'>{density.high}</Text>
+            <Text className='text-[9px] text-gray-400'>weeds</Text>
           </View>
         </View>
         {selectedDetection && (
@@ -443,17 +561,25 @@ const Mapscreen = () => {
             <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2 bg-blue-50">
               <Text className='text-xs font-bold text-gray-600'>Estimated Unique Weeds</Text>
               <Text className='text-2xl font-bold text-blue-600'>{uniqueWeedCount}</Text>
+              <Text className='text-[9px] text-gray-400 mt-1'>Tracked across frames</Text>
             </View>
             <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2 bg-gray-50">
               <Text className='text-xs font-bold text-gray-600'>Total Detections</Text>
               <Text className='text-2xl font-bold text-gray-700'>{totalDetections}</Text>
+              <Text className='text-[9px] text-gray-400 mt-1'>All raw detections</Text>
             </View>
             <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2 bg-green-50">
               <Text className='text-xs font-bold text-gray-600'>Reduction</Text>
               <Text className='text-2xl font-bold text-green-600'>
                 {totalDetections > 0 ? Math.round((1 - uniqueWeedCount / totalDetections) * 100) : 0}%
               </Text>
+              <Text className='text-[9px] text-gray-400 mt-1'>Duplicate removal</Text>
             </View>
+          </View>
+          <View className="bg-blue-50 rounded-lg p-2 mt-3">
+            <Text className='text-[10px] text-gray-600 text-center'>
+              💡 Note: Density totals ({density.low + density.medium + density.high}) show unique weeds categorized by spatial concentration
+            </Text>
           </View>
           <Text className='text-xs text-gray-500 text-center mt-2'>
             Heatmap shows unique weeds by tracking the same weed across frames
@@ -461,69 +587,92 @@ const Mapscreen = () => {
         </View>
       )}
     </ScrollView>
+    </SafeAreaView>
   );
 };
 
 export default Mapscreen;
 
 // WebView Leaflet fallback for Expo Go
-function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoint[], heat: Array<{ lat: number, lng: number, weight: number }>, setScrollEnabled: (enabled: boolean) => void }) {
+function LeafletWebMap({ polyline, heat, setScrollEnabled, userLocation, centerOn }: {
+  polyline: GMapPoint[],
+  heat: Array<{ lat: number, lng: number, weight: number }>,
+  setScrollEnabled: (enabled: boolean) => void,
+  userLocation?: { lat: number, lng: number } | null,
+  centerOn?: { lat: number, lng: number } | null
+}) {
   let WebViewComp: any = null;
   try {
     WebViewComp = require('react-native-webview').WebView;
   } catch (e) {
     return (
-      <View className='flex-1 items-center justify-center p-4'>
-        <Text className='text-center text-gray-700'>WebView not installed.</Text>
-        <Text className='text-center text-gray-500 mt-2'>Run: npx expo install react-native-webview</Text>
+      <View style={{flex: 1, alignItems: 'center', justifyContent: 'center', padding: 16}}>
+        <Text style={{textAlign: 'center', color: '#374151'}}>WebView not installed.</Text>
+        <Text style={{textAlign: 'center', color: '#6b7280', marginTop: 8}}>Run: npx expo install react-native-webview</Text>
       </View>
     );
   }
-  const center = polyline[0] || { lat: 14.5995, lng: 120.9842 };
+  const center = centerOn || (polyline[0] ? polyline[0] : { lat: 14.5995, lng: 120.9842 });
   const coordsJson = JSON.stringify(polyline.map(p => [p.lat, p.lng]));
   const heatJson = JSON.stringify(heat.map(h => [h.lat, h.lng, h.weight]));
-  
+  const userLocJson = userLocation ? JSON.stringify([userLocation.lat, userLocation.lng]) : 'null';
   // Use Google Satellite tiles
   const html = `<!DOCTYPE html>
   <html>
   <head>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@2.4.0/Control.FullScreen.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
-    <style>html, body, #map { height: 100%; margin: 0; padding: 0; touch-action: none; }</style>
+    <script src="https://unpkg.com/leaflet.fullscreen@2.4.0/Control.FullScreen.js"></script>
+    <style>html, body { height: 100%; margin: 0; padding: 0; touch-action: none; } #map { height: 100%; width: 100%; box-sizing: border-box; }</style>
   </head>
   <body>
     <div id="map"></div>
     <script>
-      const map = L.map('map', { zoomControl: true }).setView([${center.lat}, ${center.lng}], 17);
+      const coords = ${coordsJson};
+  const map = L.map('map', { zoomControl: true, fullscreenControl: true }).setView([${center.lat}, ${center.lng}], 17);
+      // User marker logic
+      const userLoc = ${userLocJson};
+      let userMarker = null;
+      if (userLoc) {
+        userMarker = L.marker(userLoc, {
+          icon: L.divIcon({
+            className: 'custom-user-icon',
+            html: '<div style="background-color: #2563eb; width: 22px; height: 22px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>'
+          })
+        }).addTo(map).bindPopup('Your Location');
+        map.setView(userLoc, 18, { animate: true });
+      } else if (coords.length > 1) {
+        // If not showing user location, fit to polyline as before
+        const poly = L.polyline(coords, { color: '#2563eb', weight: 3 });
+        map.fitBounds(poly.getBounds(), { padding: [20, 20] });
+      }
       // Google Satellite tiles
       L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
         maxZoom: 20,
         subdomains: ['mt0','mt1','mt2','mt3'],
         attribution: 'Map data ©2025 Google',
       }).addTo(map);
-      const coords = ${coordsJson};
       if (coords.length > 1) {
         const poly = L.polyline(coords, { color: '#2563eb', weight: 3 }).addTo(map);
         map.fitBounds(poly.getBounds(), { padding: [20, 20] });
-        
         // Add start marker (green)
         const startCoord = coords[0];
         const startIcon = L.divIcon({
           className: 'custom-icon',
-          html: \`<div style="background-color: #22c55e; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>\`,
+          html: '<div style="background-color: #22c55e; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
           iconSize: [20, 20],
           iconAnchor: [10, 10]
         });
         L.marker([startCoord[0], startCoord[1]], { icon: startIcon }).addTo(map)
           .bindPopup('Flight Start');
-        
         // Add end marker (red)
         const endCoord = coords[coords.length - 1];
         const endIcon = L.divIcon({
           className: 'custom-icon',
-          html: \`<div style="background-color: #ef4444; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>\`,
+          html: '<div style="background-color: #ef4444; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
           iconSize: [20, 20],
           iconAnchor: [10, 10]
         });
@@ -546,7 +695,6 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoi
             1.0: 'red'
           }
         }).addTo(map);
-        
         // Add small markers at exact grid cell centers for clarity
         heat.forEach(point => {
           const color = point.weight <= 2 ? '#22c55e' :   // green
@@ -576,5 +724,13 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled }: { polyline: GMapPoi
     if (event?.nativeEvent?.data === 'disableScroll') setScrollEnabled(false);
     if (event?.nativeEvent?.data === 'enableScroll') setScrollEnabled(true);
   };
-  return <WebViewComp originWhitelist={["*"]} source={{ html }} style={{ width: 380, height: 310 }} onMessage={onMessage} />;
+  return <WebViewComp
+    originWhitelist={["*"]}
+    source={{ html }}
+    style={{ width: 380, height: 310, backgroundColor: 'white' }}
+    allowsFullscreenVideo={true}
+    javaScriptEnabled={true}
+    domStorageEnabled={true}
+    mediaPlaybackRequiresUserAction={false}
+    />;
 }

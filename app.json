@@ -1,10 +1,10 @@
 {
   "expo": {
-    "name": "thesis-mobile-app",
+    "name": "Weedefy",
     "slug": "thesis-mobile-app",
     "version": "1.0.1",
     "orientation": "portrait",
-    "icon": "./src/assets/icon.png",
+    "icon": "./src/assets/seedling.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {

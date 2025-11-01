@@ -23,7 +23,11 @@ from .database import (
     insert_detection, insert_detection_details,
     fetch_detection_session, fetch_all_detections, get_detection_statistics,
     upsert_srt_track, reset_compact_tables, update_srt_status, DB_NAME, init_db,
-    fetch_detections_by_class, upsert_heatmap, calculate_unique_weeds
+    fetch_detections_by_class, upsert_heatmap, calculate_unique_weeds,
+    # Job queue management
+    create_processing_job, update_job_status, update_job_result,
+    get_job_status, mark_compression_started, mark_compression_completed,
+    get_pending_compression_jobs, cleanup_old_jobs
 )
 from .srt_parser import parse_srt_file, validate_srt_file
 
@@ -96,15 +100,14 @@ def process_media_background(
     """Process media file in background."""
     try:
         start_time = time.time()
-        processing_jobs[job_id]["status"] = "processing"
-        processing_jobs[job_id]["progress"] = "Running inference..."
+        update_job_status(job_id, "processing", "Running inference...")
         
         # Run inference
         print(f"[Job {job_id}] Starting inference...")
         detections, annotated_source = run_inference_auto(media_path, confidence=confidence, overlap=overlap)
         print(f"[Job {job_id}] Inference completed in {time.time() - start_time:.2f} seconds")
         
-        processing_jobs[job_id]["progress"] = "Uploading to cloud storage..."
+        update_job_status(job_id, "processing", "Uploading to cloud storage...")
         
         # Get file type and process results
         actual_file_type = detect_file_type(media_path)
@@ -194,8 +197,7 @@ def process_media_background(
                 if isinstance(annotated_source, str) and not annotated_source.startswith('http') and os.path.exists(annotated_source):
                     # This is a temp video file path - store it for client download
                     temp_video_path = annotated_source
-                    processing_jobs[job_id]["temp_video_path"] = temp_video_path
-                    processing_jobs[job_id]["original_filename"] = media_filename
+                    # Note: temp_video_path will be saved to DB later in update_job_result()
                     print(f"[Job {job_id}] Temp video ready for client compression: {temp_video_path}")
                     annotated_url = None  # Will be set after client uploads compressed version
                 elif isinstance(annotated_source, str) and annotated_source.startswith('http'):
@@ -225,11 +227,15 @@ def process_media_background(
         except Exception:
             annotated_url = cloud_result.get('secure_url') if cloud_result else None
 
-        processing_jobs[job_id]["progress"] = "Saving to database..."
+        update_job_status(job_id, "processing", "Saving to database...")
+        
+        # Get original filename from job (for consistent naming between continuous and resumed uploads)
+        job_data = get_job_status(job_id)
+        display_filename = job_data.get("original_filename", media_filename) if job_data else media_filename
         
         # Insert detection record
         detection_id = insert_detection(
-            filename=media_filename,
+            filename=display_filename,
             timestamp=timestamp,
             file_type=actual_file_type,
             summary=summary,
@@ -404,9 +410,8 @@ def process_media_background(
         except Exception:
             pass
 
-        # Mark as completed
-        processing_jobs[job_id]["status"] = "completed"
-        processing_jobs[job_id]["result"] = {
+        # Mark as completed - SAVE TO DATABASE
+        result_data = {
             "message": f"File uploaded and processed successfully{srt_message}",
             "detection_id": detection_id,
             "summary": summary,
@@ -418,6 +423,17 @@ def process_media_background(
             "cloud_annotated_url": annotated_url,
             "needs_client_compression": temp_video_path is not None,  # Flag for mobile app
         }
+        
+        # Update database with result
+        update_job_result(
+            job_id=job_id,
+            detection_id=detection_id,
+            result_json=json.dumps(result_data),
+            annotated_url=annotated_url,
+            temp_video_path=temp_video_path,
+            needs_compression=(temp_video_path is not None)
+        )
+        
         print(f"[Job {job_id}] Processing completed successfully")
         
         if temp_video_path:
@@ -426,8 +442,9 @@ def process_media_background(
     except Exception as e:
         print(f"[Job {job_id}] Processing failed: {e}")
         traceback.print_exc()
-        processing_jobs[job_id]["status"] = "failed"
-        processing_jobs[job_id]["error"] = str(e)
+        
+        # Save error to database
+        update_job_status(job_id, "failed", error_message=str(e))
         
         # Cleanup temp files
         try:
@@ -484,13 +501,14 @@ async def upload_combined_files(
     tmp.close()
     media_path = tmp.name
     
-    # Initialize job status
-    processing_jobs[job_id] = {
-        "status": "queued",
-        "progress": "Uploaded, starting processing...",
-        "result": None,
-        "error": None
-    }
+    # Create job in database for persistence
+    create_processing_job(
+        job_id=job_id,
+        original_filename=media_file.filename,
+        is_video=is_video,
+        is_image=is_image,
+        has_srt=(srt_file is not None)
+    )
     
     # Start background processing
     background_tasks.add_task(
@@ -516,20 +534,29 @@ async def upload_combined_files(
     })
 
 @app.get("/job-status/{job_id}")
-async def get_job_status(job_id: str):
+async def get_job_status_endpoint(job_id: str):
     """Check the status of a background processing job."""
-    if job_id not in processing_jobs:
+    job_data = get_job_status(job_id)
+    
+    if not job_data:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    job_data = processing_jobs[job_id]
+    # Parse result_json if available
+    result = None
+    if job_data["result_json"]:
+        try:
+            result = json.loads(job_data["result_json"])
+        except:
+            result = None
     
     return JSONResponse({
-        "job_id": job_id,
+        "job_id": job_data["job_id"],
         "status": job_data["status"],
-        "progress": job_data.get("progress"),
-        "result": job_data.get("result"),
-        "error": job_data.get("error"),
-        "temp_video_path": job_data.get("temp_video_path")  # For client-side compression
+        "progress": job_data["progress"],
+        "result": result,
+        "error": job_data["error_message"],
+        "temp_video_path": job_data["temp_video_path"],
+        "needs_client_compression": job_data["needs_client_compression"]
     })
 
 @app.get("/download-temp-video/{job_id}")
@@ -537,14 +564,18 @@ async def download_temp_video(job_id: str):
     """Download temporary annotated video for client-side compression."""
     from fastapi.responses import FileResponse
     
-    if job_id not in processing_jobs:
+    job_data = get_job_status(job_id)
+    
+    if not job_data:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    job_data = processing_jobs[job_id]
     temp_video_path = job_data.get("temp_video_path")
     
     if not temp_video_path or not os.path.exists(temp_video_path):
         raise HTTPException(status_code=404, detail="Temp video not found")
+    
+    # Mark that compression has started
+    mark_compression_started(job_id)
     
     return FileResponse(
         temp_video_path,
@@ -558,10 +589,10 @@ async def upload_compressed_video(
     compressed_video: UploadFile = File(..., description="Client-compressed video")
 ):
     """Receive compressed video from client and upload to Cloudinary."""
-    if job_id not in processing_jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
+    job_data = get_job_status(job_id)
     
-    job_data = processing_jobs[job_id]
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Job not found")
     
     try:
         # Read compressed video
@@ -576,7 +607,9 @@ async def upload_compressed_video(
         
         # Upload to Cloudinary
         from .cloudinary_utils import upload_video_streaming
-        detection_id = job_data.get("result", {}).get("detection_id")
+        
+        # Parse result to get detection_id and filename
+        detection_id = job_data.get("detection_id")
         original_filename = job_data.get("original_filename", "video.mp4")
         
         uploaded = upload_video_streaming(
@@ -591,8 +624,6 @@ async def upload_compressed_video(
         
         # Update database with annotated URL
         if detection_id:
-            import sqlite3
-            from .database import DB_NAME
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             try:
@@ -607,9 +638,8 @@ async def upload_compressed_video(
             finally:
                 conn.close()
         
-        # Update job result
-        if "result" in job_data:
-            job_data["result"]["cloud_annotated_url"] = annotated_url
+        # Mark compression as completed in job queue
+        mark_compression_completed(job_id, annotated_url)
         
         # Cleanup temp files
         try:
@@ -617,7 +647,6 @@ async def upload_compressed_video(
             temp_video_path = job_data.get("temp_video_path")
             if temp_video_path and os.path.exists(temp_video_path):
                 os.remove(temp_video_path)
-                job_data["temp_video_path"] = None
         except Exception:
             pass
         
@@ -629,6 +658,99 @@ async def upload_compressed_video(
         
     except Exception as e:
         print(f"[Job {job_id}] Error uploading compressed video: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ========== JOB RECOVERY ENDPOINTS ==========
+
+@app.get("/jobs/pending-compression")
+async def get_pending_compression_jobs_endpoint():
+    """Get all jobs waiting for client-side compression."""
+    try:
+        jobs = get_pending_compression_jobs()
+        return JSONResponse({
+            "success": True,
+            "jobs": jobs,
+            "count": len(jobs)
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/jobs/{job_id}/resume-compression")
+async def resume_compression(job_id: str):
+    """Resume compression workflow for a job after connectivity loss."""
+    job_data = get_job_status(job_id)
+    
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    if not job_data["needs_client_compression"]:
+        return JSONResponse({
+            "success": False,
+            "message": "Job does not need compression"
+        })
+    
+    if not job_data["temp_video_path"] or not os.path.exists(job_data["temp_video_path"]):
+        return JSONResponse({
+            "success": False,
+            "message": "Temp video no longer available"
+        })
+    
+    return JSONResponse({
+        "success": True,
+        "message": "Job ready for compression resumption",
+        "job_id": job_id,
+        "temp_video_available": True,
+        "detection_id": job_data["detection_id"]
+    })
+
+@app.delete("/jobs/{job_id}")
+async def cancel_job_delete(job_id: str):
+    """Cancel a job and clean up resources (DELETE method)."""
+    return await cancel_job_logic(job_id)
+
+@app.post("/cancel-job/{job_id}")
+async def cancel_job_post(job_id: str):
+    """Cancel a job and clean up resources (POST method for frontend)."""
+    return await cancel_job_logic(job_id)
+
+async def cancel_job_logic(job_id: str):
+    """Shared logic for cancelling a job."""
+    job_data = get_job_status(job_id)
+    
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    try:
+        print(f"[Job {job_id}] 🛑 Cancellation requested by user")
+        
+        # Clean up temp files
+        if job_data.get("temp_video_path") and os.path.exists(job_data["temp_video_path"]):
+            os.remove(job_data["temp_video_path"])
+            print(f"[Job {job_id}] Removed temp video file")
+        
+        # Mark as failed/cancelled in database
+        update_job_status(job_id, "failed", error_message="Cancelled by user")
+        print(f"[Job {job_id}] Marked as cancelled in database")
+        
+        return JSONResponse({
+            "success": True,
+            "message": "Job cancelled successfully"
+        })
+    except Exception as e:
+        print(f"[Job {job_id}] ❌ Error cancelling job: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/jobs/cleanup")
+async def cleanup_old_jobs_endpoint(days: int = Query(7, description="Clean up jobs older than X days")):
+    """Clean up old completed/failed jobs."""
+    try:
+        deleted_count = cleanup_old_jobs(days)
+        return JSONResponse({
+            "success": True,
+            "message": f"Cleaned up {deleted_count} old jobs",
+            "deleted_count": deleted_count
+        })
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/upload/")
@@ -681,13 +803,14 @@ async def upload_file(
     tmp.close()
     file_path = tmp.name
     
-    # Initialize job status
-    processing_jobs[job_id] = {
-        "status": "queued",
-        "progress": "Uploaded, starting processing...",
-        "result": None,
-        "error": None
-    }
+    # Create job in database for persistence
+    create_processing_job(
+        job_id=job_id,
+        original_filename=file.filename,
+        is_video=is_video,
+        is_image=is_image,
+        has_srt=False
+    )
     
     # Start background processing (reuse the same function)
     background_tasks.add_task(
@@ -1374,53 +1497,96 @@ async def get_unique_weeds_heatmap(
         r = 6371000  # Radius of earth in meters
         return c * r
     
-    # Improved tracking: Use spatial clustering for better accuracy with 10 FPS
-    # Group detections by GPS location first, then count unique spatial clusters
+    # Improved tracking algorithm for 10 FPS drone video
+    # At 10 FPS, typical agricultural drone (3-5 m/s) covers 0.3-0.5m per frame
+    # Same weed visible for 1-3 seconds = 10-30 frames at 10 FPS
+    # Use IoU + GPS + temporal tracking to avoid over-counting
     
-    spatial_clusters = {}
+    # Sort detections by frame number for temporal tracking
+    detections_with_gps_sorted = sorted(detections_with_gps, key=lambda x: x['frame_num'])
     
-    for det in detections_with_gps:
+    tracks = []
+    TEMPORAL_FRAME_GAP = max(frame_gap, 20)  # At 10 FPS, 20 frames = 2.0 seconds (longer tracking window)
+    GPS_CLUSTER_THRESHOLD_M = 1.0  # Weeds within 1.0m are likely the same plant (slightly relaxed for better merging)
+    MIN_MATCH_SCORE = 0.4  # Reduced from 0.5 - allow weaker matches to merge more tracks
+    
+    for det in detections_with_gps_sorted:
         det_id = det['id']
         frame_num = det['frame_num']
         weed_class = det['class']
         confidence = det['confidence']
         box = det['bbox']
-        gps_coords = det['gps']
-        gps_lat, gps_lon = gps_coords
+        gps_lat, gps_lon = det['gps']
         
-        # Create spatial cluster key based on GPS
-        # Using 6 decimal places (~0.1m) to preserve individual detection locations
-        # This ensures each unique weed location along the flight path is shown
-        spatial_key = (round(gps_lat, 6), round(gps_lon, 6))
-        full_key = (weed_class, spatial_key)
+        matched_track = None
+        best_score = 0.0
         
-        if full_key not in spatial_clusters:
-            spatial_clusters[full_key] = {
+        # Try to match with existing tracks (same class)
+        for track in tracks:
+            if track['weed_class'] != weed_class:
+                continue
+            
+            # Check temporal gap (must be within frame window)
+            frame_diff = frame_num - track['last_frame']
+            if frame_diff > TEMPORAL_FRAME_GAP or frame_diff < 0:
+                continue
+            
+            # Calculate IoU with track's last bounding box
+            iou = calculate_iou(box, track['last_bbox'])
+            
+            # Calculate GPS distance to track's last position
+            gps_dist = calculate_gps_distance(gps_lat, gps_lon, track['last_gps'][0], track['last_gps'][1])
+            
+            # Matching criteria: Require BOTH good IoU AND close GPS OR very high IoU alone
+            score = 0.0
+            if iou >= iou_threshold:
+                # Strong spatial match in image space
+                if gps_dist is not None and gps_dist <= GPS_CLUSTER_THRESHOLD_M:
+                    # Both IoU and GPS agree - strong match
+                    score = iou * 2.5
+                elif iou >= 0.8:
+                    # Very high IoU even without GPS confirmation
+                    score = iou * 1.5
+                else:
+                    # Decent IoU but GPS is far or unknown - weaker match
+                    score = iou * 0.8
+            elif gps_dist is not None and gps_dist <= GPS_CLUSTER_THRESHOLD_M:
+                # Close GPS but low IoU - could be same weed from different angle
+                score = 0.5 / (1.0 + gps_dist)
+            
+            if score > best_score:
+                best_score = score
+                matched_track = track
+        
+        if matched_track is not None and best_score >= MIN_MATCH_SCORE:
+            # Update existing track
+            matched_track['detections'].append(det)
+            matched_track['detection_ids'].append(det_id)
+            matched_track['frames'].append(frame_num)
+            matched_track['gps_coords'].append((gps_lat, gps_lon))
+            matched_track['count'] += 1
+            matched_track['last_frame'] = frame_num
+            matched_track['last_bbox'] = box
+            matched_track['last_gps'] = (gps_lat, gps_lon)
+            matched_track['avg_confidence'] = (matched_track['avg_confidence'] * (matched_track['count'] - 1) + confidence) / matched_track['count']
+        else:
+            # Create new track
+            tracks.append({
                 'weed_class': weed_class,
-                'detections': [],
-                'detection_ids': [],
-                'frames': [],
-                'gps_coords': [],
-                'avg_confidence': 0,
-                'count': 0,
+                'detections': [det],
+                'detection_ids': [det_id],
+                'frames': [frame_num],
+                'gps_coords': [(gps_lat, gps_lon)],
+                'avg_confidence': confidence,
+                'count': 1,
                 'first_frame': frame_num,
-                'last_frame': frame_num
-            }
-        
-        cluster = spatial_clusters[full_key]
-        cluster['detections'].append(det)
-        cluster['detection_ids'].append(det_id)
-        cluster['frames'].append(frame_num)
-        cluster['gps_coords'].append(gps_coords)
-        cluster['avg_confidence'] = (cluster['avg_confidence'] * cluster['count'] + confidence) / (cluster['count'] + 1)
-        cluster['count'] += 1
-        cluster['last_frame'] = max(cluster['last_frame'], frame_num)
-        cluster['first_frame'] = min(cluster['first_frame'], frame_num)
+                'last_frame': frame_num,
+                'last_bbox': box,
+                'last_gps': (gps_lat, gps_lon)
+            })
     
-    # Convert clusters to tracks format
-    tracks = list(spatial_clusters.values())
-    
-    print(f"[Heatmap] Identified {len(tracks)} unique weeds from {len(detections_with_gps)} GPS-matched detections")
+    print(f"[Heatmap] Tracked {len(tracks)} unique weeds from {len(detections_with_gps)} GPS-matched detections using temporal+spatial tracking")
+    print(f"[Heatmap] Tracking params: IoU≥{iou_threshold}, frame_gap≤{TEMPORAL_FRAME_GAP}, GPS≤{GPS_CLUSTER_THRESHOLD_M}m, min_score≥{MIN_MATCH_SCORE}")
     
     # Now we have unique weeds (tracks), assign each to GPS grid cells
     if not tracks or not any(t['gps_coords'] for t in tracks):
@@ -1691,7 +1857,7 @@ async def export_report(
             from reportlab.lib import colors
             from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
             from reportlab.lib.units import inch
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
             from reportlab.lib.enums import TA_CENTER, TA_LEFT
             
             buffer = io.BytesIO()
@@ -1736,6 +1902,256 @@ async def export_report(
             ]))
             story.append(session_table)
             story.append(Spacer(1, 0.3*inch))
+            
+            # Heatmap image if SRT data available
+            if has_srt_data:
+                try:
+                    # Get heatmap data
+                    heatmap_response = await get_unique_weeds_heatmap(detection_id, 0.6, 2, 0.3, False)
+                    points = heatmap_response.get('points', [])
+                    
+                    if points:
+                        # Generate heatmap image using folium (Leaflet) like Mapscreen
+                        import folium
+                        from folium.plugins import HeatMap
+                        import selenium
+                        from selenium import webdriver
+                        from selenium.webdriver.chrome.options import Options
+                        from webdriver_manager.chrome import ChromeDriverManager
+                        import tempfile
+                        import os
+                        
+                        # Create folium map with same settings as Mapscreen
+                        if points:
+                            # Calculate center
+                            avg_lat = sum(p['lat'] for p in points) / len(points)
+                            avg_lng = sum(p['lng'] for p in points) / len(points)
+                            
+                            # Create map with Google Satellite tiles (same as Mapscreen)
+                            m = folium.Map(
+                                location=[avg_lat, avg_lng],
+                                zoom_start=17,
+                                max_zoom=20
+                            )
+                            
+                            # Add Google Satellite tiles like Mapscreen
+                            folium.TileLayer(
+                                tiles='https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+                                attr='Map data ©2025 Google',
+                                name='Google Satellite',
+                                max_zoom=20,
+                                subdomains=['mt0', 'mt1', 'mt2', 'mt3']
+                            ).add_to(m)
+                            
+                            # Add polyline if we have SRT data (flight path)
+                            try:
+                                polyline_response = await get_gmap_polyline(detection_id)
+                                polyline_points = polyline_response.get('points', [])
+                                if polyline_points:
+                                    folium.PolyLine(
+                                        locations=[[p['lat'], p['lng']] for p in polyline_points],
+                                        color='#2563eb',
+                                        weight=3
+                                    ).add_to(m)
+                                    
+                                    # Add start marker (green)
+                                    if polyline_points:
+                                        start_point = polyline_points[0]
+                                        folium.Marker(
+                                            location=[start_point['lat'], start_point['lng']],
+                                            icon=folium.DivIcon(
+                                                html='<div style="background-color: #22c55e; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
+                                                icon_size=(20, 20),
+                                                icon_anchor=(10, 10)
+                                            ),
+                                            popup='Flight Start'
+                                        ).add_to(m)
+                                        
+                                        # Add end marker (red)
+                                        end_point = polyline_points[-1]
+                                        folium.Marker(
+                                            location=[end_point['lat'], end_point['lng']],
+                                            icon=folium.DivIcon(
+                                                html='<div style="background-color: #ef4444; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
+                                                icon_size=(20, 20),
+                                                icon_anchor=(10, 10)
+                                            ),
+                                            popup='Flight End'
+                                        ).add_to(m)
+                            except Exception as e:
+                                print(f"Error adding polyline: {e}")
+                            
+                            # Add heatmap layer with exact same settings as Mapscreen
+                            heat_data = [[p['lat'], p['lng'], p['weight']] for p in points]
+                            from folium.plugins import HeatMap
+                            HeatMap(
+                                heat_data,
+                                radius=6,            # Reduced radius for smaller, tighter heat points
+                                blur=6,              # Slightly less blur to keep points distinct
+                                max_zoom=18,
+                                max=4,               # Lower max to make low-density areas more visible
+                                gradient={           # Custom gradient: green (low) -> yellow -> red (high)
+                                    0.0: 'green',
+                                    0.3: 'lime',
+                                    0.5: 'yellow',
+                                    0.7: 'orange',
+                                    1.0: 'red'
+                                }
+                            ).add_to(m)
+                            
+                            # Fit bounds
+                            if len(points) > 1:
+                                m.fit_bounds([
+                                    [min(p['lat'] for p in points), min(p['lng'] for p in points)],
+                                    [max(p['lat'] for p in points), max(p['lng'] for p in points)]
+                                ])
+                            
+                            # Save to temporary HTML file
+                            with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+                                html_file = f.name
+                                m.save(html_file)
+                            
+                            # Take screenshot using selenium
+                            chrome_options = Options()
+                            chrome_options.add_argument('--headless')
+                            chrome_options.add_argument('--no-sandbox')
+                            chrome_options.add_argument('--disable-dev-shm-usage')
+                            chrome_options.add_argument('--window-size=800,600')
+                            
+                            try:
+                                from selenium.webdriver.chrome.service import Service
+                                service = Service(ChromeDriverManager().install())
+                                driver = webdriver.Chrome(service=service, options=chrome_options)
+                                driver.get(f'file://{html_file}')
+                                # Wait for map to load
+                                import time
+                                time.sleep(5)  # Increased wait time for tiles to load
+                                # Take screenshot
+                                screenshot = driver.get_screenshot_as_png()
+                                driver.quit()
+                                
+                                # Convert to BytesIO for PDF
+                                from io import BytesIO
+                                img_buffer = BytesIO(screenshot)
+                                
+                                # Add to PDF
+                                story.append(Paragraph("GPS Heatmap", styles['Heading2']))
+                                story.append(Spacer(1, 0.1*inch))
+                                heatmap_img = Image(img_buffer, width=6*inch, height=4*inch)
+                                story.append(heatmap_img)
+                                story.append(Spacer(1, 0.2*inch))
+                                
+                                # Add legend
+                                story.append(Paragraph("Map Legend", styles['Heading3']))
+                                story.append(Spacer(1, 0.1*inch))
+                                
+                                # Create legend table with color indicators
+                                legend_data = [
+                                    ['Low Density', '≤2 weeds', 'Medium Density', '3-5 weeds', 'High Density', '>5 weeds'],
+                                    ['Flight Path', 'Blue line', 'Start Point', 'Green marker', 'End Point', 'Red marker']
+                                ]
+                                
+                                legend_table = Table(legend_data, colWidths=[1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch])
+                                legend_table.setStyle(TableStyle([
+                                    # Header row styling
+                                    ('BACKGROUND', (0, 0), (5, 0), colors.HexColor('#f3f4f6')),
+                                    ('TEXTCOLOR', (0, 0), (5, 0), colors.black),
+                                    ('ALIGN', (0, 0), (5, 0), 'CENTER'),
+                                    ('FONTNAME', (0, 0), (5, 0), 'Helvetica-Bold'),
+                                    ('FONTSIZE', (0, 0), (5, 0), 10),
+                                    ('BOTTOMPADDING', (0, 0), (5, 0), 8),
+                                    
+                                    # Data row styling
+                                    ('BACKGROUND', (0, 1), (5, 1), colors.HexColor('#ffffff')),
+                                    ('TEXTCOLOR', (0, 1), (5, 1), colors.black),
+                                    ('ALIGN', (0, 1), (5, 1), 'CENTER'),
+                                    ('FONTSIZE', (0, 1), (5, 1), 9),
+                                    ('GRID', (0, 0), (5, 1), 0.5, colors.grey),
+                                    
+                                    # Color indicators for density levels
+                                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#22c55e')),  # Low - green
+                                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor('#eab308')),  # Medium - yellow
+                                    ('BACKGROUND', (4, 0), (4, 0), colors.HexColor('#ef4444')),  # High - red
+                                    
+                                    # Color indicators for markers
+                                    ('BACKGROUND', (0, 1), (0, 1), colors.HexColor('#2563eb')),  # Path - blue
+                                    ('BACKGROUND', (2, 1), (2, 1), colors.HexColor('#22c55e')),  # Start - green
+                                    ('BACKGROUND', (4, 1), (4, 1), colors.HexColor('#ef4444')),  # End - red
+                                ]))
+                                story.append(legend_table)
+                                story.append(Spacer(1, 0.3*inch))
+                                
+                            except Exception as e:
+                                print(f"Error taking screenshot: {e}")
+                                # Fallback to matplotlib if selenium fails
+                                import matplotlib.pyplot as plt
+                                fig, ax = plt.subplots(figsize=(6, 4))
+                                lats = [p['lat'] for p in points]
+                                lngs = [p['lng'] for p in points]
+                                weights = [p['weight'] for p in points]
+                                scatter = ax.scatter(lngs, lats, c=weights, cmap='RdYlGn_r', s=50, alpha=0.7, edgecolors='black')
+                                ax.set_xlabel('Longitude')
+                                ax.set_ylabel('Latitude')
+                                ax.set_title('Weed Detection Heatmap')
+                                ax.grid(True, alpha=0.3)
+                                cbar = plt.colorbar(scatter, ax=ax)
+                                cbar.set_label('Unique Weed Count')
+                                img_buffer = BytesIO()
+                                fig.savefig(img_buffer, format='png', dpi=100, bbox_inches='tight')
+                                img_buffer.seek(0)
+                                plt.close(fig)
+                                story.append(Paragraph("GPS Heatmap", styles['Heading2']))
+                                story.append(Spacer(1, 0.1*inch))
+                                heatmap_img = Image(img_buffer, width=6*inch, height=4*inch)
+                                story.append(heatmap_img)
+                                story.append(Spacer(1, 0.2*inch))
+                                
+                                # Add legend
+                                story.append(Paragraph("Map Legend", styles['Heading3']))
+                                story.append(Spacer(1, 0.1*inch))
+                                
+                                # Create legend table with color indicators
+                                legend_data = [
+                                    ['Low Density', '≤2 weeds', 'Medium Density', '3-5 weeds', 'High Density', '>5 weeds'],
+                                    ['Flight Path', 'Blue line', 'Start Point', 'Green marker', 'End Point', 'Red marker']
+                                ]
+                                
+                                legend_table = Table(legend_data, colWidths=[1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch])
+                                legend_table.setStyle(TableStyle([
+                                    # Header row styling
+                                    ('BACKGROUND', (0, 0), (5, 0), colors.HexColor('#f3f4f6')),
+                                    ('TEXTCOLOR', (0, 0), (5, 0), colors.black),
+                                    ('ALIGN', (0, 0), (5, 0), 'CENTER'),
+                                    ('FONTNAME', (0, 0), (5, 0), 'Helvetica-Bold'),
+                                    ('FONTSIZE', (0, 0), (5, 0), 10),
+                                    ('BOTTOMPADDING', (0, 0), (5, 0), 8),
+                                    
+                                    # Data row styling
+                                    ('BACKGROUND', (0, 1), (5, 1), colors.HexColor('#ffffff')),
+                                    ('TEXTCOLOR', (0, 1), (5, 1), colors.black),
+                                    ('ALIGN', (0, 1), (5, 1), 'CENTER'),
+                                    ('FONTSIZE', (0, 1), (5, 1), 9),
+                                    ('GRID', (0, 0), (5, 1), 0.5, colors.grey),
+                                    
+                                    # Color indicators for density levels
+                                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#22c55e')),  # Low - green
+                                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor('#eab308')),  # Medium - yellow
+                                    ('BACKGROUND', (4, 0), (4, 0), colors.HexColor('#ef4444')),  # High - red
+                                    
+                                    # Color indicators for markers
+                                    ('BACKGROUND', (0, 1), (0, 1), colors.HexColor('#2563eb')),  # Path - blue
+                                    ('BACKGROUND', (2, 1), (2, 1), colors.HexColor('#22c55e')),  # Start - green
+                                    ('BACKGROUND', (4, 1), (4, 1), colors.HexColor('#ef4444')),  # End - red
+                                ]))
+                                story.append(legend_table)
+                                story.append(Spacer(1, 0.3*inch))
+                            finally:
+                                # Clean up temp file
+                                if os.path.exists(html_file):
+                                    os.unlink(html_file)
+                except Exception as e:
+                    print(f"Error generating heatmap image: {e}")
+                    # Continue without heatmap
             
             # Weed class summary
             story.append(Paragraph("Weed Species Summary", styles['Heading2']))

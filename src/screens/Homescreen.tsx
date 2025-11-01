@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { View, Text, Pressable, ActivityIndicator, ScrollView, RefreshControl, Alert } from 'react-native'
+import { SafeAreaView } from 'react-native-safe-area-context'
 import * as DocumentPicker from 'expo-document-picker'
 import * as ImagePicker from 'expo-image-picker'
 import * as FileSystem from 'expo-file-system'
@@ -7,6 +8,7 @@ import { Ionicons, FontAwesome6 } from '@expo/vector-icons'
 import { Video, Image as CompressorImage } from 'react-native-compressor'
 import { useSession } from '../context/SessionContext'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
+import { saveActiveJob, getActiveJob, clearActiveJob } from '../utils/jobRecovery'
 function guessMimeType(name: string): string {
   const lower = name.toLowerCase()
   if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
@@ -40,9 +42,13 @@ console.log('API_BASE =', API_BASE)
 
 // Automatic client-side video compression handler
 async function handleClientCompression(jobId: string, result: any, onProgress?: (message: string) => void): Promise<any> {
+  // Update job stage to compression
+  await saveActiveJob(jobId, 'compression')
+  
   if (!result.needs_client_compression) {
     // No compression needed (image or already has annotated URL)
     console.log('ℹ️  [COMPRESS] No client compression needed')
+    await clearActiveJob()
     return result
   }
   
@@ -160,6 +166,9 @@ async function handleClientCompression(jobId: string, result: any, onProgress?: 
     result.cloud_annotated_url = uploadResponse.annotated_url
     onProgress?.('Video compression complete!')
     
+    // Clear active job after successful compression
+    await clearActiveJob()
+    
     return result
     
   } catch (error: any) {
@@ -167,6 +176,7 @@ async function handleClientCompression(jobId: string, result: any, onProgress?: 
     onProgress?.(`Compression error: ${error.message || 'Unknown error'}`)
     // Return original result even if compression fails
     // The detection results are still valid, just no annotated video
+    // Keep job in storage in case user wants to retry
     return result
   }
 }
@@ -207,6 +217,9 @@ async function uploadFileToApi(uri: string, name: string, onProgress?: (message:
   const jobId = uploadResult.job_id
   console.log('✅ [UPLOAD] Upload successful! Job ID:', jobId)
   console.log('✅ [UPLOAD] Message:', uploadResult.message)
+  
+  // Save job ID to local storage for recovery
+  await saveActiveJob(jobId, 'processing')
   
   // Step 2: Poll for results
   const isVideo = name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i)
@@ -252,11 +265,18 @@ async function uploadFileToApi(uri: string, name: string, onProgress?: (message:
       if (status.result.needs_client_compression) {
         console.log('🗜️  [AUTO] Starting automatic client-side compression workflow')
         finalResult = await handleClientCompression(jobId, status.result, onProgress)
+        // Job cleared inside handleClientCompression after upload completes
+      } else {
+        // No compression needed, clear job now
+        await clearActiveJob()
+        console.log('🗑️  [COMBINED] Cleared job from AsyncStorage (no compression needed)')
       }
       
       return finalResult
     } else if (status.status === 'failed') {
       console.error('❌ [POLLING] Processing failed:', status.error)
+      await clearActiveJob()
+      console.log('🗑️  [COMBINED] Cleared failed job from AsyncStorage')
       throw new Error(`Processing failed: ${status.error}`)
     }
     
@@ -323,6 +343,10 @@ async function uploadCombinedFiles(mediaFile: SelectedFile, srtFile: SelectedFil
   const jobId = uploadResult.job_id
   console.log('✅ [COMBINED] Upload successful! Job ID:', jobId)
   console.log('✅ [COMBINED] Message:', uploadResult.message)
+
+  // Save job ID to local storage for recovery
+  await saveActiveJob(jobId, 'processing')
+  console.log('💾 [COMBINED] Saved job to AsyncStorage for recovery')
 
   // Step 2: Poll for results
   const isVideo = mediaFile.name.toLowerCase().match(/\.(mp4|mov|avi|mkv)$/i)
@@ -401,11 +425,257 @@ const Homescreen = () => {
   const [message, setMessage] = useState<string>('')
   const progressTimerRef = useRef<number | null>(null)
 
+  // Helper function to auto-select newly uploaded session
+  const autoSelectSession = async (detection_id: number) => {
+    try {
+      const { API_BASE } = await import('../config');
+      const res = await fetch(`${API_BASE}/detections/`);
+      const json = await res.json();
+      const updatedSessions = json?.detections ?? [];
+      
+      const newSession = updatedSessions.find((s: any) => s[0] === detection_id);
+      if (newSession) {
+        setSelectedDetection(newSession);
+        console.log('✅ [AUTO-SELECT] Selected session:', detection_id);
+      }
+    } catch (error) {
+      console.error('❌ [AUTO-SELECT] Failed:', error);
+    }
+  }
+
+  // Check for pending jobs on mount
   useEffect(() => {
+    checkForPendingJobs()
     return () => {
       if (progressTimerRef.current !== null) clearInterval(progressTimerRef.current)
     }
   }, [])
+
+  const checkForPendingJobs = async () => {
+    console.log('🔍 [RECOVERY] checkForPendingJobs called')
+    try {
+      // Check for active job stored locally
+      const activeJob = await getActiveJob()
+      console.log('🔍 [RECOVERY] getActiveJob result:', activeJob)
+      if (!activeJob) {
+        console.log('🔍 [RECOVERY] No active job found in AsyncStorage')
+        return
+      }
+
+      const { job_id, stage } = activeJob
+      console.log(`📋 [RECOVERY] Found active job: ${job_id}, stage: ${stage}`)
+
+      // Check job status on server
+      console.log(`🔍 [RECOVERY] Fetching job status from: ${API_BASE}/job-status/${job_id}`)
+      const statusResponse = await fetch(`${API_BASE}/job-status/${job_id}`)
+      console.log(`🔍 [RECOVERY] Status response OK:`, statusResponse.ok)
+      if (!statusResponse.ok) {
+        console.log('📋 [RECOVERY] Job not found on server, clearing local storage')
+        await clearActiveJob()
+        return
+      }
+
+      const jobStatus = await statusResponse.json()
+      console.log(`📋 [RECOVERY] Job status:`, jobStatus.status)
+      console.log(`📋 [RECOVERY] needs_client_compression:`, jobStatus.needs_client_compression)
+      console.log(`📋 [RECOVERY] temp_video_path:`, jobStatus.temp_video_path)
+      console.log(`📋 [RECOVERY] Full jobStatus:`, JSON.stringify(jobStatus, null, 2))
+
+      // Check for jobs waiting for client compression (top-level field from backend)
+      if (jobStatus.status === 'completed' && jobStatus.needs_client_compression) {
+        Alert.alert(
+          'Resume Upload?',
+          'Your video is processed and ready for compression. Would you like to continue?',
+          [
+            {
+              text: 'Cancel Job',
+              style: 'destructive',
+              onPress: async () => {
+                await clearActiveJob()
+                console.log('🗑️  [RECOVERY] User cancelled compression, cleared AsyncStorage')
+                
+                // Optionally clean up temp video on backend
+                try {
+                  await fetch(`${API_BASE}/cancel-job/${job_id}`, { method: 'POST' })
+                } catch (error) {
+                  console.log('⚠️  [RECOVERY] Could not notify backend of cancellation')
+                }
+                
+                setStatus('idle')
+                setMessage('')
+              }
+            },
+            {
+              text: 'Resume',
+              onPress: async () => {
+                setStatus('uploading')
+                setMessage('Resuming compression...')
+                try {
+                  // Create result object with needs_client_compression flag
+                  const resumeResult = {
+                    ...jobStatus.result,
+                    needs_client_compression: true
+                  }
+                  
+                  const finalResult = await handleClientCompression(job_id, resumeResult, (msg) => {
+                    setMessage(msg)
+                  })
+                  
+                  await clearActiveJob()
+                  setStatus('success')
+                  setMessage('Upload completed successfully!')
+                  await refreshSessions()
+                  
+                  // Auto-select the resumed session
+                  if (finalResult?.detection_id) {
+                    await autoSelectSession(finalResult.detection_id)
+                  }
+                } catch (error: any) {
+                  console.error('❌ [RECOVERY] Resume failed:', error)
+                  setStatus('error')
+                  setMessage(`Resume failed: ${error.message}`)
+                }
+              }
+            }
+          ]
+        )
+      } else if (jobStatus.status === 'processing' || jobStatus.status === 'queued') {
+        // Still processing inference - resume polling
+        Alert.alert(
+          'Resume Processing?',
+          'Your previous upload is still being processed. Would you like to continue monitoring?',
+          [
+            {
+              text: 'Cancel Job',
+              style: 'destructive',
+              onPress: async () => {
+                try {
+                  // Clear AsyncStorage immediately
+                  await clearActiveJob()
+                  console.log('🗑️  [RECOVERY] User cancelled, cleared AsyncStorage')
+                  
+                  // Optionally abort the backend job
+                  try {
+                    const abortResponse = await fetch(`${API_BASE}/cancel-job/${job_id}`, {
+                      method: 'POST'
+                    })
+                    if (abortResponse.ok) {
+                      console.log('� [RECOVERY] Backend job cancelled successfully')
+                    }
+                  } catch (error) {
+                    console.log('⚠️  [RECOVERY] Could not cancel backend job (may already be complete)')
+                  }
+                  
+                  setStatus('idle')
+                  setMessage('')
+                } catch (error) {
+                  console.error('❌ [RECOVERY] Error cancelling job:', error)
+                }
+              }
+            },
+            {
+              text: 'Resume',
+              onPress: async () => {
+                try {
+                  setStatus('uploading')
+                  setMessage(jobStatus.progress || 'Processing...')
+                  console.log('📋 [RECOVERY] Resuming polling for job:', job_id)
+                  
+                  // Resume polling from where it left off
+                  let pollCount = 0
+                  const maxPolls = 40 // 20 minutes max
+                  
+                  while (pollCount < maxPolls) {
+                    await new Promise(resolve => setTimeout(resolve, 30000)) // Wait 30 seconds
+                    pollCount++
+                    
+                    console.log(`📊 [RECOVERY POLLING] Poll attempt ${pollCount}/${maxPolls}`)
+                    
+                    const statusResponse = await fetch(`${API_BASE}/job-status/${job_id}`)
+                    if (!statusResponse.ok) {
+                      throw new Error(`Status check failed: ${statusResponse.status}`)
+                    }
+                    
+                    const status = await statusResponse.json()
+                    console.log(`📊 [RECOVERY POLLING] Status: ${status.status}`)
+                    
+                    if (status.progress) {
+                      setMessage(status.progress)
+                    }
+                    
+                    if (status.status === 'completed') {
+                      console.log('✅ [RECOVERY POLLING] Processing completed!')
+                      
+                      // Check if compression is needed
+                      let finalResult = status.result
+                      if (status.needs_client_compression || status.result?.needs_client_compression) {
+                        console.log('🗜️  [RECOVERY] Starting client-side compression')
+                        const resumeResult = {
+                          ...status.result,
+                          needs_client_compression: true
+                        }
+                        finalResult = await handleClientCompression(job_id, resumeResult, (msg) => {
+                          setMessage(msg)
+                        })
+                      } else {
+                        await clearActiveJob()
+                      }
+                      
+                      setStatus('success')
+                      setMessage('Processing completed successfully!')
+                      await refreshSessions()
+                      
+                      // Auto-select the resumed session
+                      if (finalResult?.detection_id) {
+                        await autoSelectSession(finalResult.detection_id)
+                      }
+                      break
+                    } else if (status.status === 'failed') {
+                      await clearActiveJob()
+                      setStatus('error')
+                      setMessage(`Processing failed: ${status.error}`)
+                      break
+                    }
+                    
+                    const minutesElapsed = (pollCount * 30) / 60
+                    setMessage(`Processing... ${minutesElapsed.toFixed(1)} min elapsed`)
+                  }
+                  
+                  if (pollCount >= maxPolls) {
+                    setStatus('error')
+                    setMessage('Processing timeout - took longer than 20 minutes')
+                  }
+                } catch (error: any) {
+                  console.error('❌ [RECOVERY POLLING] Error:', error)
+                  setStatus('error')
+                  setMessage(`Resume failed: ${error.message}`)
+                }
+              }
+            }
+          ]
+        )
+      } else if (jobStatus.status === 'completed' && !jobStatus.needs_client_compression) {
+        // Already fully completed, just clear
+        console.log('📋 [RECOVERY] Job already completed, clearing local storage')
+        await clearActiveJob()
+        await refreshSessions()
+      } else if (jobStatus.status === 'failed') {
+        // Failed, clear storage
+        await clearActiveJob()
+      }
+    } catch (error) {
+      console.error('📋 [RECOVERY] Error checking pending jobs:', error)
+    }
+  }
+
+  // Deprecated - use helper functions instead
+  const saveActiveJobOld = async (job_id: string, stage: 'upload' | 'processing' | 'compression') => {
+    await saveActiveJob(job_id, stage)
+  }
+
+  const clearActiveJobOld = async () => {
+    await clearActiveJob()
+  }
 
   const pickMedia = async () => {
     try {
@@ -747,6 +1017,10 @@ const Homescreen = () => {
       setProgress(100)
       setStatus('success')
       
+      // Clear file selections after successful upload
+      setSelectedMedia(null)
+      setSelectedSrt(null)
+      
       // Refresh sessions to include the new upload
       await refreshSessions();
       
@@ -818,11 +1092,54 @@ const Homescreen = () => {
   }, [])
 
   return (
-    <View className="flex-1 bg-bgColor1">
+    <SafeAreaView className="flex-1 bg-bgColor1" edges={['top']}>
       <ScrollView 
-        contentContainerStyle={{ alignItems: 'center', paddingTop: insets.top + 16, paddingBottom: 16, paddingHorizontal: 16 }}
+        contentContainerStyle={{ alignItems: 'center', paddingTop: 16, paddingBottom: 16, paddingHorizontal: 16 }}
         showsVerticalScrollIndicator={false}
         refreshControl={<RefreshControl refreshing={false} onRefresh={onRefresh} />}>
+        
+
+        {/* App Branding - Improved Visibility */}
+        <View className="w-full max-w-md mb-6 items-center">
+          <View
+            style={{
+              backgroundColor: '#25A578',
+              borderRadius: 18,
+              paddingVertical: 18,
+              paddingHorizontal: 32,
+              flexDirection: 'row',
+              alignItems: 'center',
+              justifyContent: 'center',
+              shadowColor: '#000',
+              shadowOffset: { width: 0, height: 2 },
+              shadowOpacity: 0.18,
+              shadowRadius: 6,
+              elevation: 6,
+              marginBottom: 0,
+            }}
+          >
+            <FontAwesome6 name="seedling" size={36} color="#fff" style={{ textShadowColor: '#1a5c3a', textShadowOffset: { width: 1, height: 2 }, textShadowRadius: 4 }} />
+            <Text
+              style={{
+                color: '#fff',
+                fontSize: 36,
+                fontWeight: 'bold',
+                marginLeft: 14,
+                letterSpacing: 2,
+                textShadowColor: '#1a5c3a',
+                textShadowOffset: { width: 1, height: 2 },
+                textShadowRadius: 4,
+                fontFamily: 'System',
+              }}
+            >
+              WEEDEFY
+            </Text>
+          </View>
+          <Text style={{ color: '#25A578', marginTop: 8, fontWeight: '600', fontSize: 16, letterSpacing: 1 }}>
+            Smart Weed Detection System
+          </Text>
+        </View>
+
         <View className="justify-center items-center bg-white w-full max-w-md h-auto py-6 px-4 rounded-2xl shadow-custom border-2 border-gray-200">
         <Ionicons name="cloud-upload" size={56} color="rgb(37, 165, 120)" className="mb-3" />
         <Text className="text-2xl font-bold text-gray-800 mb-2 text-center">
@@ -970,7 +1287,7 @@ const Homescreen = () => {
         )}
         </View>
       </ScrollView>
-    </View>
+    </SafeAreaView>
   )
 }
 

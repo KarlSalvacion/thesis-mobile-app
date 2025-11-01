@@ -101,6 +101,34 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_gps ON detection_details(detection_id, latitude, longitude)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_frame ON detection_details(detection_id, frame_number)")
     
+    # Persistent job queue for handling connectivity issues and resumption
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processing_jobs (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            progress TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            detection_id INTEGER,
+            original_filename TEXT,
+            media_path TEXT,
+            temp_video_path TEXT,
+            is_video BOOLEAN DEFAULT FALSE,
+            is_image BOOLEAN DEFAULT FALSE,
+            has_srt BOOLEAN DEFAULT FALSE,
+            result_json TEXT,
+            error_message TEXT,
+            needs_client_compression BOOLEAN DEFAULT FALSE,
+            compression_started_at TEXT,
+            compression_completed_at TEXT,
+            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE SET NULL
+        )
+    """)
+    
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON processing_jobs(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON processing_jobs(created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_needs_compression ON processing_jobs(needs_client_compression, status)")
+    
     conn.commit()
 
     # Backfill columns for older DBs (SQLite lacks IF NOT EXISTS for columns)
@@ -312,17 +340,24 @@ def batch_insert_detection_details(detection_id: int, detections_list: list, srt
     return rows_inserted
 
 
-def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.3, frame_gap: int = 10) -> dict:
+def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.5, frame_gap: int = 20) -> dict:
     """Calculate unique weed count by tracking weeds across frames using a simple online tracker.
 
     This function iterates detections in temporal order and attempts to match each detection
     to existing tracks using IoU and GPS proximity. If no match is found within the allowed
     frame_gap, a new track is started.
 
+    MORE AGGRESSIVE DEFAULTS FOR 10 FPS VIDEO:
+    - iou_threshold: 0.5 - 50% overlap required (more lenient to account for angle/distance changes)
+    - frame_gap: 20 frames - at 10 FPS, 20 frames = 2.0 seconds
+      This accounts for typical drone flight where same weed is visible 2 seconds
+      Longer frame gap = tracks persist longer = fewer unique weeds counted
+
     Args:
         detection_id: The detection session ID
         iou_threshold: IoU threshold for considering same weed (0.0-1.0)
         frame_gap: Maximum frame gap to consider for tracking (frames)
+                   At 10 FPS: 10 frames = 1 second, 20 frames = 2 seconds
 
     Returns:
         dict with unique_count, total_detections, tracks, and breakdown by class
@@ -387,7 +422,8 @@ def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.3, frame_
 
     # Online tracker: tracks is a list of dicts with last seen bbox/frame and history
     tracks = []
-    GPS_MATCH_THRESHOLD_M = 2.0  # meters
+    GPS_MATCH_THRESHOLD_M = 1.0  # Relaxed to 1.0m - weeds within 1m considered same for more aggressive merging
+    MIN_MATCH_SCORE = 0.4  # Reduced threshold - allow weaker matches to merge more tracks
 
     for det in detections:
         matched_track = None
@@ -410,16 +446,25 @@ def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.3, frame_
             if det['lat'] is not None and tr.get('last_lat') is not None:
                 gps_dist = calculate_gps_distance(det['lat'], det['lon'], tr['last_lat'], tr['last_lon'])
 
-            # Matching criteria: IoU OR GPS proximity
+            # Matching criteria: Require stronger evidence for matching
             score = 0.0
             if iou >= iou_threshold:
-                score = iou
+                # Strong IoU match
+                if gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M:
+                    # Both IoU and GPS agree - very strong match
+                    score = iou * 2.5
+                elif iou >= 0.8:
+                    # Very high IoU compensates for GPS uncertainty
+                    score = iou * 1.5
+                else:
+                    # Decent IoU but GPS uncertain or far
+                    score = iou * 0.8
             elif gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M:
-                # Favor small GPS distances (convert to a score between 0.0-1.0)
-                score = 1.0 / (1.0 + gps_dist)
+                # Close GPS but low IoU - weaker match
+                score = 0.5 / (1.0 + gps_dist)
 
-            # Prefer tracks with higher score
-            if score > best_score:
+            # Prefer tracks with higher score and above minimum threshold
+            if score > best_score and score >= MIN_MATCH_SCORE:
                 best_score = score
                 matched_track = tr
 
@@ -734,6 +779,204 @@ def get_detection_statistics():
     
     # Total detections
     cursor.execute("SELECT COUNT(*) FROM detection_details")
+    total_detections = cursor.fetchone()[0]
+    
+    conn.close()
+    return {
+        "total_sessions": total_sessions,
+        "total_detections": total_detections
+    }
+
+# ========== JOB QUEUE MANAGEMENT ==========
+
+def create_processing_job(job_id, original_filename, is_video=False, is_image=False, has_srt=False):
+    """Create a new processing job in the database."""
+    import datetime
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    
+    cursor.execute("""
+        INSERT INTO processing_jobs 
+        (job_id, status, progress, created_at, updated_at, original_filename, is_video, is_image, has_srt)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (job_id, "queued", "Uploaded, starting processing...", now, now, original_filename, is_video, is_image, has_srt))
+    
+    conn.commit()
+    conn.close()
+
+def update_job_status(job_id, status, progress=None, error_message=None):
+    """Update job status and progress."""
+    import datetime
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    
+    if error_message:
+        cursor.execute("""
+            UPDATE processing_jobs 
+            SET status = ?, progress = ?, error_message = ?, updated_at = ?
+            WHERE job_id = ?
+        """, (status, progress, error_message, now, job_id))
+    elif progress:
+        cursor.execute("""
+            UPDATE processing_jobs 
+            SET status = ?, progress = ?, updated_at = ?
+            WHERE job_id = ?
+        """, (status, progress, now, job_id))
+    else:
+        cursor.execute("""
+            UPDATE processing_jobs 
+            SET status = ?, updated_at = ?
+            WHERE job_id = ?
+        """, (status, now, job_id))
+    
+    conn.commit()
+    conn.close()
+
+def update_job_result(job_id, detection_id, result_json, annotated_url=None, temp_video_path=None, needs_compression=False):
+    """Update job with completed result."""
+    import datetime
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    
+    cursor.execute("""
+        UPDATE processing_jobs 
+        SET status = ?, detection_id = ?, result_json = ?, temp_video_path = ?, 
+            needs_client_compression = ?, updated_at = ?
+        WHERE job_id = ?
+    """, ("completed", detection_id, result_json, temp_video_path, needs_compression, now, job_id))
+    
+    conn.commit()
+    conn.close()
+
+def mark_compression_started(job_id):
+    """Mark that client has started downloading video for compression."""
+    import datetime
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    
+    cursor.execute("""
+        UPDATE processing_jobs 
+        SET compression_started_at = ?, updated_at = ?
+        WHERE job_id = ?
+    """, (now, now, job_id))
+    
+    conn.commit()
+    conn.close()
+
+def mark_compression_completed(job_id, annotated_url):
+    """Mark that client has completed compression and uploaded video."""
+    import datetime
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    
+    cursor.execute("""
+        UPDATE processing_jobs 
+        SET compression_completed_at = ?, needs_client_compression = ?, updated_at = ?
+        WHERE job_id = ?
+    """, (now, False, now, job_id))
+    
+    # Also update result_json to include annotated_url
+    cursor.execute("SELECT result_json FROM processing_jobs WHERE job_id = ?", (job_id,))
+    row = cursor.fetchone()
+    if row and row[0]:
+        import json
+        result = json.loads(row[0])
+        result["cloud_annotated_url"] = annotated_url
+        result["needs_client_compression"] = False
+        cursor.execute("""
+            UPDATE processing_jobs 
+            SET result_json = ?
+            WHERE job_id = ?
+        """, (json.dumps(result), job_id))
+    
+    conn.commit()
+    conn.close()
+
+def get_job_status(job_id):
+    """Get job status from database."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM processing_jobs WHERE job_id = ?", (job_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return None
+    
+    return {
+        "job_id": row[0],
+        "status": row[1],
+        "progress": row[2],
+        "created_at": row[3],
+        "updated_at": row[4],
+        "detection_id": row[5],
+        "original_filename": row[6],
+        "media_path": row[7],
+        "temp_video_path": row[8],
+        "is_video": bool(row[9]),
+        "is_image": bool(row[10]),
+        "has_srt": bool(row[11]),
+        "result_json": row[12],
+        "error_message": row[13],
+        "needs_client_compression": bool(row[14]),
+        "compression_started_at": row[15],
+        "compression_completed_at": row[16]
+    }
+
+def get_pending_compression_jobs():
+    """Get all jobs waiting for client-side compression."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM processing_jobs 
+        WHERE status = 'completed' AND needs_client_compression = 1
+        ORDER BY created_at DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    
+    jobs = []
+    for row in rows:
+        jobs.append({
+            "job_id": row[0],
+            "status": row[1],
+            "progress": row[2],
+            "created_at": row[3],
+            "updated_at": row[4],
+            "detection_id": row[5],
+            "original_filename": row[6],
+            "temp_video_path": row[8],
+            "needs_client_compression": bool(row[14]),
+            "compression_started_at": row[15]
+        })
+    
+    return jobs
+
+def cleanup_old_jobs(days=7):
+    """Clean up old completed/failed jobs older than specified days."""
+    import datetime
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat()
+    cursor.execute("""
+        DELETE FROM processing_jobs 
+        WHERE status IN ('completed', 'failed') 
+        AND updated_at < ?
+        AND needs_client_compression = 0
+    """, (cutoff,))
+    
+    deleted_count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    
+    return deleted_count
+
     total_detections = cursor.fetchall()[0][0]
     
     # Weed class distribution

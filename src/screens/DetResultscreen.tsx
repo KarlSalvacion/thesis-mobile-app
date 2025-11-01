@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import * as ScreenOrientation from 'expo-screen-orientation';
 import { View, Text, ActivityIndicator, ScrollView, RefreshControl, Image, TouchableOpacity, Modal, Dimensions, Alert, Linking, Platform } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
 import { Video, ResizeMode } from 'expo-av';
@@ -80,6 +82,20 @@ const DetectionResults = () => {
   const [isModalVisible, setIsModalVisible] = useState<boolean>(false)
   const [sessionModalVisible, setSessionModalVisible] = useState<boolean>(false)
   const [exporting, setExporting] = useState<boolean>(false)
+  // Handle orientation lock for fullscreen modal
+  useEffect(() => {
+    if (isModalVisible) {
+      // Allow all orientations in fullscreen
+      ScreenOrientation.unlockAsync();
+    } else {
+      // Lock to portrait when not in fullscreen
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+    }
+    // Clean up: lock to portrait when unmounting
+    return () => {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+    };
+  }, [isModalVisible]);
   const [exportCancelToken, setExportCancelToken] = useState<AbortController | null>(null)
   const [uniqueWeedCount, setUniqueWeedCount] = useState<number | null>(null)
   const [uniqueWeedData, setUniqueWeedData] = useState<any>(null)
@@ -121,14 +137,15 @@ const DetectionResults = () => {
           // Check if this detection has SRT data first
           if (detection[10]) { // has_srt_data field
             // Use unique-weeds-heatmap endpoint for videos with GPS data
-            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=0.3&iou_threshold=0.6&frame_gap=2`);
+            // SAME parameters as Mapscreen for consistency
+            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=2.0&iou_threshold=0.5&frame_gap=20`);
             if (res3.ok) {
               const uniqueData = await res3.json();
               setUniqueWeedCount(uniqueData.unique_weed_count);
               setUniqueWeedData(uniqueData);
             } else {
               // Fallback to basic unique weeds calculation without GPS
-              const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.6&frame_gap=2`);
+              const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.5&frame_gap=20`);
               if (res4.ok) {
                 const uniqueData = await res4.json();
                 setUniqueWeedCount(uniqueData.unique_weed_count);
@@ -137,7 +154,7 @@ const DetectionResults = () => {
             }
           } else {
             // For videos without SRT data, use the basic unique-weeds endpoint
-            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.6&frame_gap=2`);
+            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.5&frame_gap=20`);
             if (res3.ok) {
               const uniqueData = await res3.json();
               setUniqueWeedCount(uniqueData.unique_weed_count);
@@ -458,9 +475,10 @@ const DetectionResults = () => {
   }
 
   return (
-    <ScrollView className="flex-1 bg-bgColor1" showsVerticalScrollIndicator={false}
-      refreshControl={<RefreshControl refreshing={loading} onRefresh={() => refreshSessions()} />}>
-      <View className="flex-1 justify-start items-center pt-12 pb-8 px-4" style={{ paddingTop: insets.top + 48 }}>
+    <SafeAreaView className="flex-1 bg-bgColor1" edges={['top']}>
+      <ScrollView className="flex-1" showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={loading} onRefresh={() => refreshSessions()} />}>
+        <View className="flex-1 justify-start items-center pb-8 px-4" style={{ paddingTop: 48 }}>
         {/* Media Container - Expandable with DJI Mini 4 Pro aspect ratio */}
         <View className="w-full items-center mb-6">
           <TouchableOpacity 
@@ -786,7 +804,7 @@ const DetectionResults = () => {
                 disabled={exporting}
               >
                 <View className="flex-row items-center">
-                  <FontAwesome6 name="map-marker-alt" size={20} color="rgb(37, 165, 120)" />
+                  <Ionicons name="map" size={24} color="rgb(37, 165, 120)" />
                   <Text className="text-green-700 font-medium ml-3 flex-1">
                     View on Map
                   </Text>
@@ -843,7 +861,31 @@ const DetectionResults = () => {
           </View>
         </View>
       </View>
+
+      {/* Loading overlay for export */}
+      {exporting && (
+        <View className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
+          <View className="bg-white rounded-2xl p-6 mx-4 shadow-xl">
+            <View className="items-center">
+              <ActivityIndicator size="large" color="#2563eb" />
+              <Text className="text-lg font-semibold text-gray-800 mt-4 mb-2">
+                Generating Report
+              </Text>
+              <Text className="text-sm text-gray-600 text-center mb-4">
+                Preparing File...
+              </Text>
+              <TouchableOpacity
+                className="bg-red-50 border border-red-200 rounded-lg px-4 py-2"
+                onPress={cancelExport}
+              >
+                <Text className="text-red-700 font-medium">Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      )}
     </ScrollView>
+    </SafeAreaView>
   )
 }
 
