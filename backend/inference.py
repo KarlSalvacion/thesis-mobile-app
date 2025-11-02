@@ -996,26 +996,56 @@ def run_video_inference(
                     ann_video_path = tempfile.mktemp(suffix='_annotated.mp4')
                     print(f'Stitching video with OpenCV at {api_fps} FPS (detection rate)...')
                     
-                    # Use OpenCV stitching at detection FPS
-                    stitch_success = stitch_video_cv2(ann_frames_dir, api_fps, ann_video_path, frame_pattern='ann_%06d.jpg')
+                    # Use OpenCV stitching with compression (stays under 100MB for Cloudinary)
+                    stitch_success = stitch_video_cv2(ann_frames_dir, api_fps, ann_video_path, frame_pattern='ann_%06d.jpg', target_size_mb=95)
                     
                     if not stitch_success:
                         # OpenCV failed - cannot proceed without FFmpeg
                         raise RuntimeError('OpenCV video stitching failed. Please check opencv-python-headless installation.')
                     
-                    print(f'Successfully stitched annotated video with OpenCV: {ann_video_path}')
+                    # Check file size
+                    video_size_mb = os.path.getsize(ann_video_path) / (1024 * 1024)
+                    print(f'Successfully stitched annotated video: {video_size_mb:.2f} MB')
                     
-                    # Return the temp video path for client-side compression
-                    # Instead of uploading to Cloudinary here, let client compress first
-                    print(f'✅ Annotated video ready for client-side compression')
-                    annotated = ann_video_path  # Return the local path, not a URL
-                    
-                    # DON'T cleanup temp files yet - client needs to download this file
-                    # Cleanup will happen after client uploads compressed version
-                    # (tmpdir and ann_frames_dir can be cleaned up, but keep ann_video_path)
-                    shutil.rmtree(tmpdir, ignore_errors=True)
-                    shutil.rmtree(ann_frames_dir, ignore_errors=True)
-                    # Don't delete ann_video_path yet!
+                    # Upload directly to Cloudinary (skip client compression cycle)
+                    if video_size_mb <= 100:
+                        print(f'🚀 Uploading compressed video directly to Cloudinary (skipping client compression)')
+                        from .cloudinary_utils import upload_video_streaming
+                        
+                        try:
+                            # Use video filename from path
+                            video_filename = os.path.basename(video_path) if video_path else "video.mp4"
+                            
+                            uploaded = upload_video_streaming(
+                                ann_video_path,
+                                video_filename,
+                                folder="weed-detections/annotated",
+                                annotate=False
+                            )
+                            annotated = uploaded.get('secure_url')
+                            print(f'✅ Video uploaded to Cloudinary: {annotated}')
+                            
+                            # Cleanup temp files immediately
+                            shutil.rmtree(tmpdir, ignore_errors=True)
+                            shutil.rmtree(ann_frames_dir, ignore_errors=True)
+                            if os.path.exists(ann_video_path):
+                                os.remove(ann_video_path)
+                        except Exception as upload_error:
+                            print(f'⚠️  Cloudinary upload failed: {upload_error}')
+                            print(f'Falling back to client compression workflow')
+                            annotated = ann_video_path  # Return temp path for client compression
+                            shutil.rmtree(tmpdir, ignore_errors=True)
+                            shutil.rmtree(ann_frames_dir, ignore_errors=True)
+                    else:
+                        # File too large - use client compression fallback
+                        print(f'⚠️  Video size {video_size_mb:.2f} MB exceeds 100MB limit')
+                        print(f'✅ Annotated video ready for client-side compression')
+                        annotated = ann_video_path  # Return the local path for client compression
+                        
+                        # DON'T cleanup temp files yet - client needs to download this file
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+                        shutil.rmtree(ann_frames_dir, ignore_errors=True)
+                        # Don't delete ann_video_path yet!
                         
                 except Exception as e:
                     print(f'Error creating annotated video from Roboflow results: {e}')

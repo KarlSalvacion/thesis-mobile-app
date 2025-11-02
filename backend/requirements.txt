@@ -11,4 +11,5 @@ folium==0.15.1  # For creating Leaflet maps server-side
 selenium==4.15.2  # For headless browser screenshot
 webdriver-manager==4.0.1  # For managing ChromeDriver
 psutil==5.9.8  # For memory monitoring on Render.com
+psycopg2-binary==2.9.9  # PostgreSQL adapter
 # inference>=0.58.2  # Commented out - using Roboflow hosted API instead

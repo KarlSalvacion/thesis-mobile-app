@@ -465,14 +465,18 @@ def extract_frames_cv2(video_path: str, target_fps: Optional[float] = None, max_
         return None
 
 
-def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_pattern: str = 'ann_%06d.jpg') -> bool:
-    """Stitch frames into video using OpenCV VideoWriter (2-3x faster than FFmpeg).
+def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_pattern: str = 'ann_%06d.jpg', target_size_mb: int = 80) -> bool:
+    """Stitch frames into video using OpenCV VideoWriter with smart compression.
+    
+    This function compresses video DURING stitching to avoid the client download/re-upload cycle.
+    It uses OpenCV's built-in compression (no FFmpeg needed) and adjusts quality to stay under 100MB.
     
     Args:
         frames_dir: Directory containing frame images
         fps: Output video framerate
         output_path: Path for output video file
         frame_pattern: Frame filename pattern (e.g., 'ann_%06d.jpg')
+        target_size_mb: Target file size in MB (default 95MB to stay under Cloudinary's 100MB limit)
         
     Returns:
         True if successful, False otherwise
@@ -508,28 +512,68 @@ def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_patter
             return False
         
         height, width = first_frame.shape[:2]
-        print(f"Video dimensions: {width}x{height}")
+        print(f"Original video dimensions: {width}x{height}")
         
-        # Keep 1080p resolution for quality (annotations need to be readable!)
-        # Client-side compression will handle file size optimization
-        # Ensure even dimensions (required for H.264 encoding later)
+        # Smart resolution scaling to stay under target size
+        # More accurate estimate: ~160KB per frame at 1080p with mp4v codec
+        estimated_size_mb = (frame_count * 160) / 1024  # Conservative estimate at 1080p
+        
+        # Calculate scaling factor to stay under target (add 10% safety margin)
+        if estimated_size_mb > target_size_mb:
+            scale_factor = ((target_size_mb * 0.90) / estimated_size_mb) ** 0.5  # 10% buffer + square root for area scaling
+            width = int(width * scale_factor)
+            height = int(height * scale_factor)
+            print(f"📉 Scaling down to {width}x{height} to stay under {target_size_mb}MB (estimated: {estimated_size_mb:.1f}MB)")
+        else:
+            print(f"✅ No scaling needed, estimated size: {estimated_size_mb:.1f}MB")
+        
+        # Ensure even dimensions (required for H.264 encoding)
         if width % 2 != 0:
             width = width - 1
         if height % 2 != 0:
             height = height - 1
         
-        print(f"Stitching at full resolution: {width}x{height} (maintaining quality for annotations)")
+        print(f"Final output resolution: {width}x{height}")
         
-        # OpenCV VideoWriter - use mp4v for fast encoding
-        # Client will compress to H.264 with high quality settings
-        fourcc = _cv2.VideoWriter_fourcc(*'mp4v')
-        out = _cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        # Suppress OpenCV H.264 warnings (we'll use mp4v fallback anyway on most systems)
+        import warnings
+        os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'  # Suppress VideoWriter debug messages
+        
+        # Use H.264 codec for better compression (smaller file size)
+        # Try different codec options for best compatibility
+        codecs_to_try = [
+            ('mp4v', 'MPEG-4 (mp4v)'),  # Start with reliable fallback for Windows
+            ('avc1', 'H.264 (avc1)'),   # H.264 if available
+        ]
+        
+        out = None
+        used_codec = None
+        
+        for codec_fourcc, codec_name in codecs_to_try:
+            try:
+                fourcc = _cv2.VideoWriter_fourcc(*codec_fourcc)
+                test_out = _cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                if test_out.isOpened():
+                    out = test_out
+                    used_codec = codec_name
+                    print(f"✅ Using {codec_name} codec for compression")
+                    break
+                else:
+                    test_out.release()
+            except:
+                pass
+        
+        if out is None or not out.isOpened():
+            print("❌ Failed to open VideoWriter with any H.264 codec, using mp4v fallback")
+            fourcc = _cv2.VideoWriter_fourcc(*'mp4v')
+            out = _cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            used_codec = "MPEG-4 (mp4v)"
         
         if not out.isOpened():
-            print("Failed to open VideoWriter with mp4v codec")
+            print("Failed to open VideoWriter")
             return False
         
-        # Write all frames
+        # Write all frames with compression
         for i, filename in enumerate(frame_files):
             frame_path = os.path.join(frames_dir, filename)
             frame = _cv2.imread(frame_path)
@@ -538,7 +582,7 @@ def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_patter
                 print(f"Warning: Failed to read frame {filename}, skipping")
                 continue
             
-            # Always resize to target dimensions (for resolution reduction + consistency)
+            # Resize to target dimensions for compression
             frame = _cv2.resize(frame, (width, height))
             
             out.write(frame)
@@ -552,10 +596,16 @@ def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_patter
         
         # Verify output file exists and get size
         if os.path.exists(output_path):
-            uncompressed_size = os.path.getsize(output_path)
-            size_mb = uncompressed_size / (1024 * 1024)
-            print(f"Stitched video size: {size_mb:.2f} MB (720p, mp4v codec)")
-            print(f"✅ Skipping backend compression - client will compress with react-native-compressor")
+            compressed_size = os.path.getsize(output_path)
+            size_mb = compressed_size / (1024 * 1024)
+            
+            if size_mb <= target_size_mb:
+                print(f"✅ Compressed video: {size_mb:.2f} MB (under {target_size_mb}MB limit)")
+                print(f"🚀 Ready for direct Cloudinary upload (no client compression needed)")
+            else:
+                print(f"⚠️  Video size: {size_mb:.2f} MB (over {target_size_mb}MB, may need further compression)")
+            
+            print(f"📊 Codec: {used_codec}, Resolution: {width}x{height}, FPS: {fps}")
             
             return True
         else:

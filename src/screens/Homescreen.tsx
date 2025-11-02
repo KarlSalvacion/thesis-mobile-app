@@ -162,8 +162,33 @@ async function handleClientCompression(jobId: string, result: any, onProgress?: 
       console.warn('⚠️  [COMPRESS] Cleanup warning:', e)
     }
     
-    // Update result with annotated URL from compressed video
-    result.cloud_annotated_url = uploadResponse.annotated_url
+    // Step 5: Fetch updated job status with annotated URL from backend
+    console.log('🔄 [COMPRESS] Fetching updated job status from backend...')
+    
+    // Small delay to ensure database transaction completes
+    await new Promise(resolve => setTimeout(resolve, 500))
+    
+    const statusResponse = await fetch(`${API_BASE}/job-status/${jobId}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    })
+    
+    if (statusResponse.ok) {
+      const updatedStatus = await statusResponse.json()
+      console.log('✅ [COMPRESS] Got updated status from backend:', updatedStatus.result?.cloud_annotated_url)
+      
+      // Use the updated result from backend (has the correct annotated URL)
+      if (updatedStatus.result) {
+        result = updatedStatus.result
+      } else {
+        // Fallback: manually update the result
+        result.cloud_annotated_url = uploadResponse.annotated_url
+      }
+    } else {
+      console.warn('⚠️  [COMPRESS] Could not fetch updated status, using upload response')
+      result.cloud_annotated_url = uploadResponse.annotated_url
+    }
+    
     onProgress?.('Video compression complete!')
     
     // Clear active job after successful compression
@@ -416,7 +441,7 @@ type SelectedFile = {
 }
 
 const Homescreen = () => {
-  const { refreshSessions, setSelectedDetection, sessions } = useSession();
+  const { refreshSessions, setSelectedDetection, sessions, setNavigationLocked } = useSession();
   const insets = useSafeAreaInsets();
   const [selectedMedia, setSelectedMedia] = useState<SelectedFile | null>(null)
   const [selectedSrt, setSelectedSrt] = useState<SelectedFile | null>(null)
@@ -681,14 +706,19 @@ const Homescreen = () => {
     try {
       setMessage('')
       setStatus('picking')
+      setNavigationLocked(true) // Lock navigation during file picking
+      setMessage('Opening file picker...')
 
       const permission = await ImagePicker.requestMediaLibraryPermissionsAsync()
       if (permission.status !== 'granted') {
         setStatus(selectedMedia || selectedSrt ? 'ready' : 'idle')
         setMessage('Permission to access media library is required.')
+        setNavigationLocked(false) // Unlock on error
         return
       }
 
+      setMessage('Selecting file... This may take a moment for large files')
+      
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.All,
         allowsEditing: false,
@@ -697,21 +727,53 @@ const Homescreen = () => {
 
       if (result.canceled) {
         setStatus((selectedMedia || selectedSrt) ? 'ready' : 'idle')
+        setMessage('')
+        setNavigationLocked(false) // Unlock on cancel
         return
       }
 
       const asset = result.assets?.[0]
       if (asset) {
-        // Try to preserve an actual filename provided by the picker (if present).
-        // Fall back to the URI last segment, sanitizing query params. If still missing,
-        // use a sensible default based on media type so the name stays stable.
-        const maybeFileName = (asset as any).fileName || (asset as any).filename || (asset as any).name
+        setMessage('Reading file information...')
+        
+        // Get file info asynchronously with timeout
+        let size: number | null = null
         let inferredName = ''
+        
+        try {
+          // Try to get file info with timeout (5 seconds)
+          const infoPromise = FileSystem.getInfoAsync(asset.uri)
+          const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Timeout')), 5000)
+          )
+          
+          const info: any = await Promise.race([infoPromise, timeoutPromise])
+          size = typeof info?.size === 'number' ? info.size : null
+          
+          // Validate file size (max 1GB for stability)
+          if (size && size > 1024 * 1024 * 1024) {
+            setStatus('error')
+            setMessage('File too large. Maximum file size is 1GB.')
+            setNavigationLocked(false) // Unlock on error
+            return
+          }
+          
+          // Show file size in MB
+          if (size) {
+            const sizeMB = (size / (1024 * 1024)).toFixed(2)
+            console.log(`📁 [FILE INFO] Size: ${sizeMB} MB`)
+          }
+        } catch (err) {
+          console.warn('⚠️  [FILE INFO] Could not read file size:', err)
+          // Continue without size info
+        }
 
+        // Extract filename
+        const maybeFileName = (asset as any).fileName || (asset as any).filename || (asset as any).name
+        
         if (maybeFileName && typeof maybeFileName === 'string' && maybeFileName.trim() !== '') {
           inferredName = maybeFileName
         } else if (asset.uri && typeof asset.uri === 'string') {
-          // strip query params and fragments
           const uriPart = asset.uri.split('?')[0].split('#')[0]
           inferredName = uriPart.split('/')?.pop() || ''
         }
@@ -725,15 +787,13 @@ const Homescreen = () => {
         if (!/\.[a-z0-9]+$/i.test(inferredName)) {
           inferredName = inferredName + (asset.type === 'video' ? '.mp4' : '.jpg')
         }
-        let size: number | null | undefined = undefined
-        try {
-          const info: any = await FileSystem.getInfoAsync(asset.uri)
-          size = typeof info?.size === 'number' ? info.size : undefined
-        } catch {}
 
+        // Validate media type
         if (asset.type === 'video' || asset.type === 'image') {
-          // Don't compress yet - just store the original file
-          // Compression will happen when user clicks Upload button
+          // Show file info
+          const fileType = asset.type === 'video' ? 'Video' : 'Image'
+          const sizeInfo = size ? ` (${(size / (1024 * 1024)).toFixed(2)} MB)` : ''
+          
           setSelectedMedia({
             uri: asset.uri,
             name: inferredName,
@@ -741,17 +801,29 @@ const Homescreen = () => {
             type: 'media'
           })
           setStatus('ready')
-          setMessage(`${asset.type === 'video' ? 'Video' : 'Image'} selected. Ready to upload.`)
+          setMessage(`${fileType} selected${sizeInfo}. Ready to upload.`)
+          setNavigationLocked(false) // Unlock after successful selection
+          
+          // Warn if file is very large
+          if (size && size > 500 * 1024 * 1024) { // > 500MB
+            console.warn(`⚠️  [FILE INFO] Large file detected: ${(size / (1024 * 1024)).toFixed(2)} MB`)
+            setMessage(`${fileType} selected${sizeInfo}. Large file - upload may take several minutes.`)
+          }
         } else {
           setMessage('Please select a valid video or image file.')
           setStatus('error')
+          setNavigationLocked(false) // Unlock on error
         }
       } else {
         setStatus('idle')
+        setMessage('')
+        setNavigationLocked(false) // Unlock if no asset
       }
-    } catch (err) {
-      setMessage('Failed to pick a media file.')
+    } catch (err: any) {
+      console.error('❌ [PICK MEDIA] Error:', err)
+      setMessage(`Failed to pick file: ${err.message || 'Unknown error'}`)
       setStatus('error')
+      setNavigationLocked(false) // Unlock on error
     }
   }
 
@@ -759,47 +831,105 @@ const Homescreen = () => {
     try {
       setMessage('')
       setStatus('picking')
+      setNavigationLocked(true) // Lock navigation during file picking
+      setMessage('Opening file picker...')
+      
       const result = await DocumentPicker.getDocumentAsync({
         type: [
-
           (DocumentPicker as any).types?.allFiles || 'public.item',
-          // iOS UTTypes
           'public.item',
           'public.data',
           'public.content',
           'public.text',
           'public.plain-text',
-          'public.json',
-          'public.srt',
-          // Common MIME types
           'text/plain',
-          'application/json',
+          'application/x-subrip',
           '*/*',
         ],
         multiple: false,
-        copyToCacheDirectory: true
+        copyToCacheDirectory: false // Don't copy immediately - faster picker response
       })
 
       if (result.canceled) {
         setStatus((selectedMedia || selectedSrt) ? 'ready' : 'idle')
+        setMessage('')
+        setNavigationLocked(false) // Unlock on cancel
         return
       }
 
       const file = result.assets?.[0]
       if (file) {
+        setMessage('Validating SRT file...')
+        
+        // Validate SRT file
+        const fileName = file.name ?? 'subtitle.srt'
+        if (!fileName.toLowerCase().endsWith('.srt')) {
+          setStatus('error')
+          setMessage('Please select a valid .srt file.')
+          setNavigationLocked(false) // Unlock on error
+          return
+        }
+        
+        // Validate file size (max 10MB for SRT)
+        if (file.size && file.size > 10 * 1024 * 1024) {
+          setStatus('error')
+          setMessage('SRT file too large. Maximum size is 10MB.')
+          setNavigationLocked(false) // Unlock on error
+          return
+        }
+        
+        // Validate filename matches media (if media already selected)
+        if (selectedMedia) {
+          const mediaBaseName = selectedMedia.name.toLowerCase().replace(/\.(mp4|mov|avi|mkv|jpg|jpeg|png|bmp|gif)$/, '')
+          const srtBaseName = fileName.toLowerCase().replace(/\.srt$/, '')
+          
+          if (mediaBaseName !== srtBaseName) {
+            Alert.alert(
+              'File Name Mismatch',
+              `SRT filename "${fileName}" does not match media filename "${selectedMedia.name}".\n\nThey must have the same name (except extension).\n\nDo you want to continue anyway?`,
+              [
+                { text: 'Cancel', style: 'cancel', onPress: () => {
+                  setStatus('ready')
+                  setMessage('SRT file selection cancelled.')
+                  setNavigationLocked(false) // Unlock on cancel
+                }},
+                { text: 'Continue', onPress: () => {
+                  setSelectedSrt({
+                    uri: file.uri,
+                    name: fileName,
+                    size: file.size,
+                    type: 'srt'
+                  })
+                  setStatus('ready')
+                  setMessage('⚠️  Warning: Filenames do not match. GPS data may not sync correctly.')
+                  setNavigationLocked(false) // Unlock after selection
+                }}
+              ]
+            )
+            return
+          }
+        }
+        
         setSelectedSrt({
           uri: file.uri,
-          name: file.name ?? 'subtitle.srt',
+          name: fileName,
           size: file.size,
           type: 'srt'
         })
         setStatus('ready')
+        const sizeInfo = file.size ? ` (${(file.size / 1024).toFixed(2)} KB)` : ''
+        setMessage(`SRT file selected${sizeInfo}`)
+        setNavigationLocked(false) // Unlock after successful selection
       } else {
         setStatus('idle')
+        setMessage('')
+        setNavigationLocked(false) // Unlock if no file
       }
-    } catch (err) {
-      setMessage('Failed to pick an SRT file.')
+    } catch (err: any) {
+      console.error('❌ [PICK SRT] Error:', err)
+      setMessage(`Failed to pick SRT file: ${err.message || 'Unknown error'}`)
       setStatus('error')
+      setNavigationLocked(false) // Unlock on error
     }
   }
 
@@ -1021,21 +1151,50 @@ const Homescreen = () => {
       setSelectedMedia(null)
       setSelectedSrt(null)
       
+      // Wait a moment for database to fully update (especially after compression)
+      await new Promise(resolve => setTimeout(resolve, 500))
+      
       // Refresh sessions to include the new upload
+      console.log('🔄 [AUTO-SELECT] Refreshing sessions...')
       await refreshSessions();
+      
+      // Wait another moment for context to update
+      await new Promise(resolve => setTimeout(resolve, 300))
       
       // Auto-select the newly uploaded session
       if (result?.detection_id) {
+        console.log('🔍 [AUTO-SELECT] Fetching updated sessions for detection_id:', result.detection_id)
         // Get the updated sessions list after refresh
         const { API_BASE } = await import('../config');
+        
+        // Fetch the specific detection to ensure we have the latest data
+        console.log('🔍 [AUTO-SELECT] Fetching specific detection data...')
+        const detectionRes = await fetch(`${API_BASE}/detection/${result.detection_id}`);
+        if (detectionRes.ok) {
+          const detectionJson = await detectionRes.json();
+          const specificDetection = detectionJson?.detection;
+          if (specificDetection) {
+            setSelectedDetection(specificDetection);
+            console.log('✅ [AUTO-SELECT] Selected specific detection with latest data:', result.detection_id);
+            console.log('✅ [AUTO-SELECT] cloud_annotated_url:', specificDetection[14]);
+            return; // Successfully selected, exit early
+          }
+        }
+        
+        // Fallback: get from full list if specific fetch failed
+        console.log('🔍 [AUTO-SELECT] Fallback: fetching from full sessions list...')
         const res = await fetch(`${API_BASE}/detections/`);
         const json = await res.json();
         const updatedSessions = json?.detections ?? [];
         
+        console.log('🔍 [AUTO-SELECT] Total sessions found:', updatedSessions.length)
         const newSession = updatedSessions.find((s: any) => s[0] === result.detection_id);
         if (newSession) {
           setSelectedDetection(newSession);
           console.log('✅ [AUTO-SELECT] Selected newly uploaded session:', result.detection_id);
+          console.log('✅ [AUTO-SELECT] Session data:', newSession);
+        } else {
+          console.warn('⚠️  [AUTO-SELECT] Session not found for detection_id:', result.detection_id);
         }
       }
     } catch (e: any) {
@@ -1159,18 +1318,50 @@ const Homescreen = () => {
               disabled={isBusy}
               className={`h-[100px] items-center justify-center rounded-lg border-2 border-greenColor ${isBusy ? 'bg-gray-300' : 'bg-bgColor1'}`}
             >
-              <FontAwesome6 name='file-video' size={32} color='rgb(37, 165, 120)' />
-              <Text className="text-greenColor font-bold text-xs text-center mt-2 px-2">
-                {status === 'picking' ? 'Opening...' : 'Choose video/image'}
-              </Text>
+              {status === 'picking' && !selectedMedia ? (
+                <View className="items-center justify-center">
+                  <ActivityIndicator size="large" color="rgb(37, 165, 120)" />
+                  <Text className="text-greenColor font-bold text-xs text-center mt-2 px-2">
+                    Loading...
+                  </Text>
+                </View>
+              ) : (
+                <>
+                  <FontAwesome6 name='file-video' size={32} color='rgb(37, 165, 120)' />
+                  <Text className="text-greenColor font-bold text-xs text-center mt-2 px-2">
+                    Choose video/image
+                  </Text>
+                </>
+              )}
             </Pressable>
 
             {selectedMedia && (
               <View className="bg-white border border-gray-200 rounded-lg p-2.5 mt-3">
-                <Text className="text-gray-800 font-medium text-xs" numberOfLines={1}>{selectedMedia.name}</Text>
+                <View className="flex-row items-center justify-between mb-1">
+                  <Text className="text-gray-800 font-medium text-xs flex-1" numberOfLines={1}>
+                    {selectedMedia.name}
+                  </Text>
+                  {status !== 'uploading' && (
+                    <Pressable 
+                      onPress={() => {
+                        setSelectedMedia(null)
+                        setMessage('')
+                        setStatus('idle')
+                      }}
+                      className="ml-2"
+                    >
+                      <Ionicons name="close" size={18} color="#9CA3AF" />
+                    </Pressable>
+                  )}
+                </View>
                 <Text className="text-gray-500 text-xs mt-0.5">
                   {selectedMedia.size ? `${(selectedMedia.size / (1024 * 1024)).toFixed(2)} MB` : 'Size unknown'}
                 </Text>
+                {selectedMedia.size && selectedMedia.size > 500 * 1024 * 1024 && (
+                  <Text className="text-orange-600 text-xs mt-1 font-semibold">
+                    ⚠️  Large file - may take time
+                  </Text>
+                )}
               </View>
             )}
           </View>
@@ -1183,15 +1374,44 @@ const Homescreen = () => {
               disabled={isBusy}
               className={`h-[100px] items-center justify-center rounded-lg border-2 border-blue-500 ${isBusy ? 'bg-gray-300' : 'bg-blue-50'}`}
             >
-              <FontAwesome6 name='file-lines' size={32} color='rgb(59, 130, 246)' />
-              <Text className="text-blue-600 font-bold text-xs text-center mt-2 px-2">
-                {status === 'picking' ? 'Opening...' : 'Choose SRT file'}
-              </Text>
+              {status === 'picking' && selectedMedia && !selectedSrt ? (
+                <View className="items-center justify-center">
+                  <ActivityIndicator size="large" color="rgb(59, 130, 246)" />
+                  <Text className="text-blue-600 font-bold text-xs text-center mt-2 px-2">
+                    Loading...
+                  </Text>
+                </View>
+              ) : (
+                <>
+                  <FontAwesome6 name='file-lines' size={32} color='rgb(59, 130, 246)' />
+                  <Text className="text-blue-600 font-bold text-xs text-center mt-2 px-2">
+                    Choose SRT file
+                  </Text>
+                </>
+              )}
             </Pressable>
 
             {selectedSrt && (
               <View className="bg-white border border-gray-200 rounded-lg p-2.5 mt-3">
-                <Text className="text-gray-800 font-medium text-xs" numberOfLines={1}>{selectedSrt.name}</Text>
+                <View className="flex-row items-center justify-between mb-1">
+                  <Text className="text-gray-800 font-medium text-xs flex-1" numberOfLines={1}>
+                    {selectedSrt.name}
+                  </Text>
+                  {status !== 'uploading' && (
+                    <Pressable 
+                      onPress={() => {
+                        setSelectedSrt(null)
+                        if (!selectedMedia) {
+                          setMessage('')
+                          setStatus('idle')
+                        }
+                      }}
+                      className="ml-2"
+                    >
+                      <Ionicons name="close" size={18} color="#9CA3AF" />
+                    </Pressable>
+                  )}
+                </View>
                 <Text className="text-gray-500 text-xs mt-0.5">
                   {selectedSrt.size ? `${(selectedSrt.size / 1024).toFixed(2)} KB` : 'Size unknown'}
                 </Text>
@@ -1199,6 +1419,18 @@ const Homescreen = () => {
             )}
           </View>
         </View>
+        
+        {/* File Name Match Warning */}
+        {selectedSrt && selectedMedia && !fileNamesMatch && (
+          <View className="bg-orange-50 border border-orange-300 rounded-lg p-3 mb-4 w-full">
+            <View className="flex-row items-center">
+              <Ionicons name="warning" size={20} color="#F97316" />
+              <Text className="text-orange-700 font-semibold text-xs ml-2 flex-1">
+                File names don't match! GPS data may not sync correctly.
+              </Text>
+            </View>
+          </View>
+        )}
 
         <Pressable
           onPress={mockUpload}

@@ -4,10 +4,13 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs'
 import Homescreen from '../screens/Homescreen'
 import Mapscreen from '../screens/Mapscreen'
 import DetectionResults from '../screens/DetResultscreen'
+import { useSession } from '../context/SessionContext'
 
 const Tab = createBottomTabNavigator()
 
 const NavigationBar = () => {
+  const { navigationLocked } = useSession()
+  
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
@@ -24,12 +27,32 @@ const NavigationBar = () => {
         }
       })}
     >
-      <Tab.Screen name="Home" component={Homescreen} />
-      <Tab.Screen name="Map" component={Mapscreen} />
+      <Tab.Screen 
+        name="Home" 
+        component={Homescreen}
+      />
+      <Tab.Screen 
+        name="Map" 
+        component={Mapscreen}
+        listeners={{
+          tabPress: (e) => {
+            if (navigationLocked) {
+              e.preventDefault()
+            }
+          },
+        }}
+      />
       <Tab.Screen
         name="DetectionResults"
         component={DetectionResults}
         options={{ title: 'Results' }}
+        listeners={{
+          tabPress: (e) => {
+            if (navigationLocked) {
+              e.preventDefault()
+            }
+          },
+        }}
       />
     </Tab.Navigator>
   )

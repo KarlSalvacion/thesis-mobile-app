@@ -1,346 +1,541 @@
-import sqlite3
+import psycopg2
+from psycopg2 import pool, sql
+from psycopg2.extras import RealDictCursor, execute_batch
 import json
 import os
 from datetime import datetime
+from contextlib import contextmanager
+from .config import DATABASE_URL, DB_POOL_MIN_CONN, DB_POOL_MAX_CONN
 
-# Store database in backend folder
-DB_NAME = os.path.join(os.path.dirname(__file__), "weed_detection.db")
+# PostgreSQL connection pool
+connection_pool = None
+
+def init_connection_pool():
+    '''Initialize PostgreSQL connection pool.'''
+    global connection_pool
+    if connection_pool is None:
+        try:
+            connection_pool = psycopg2.pool.SimpleConnectionPool(
+                DB_POOL_MIN_CONN,
+                DB_POOL_MAX_CONN,
+                DATABASE_URL
+            )
+            print(f"PostgreSQL connection pool created ({DB_POOL_MIN_CONN}-{DB_POOL_MAX_CONN} connections)")
+        except Exception as e:
+            print(f"Error creating connection pool: {e}")
+            raise
+
+@contextmanager
+def get_db_connection():
+    '''Context manager for database connections from pool.'''
+    if connection_pool is None:
+        init_connection_pool()
+    
+    conn = connection_pool.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        connection_pool.putconn(conn)
+
+def close_connection_pool():
+    '''Close all connections in the pool.'''
+    global connection_pool
+    if connection_pool:
+        connection_pool.closeall()
+        connection_pool = None
+        print("PostgreSQL connection pool closed")
 
 def init_db():
-    """Initialize the database and create tables if they don't exist."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Main detections table (sessions) - OPTIMIZED with summary fields
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS detections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            file_type TEXT NOT NULL,
-            summary TEXT,
-            total_frames INTEGER DEFAULT 0,
-            total_detections INTEGER DEFAULT 0,
-            processing_time REAL DEFAULT 0.0,
-            input_size_bytes INTEGER,
-            result_size_bytes INTEGER,
-            has_srt_data BOOLEAN DEFAULT FALSE,
-            cloud_public_id TEXT,
-            cloud_resource_type TEXT,
-            cloud_secure_url TEXT,
-            cloud_annotated_url TEXT,
-            -- OPTIMIZED: Cached summary fields for fast mobile app queries
-            weed_class_counts TEXT,
-            has_gps_data BOOLEAN DEFAULT FALSE,
-            bounds_min_lat REAL,
-            bounds_max_lat REAL,
-            bounds_min_lng REAL,
-            bounds_max_lng REAL
-        )
-    """)
-    
-    # REMOVED: frame_metadata table (redundant with srt_tracks)
-    # Data stored once in srt_tracks.frames_json instead of twice
-    
-    # Compact SRT track storage (aggregated per session)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS srt_tracks (
-            detection_id INTEGER PRIMARY KEY,
-            point_count INTEGER NOT NULL,
-            start_time TEXT,
-            end_time TEXT,
-            bounds_geojson TEXT,
-            path_geojson TEXT NOT NULL,
-            frames_json TEXT NOT NULL,
-            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
-        )
-    """)
+    '''Initialize the database and create tables if they don't exist.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS detections (
+                id SERIAL PRIMARY KEY,
+                filename TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                summary TEXT,
+                total_frames INTEGER DEFAULT 0,
+                total_detections INTEGER DEFAULT 0,
+                processing_time REAL DEFAULT 0.0,
+                input_size_bytes INTEGER,
+                result_size_bytes INTEGER,
+                has_srt_data BOOLEAN DEFAULT FALSE,
+                cloud_public_id TEXT,
+                cloud_resource_type TEXT,
+                cloud_secure_url TEXT,
+                cloud_annotated_url TEXT,
+                weed_class_counts TEXT,
+                has_gps_data BOOLEAN DEFAULT FALSE,
+                bounds_min_lat REAL,
+                bounds_max_lat REAL,
+                bounds_min_lng REAL,
+                bounds_max_lng REAL
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS srt_tracks (
+                detection_id INTEGER PRIMARY KEY,
+                point_count INTEGER NOT NULL,
+                start_time TEXT,
+                end_time TEXT,
+                bounds_geojson TEXT,
+                path_geojson TEXT NOT NULL,
+                frames_json TEXT NOT NULL,
+                FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+            )
+        ''')
 
-    # Optional aggregated heatmap storage per session (grid-based)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS heatmaps (
-            detection_id INTEGER PRIMARY KEY,
-            grid_size_m REAL NOT NULL,
-            bounds_geojson TEXT,
-            cells_json TEXT NOT NULL,
-            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
-        )
-    """)
-    
-    # Individual detection details table - OPTIMIZED with GPS data
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS detection_details (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            detection_id INTEGER NOT NULL,
-            frame_number INTEGER NOT NULL,
-            weed_class TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            bbox_x REAL NOT NULL,
-            bbox_y REAL NOT NULL,
-            bbox_width REAL NOT NULL,
-            bbox_height REAL NOT NULL,
-            normalized_bbox_x REAL,
-            normalized_bbox_y REAL,
-            normalized_bbox_width REAL,
-            normalized_bbox_height REAL,
-            detection_timestamp TEXT NOT NULL,
-            -- OPTIMIZED: GPS coordinates stored directly for fast heatmap generation
-            latitude REAL,
-            longitude REAL,
-            altitude REAL,
-            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
-        )
-    """)
-    
-    # OPTIMIZED: Better indexes for mobile app queries
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_timestamp ON detections(timestamp DESC)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_has_srt ON detections(has_srt_data)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_file_type ON detections(file_type)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_session ON detection_details(detection_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_class ON detection_details(weed_class)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_gps ON detection_details(detection_id, latitude, longitude)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_frame ON detection_details(detection_id, frame_number)")
-    
-    # Persistent job queue for handling connectivity issues and resumption
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS processing_jobs (
-            job_id TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            progress TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            detection_id INTEGER,
-            original_filename TEXT,
-            media_path TEXT,
-            temp_video_path TEXT,
-            is_video BOOLEAN DEFAULT FALSE,
-            is_image BOOLEAN DEFAULT FALSE,
-            has_srt BOOLEAN DEFAULT FALSE,
-            result_json TEXT,
-            error_message TEXT,
-            needs_client_compression BOOLEAN DEFAULT FALSE,
-            compression_started_at TEXT,
-            compression_completed_at TEXT,
-            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE SET NULL
-        )
-    """)
-    
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON processing_jobs(status)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON processing_jobs(created_at DESC)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_needs_compression ON processing_jobs(needs_client_compression, status)")
-    
-    conn.commit()
-
-    # Backfill columns for older DBs (SQLite lacks IF NOT EXISTS for columns)
-    existing_columns = [row[1] for row in cursor.execute("PRAGMA table_info(detections)").fetchall()]
-    
-    columns_to_add = [
-        ("input_size_bytes", "INTEGER"),
-        ("result_size_bytes", "INTEGER"),
-        ("has_srt_data", "BOOLEAN DEFAULT FALSE"),
-        ("cloud_public_id", "TEXT"),
-        ("cloud_resource_type", "TEXT"),
-        ("cloud_secure_url", "TEXT"),
-        ("cloud_annotated_url", "TEXT"),
-        # New optimized columns
-        ("weed_class_counts", "TEXT"),
-        ("has_gps_data", "BOOLEAN DEFAULT FALSE"),
-        ("bounds_min_lat", "REAL"),
-        ("bounds_max_lat", "REAL"),
-        ("bounds_min_lng", "REAL"),
-        ("bounds_max_lng", "REAL"),
-    ]
-    
-    for col_name, col_type in columns_to_add:
-        if col_name not in existing_columns:
-            try:
-                cursor.execute(f"ALTER TABLE detections ADD COLUMN {col_name} {col_type}")
-                conn.commit()
-            except Exception as e:
-                pass  # Column might already exist
-    
-    # Backfill GPS columns in detection_details
-    existing_detail_columns = [row[1] for row in cursor.execute("PRAGMA table_info(detection_details)").fetchall()]
-    detail_columns_to_add = [
-        ("latitude", "REAL"),
-        ("longitude", "REAL"),
-        ("altitude", "REAL"),
-    ]
-    
-    for col_name, col_type in detail_columns_to_add:
-        if col_name not in existing_detail_columns:
-            try:
-                cursor.execute(f"ALTER TABLE detection_details ADD COLUMN {col_name} {col_type}")
-                conn.commit()
-            except Exception:
-                pass
-    
-    conn.close()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS heatmaps (
+                detection_id INTEGER PRIMARY KEY,
+                grid_size_m REAL NOT NULL,
+                bounds_geojson TEXT,
+                cells_json TEXT NOT NULL,
+                FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS detection_details (
+                id SERIAL PRIMARY KEY,
+                detection_id INTEGER NOT NULL,
+                frame_number INTEGER NOT NULL,
+                weed_class TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                bbox_x REAL NOT NULL,
+                bbox_y REAL NOT NULL,
+                bbox_width REAL NOT NULL,
+                bbox_height REAL NOT NULL,
+                normalized_bbox_x REAL,
+                normalized_bbox_y REAL,
+                normalized_bbox_width REAL,
+                normalized_bbox_height REAL,
+                detection_timestamp TEXT NOT NULL,
+                latitude REAL,
+                longitude REAL,
+                altitude REAL,
+                FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS processing_jobs (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT UNIQUE NOT NULL,
+                detection_id INTEGER,
+                status TEXT NOT NULL,
+                progress TEXT,
+                error_message TEXT,
+                original_filename TEXT,
+                is_video BOOLEAN DEFAULT FALSE,
+                is_image BOOLEAN DEFAULT FALSE,
+                has_srt BOOLEAN DEFAULT FALSE,
+                result_json TEXT,
+                temp_video_path TEXT,
+                needs_client_compression BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+            )
+        ''')
+        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_timestamp ON detections(timestamp DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_has_srt ON detections(has_srt_data)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_detections_file_type ON detections(file_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_session ON detection_details(detection_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_class ON detection_details(weed_class)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_gps ON detection_details(detection_id, latitude, longitude)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_details_frame ON detection_details(detection_id, frame_number)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_processing_jobs_detection ON processing_jobs(detection_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs(status)")
+        
+        conn.commit()
+        print("PostgreSQL database initialized successfully")
 
 def reset_compact_tables():
-    """Drop and recreate compact SRT/heatmap tables to reset data."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    # Drop if exist
-    cursor.execute("DROP TABLE IF EXISTS srt_tracks")
-    cursor.execute("DROP TABLE IF EXISTS heatmaps")
-    conn.commit()
-    # Recreate
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS srt_tracks (
-            detection_id INTEGER PRIMARY KEY,
-            point_count INTEGER NOT NULL,
-            start_time TEXT,
-            end_time TEXT,
-            bounds_geojson TEXT,
-            path_geojson TEXT NOT NULL,
-            frames_json TEXT NOT NULL,
-            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS heatmaps (
-            detection_id INTEGER PRIMARY KEY,
-            grid_size_m REAL NOT NULL,
-            bounds_geojson TEXT,
-            cells_json TEXT NOT NULL,
-            FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
-        )
-    """)
-    conn.commit()
-    conn.close()
+    '''Drop and recreate compact SRT/heatmap tables to reset data.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS srt_tracks CASCADE")
+        cursor.execute("DROP TABLE IF EXISTS heatmaps CASCADE")
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS srt_tracks (
+                detection_id INTEGER PRIMARY KEY,
+                point_count INTEGER NOT NULL,
+                start_time TEXT,
+                end_time TEXT,
+                bounds_geojson TEXT,
+                path_geojson TEXT NOT NULL,
+                frames_json TEXT NOT NULL,
+                FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS heatmaps (
+                detection_id INTEGER PRIMARY KEY,
+                grid_size_m REAL NOT NULL,
+                bounds_geojson TEXT,
+                cells_json TEXT NOT NULL,
+                FOREIGN KEY (detection_id) REFERENCES detections (id) ON DELETE CASCADE
+            )
+        ''')
+        
+        conn.commit()
 
-def insert_detection(
-    filename,
-    timestamp,
-    file_type,
-    summary,
-    total_frames=0,
-    total_detections=0,
-    processing_time=0.0,
-    input_size_bytes=None,
-    result_size_bytes=None,
-    has_srt_data=False,
-    cloud_public_id=None,
-    cloud_resource_type=None,
-    cloud_secure_url=None,
-    cloud_annotated_url=None,
-):
-    """Insert a new detection session record."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO detections (filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data, cloud_public_id, cloud_resource_type, cloud_secure_url, cloud_annotated_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            filename,
-            timestamp,
-            file_type,
-            summary,
-            total_frames,
-            total_detections,
-            processing_time,
-            input_size_bytes,
-            result_size_bytes,
-            has_srt_data,
-            cloud_public_id,
-            cloud_resource_type,
-            cloud_secure_url,
-            cloud_annotated_url,
-        ),
-    )
-    detection_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return detection_id
+def drop_all_tables():
+    '''Drop all tables in the database.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS processing_jobs CASCADE")
+        cursor.execute("DROP TABLE IF EXISTS detection_details CASCADE")
+        cursor.execute("DROP TABLE IF EXISTS heatmaps CASCADE")
+        cursor.execute("DROP TABLE IF EXISTS srt_tracks CASCADE")
+        cursor.execute("DROP TABLE IF EXISTS detections CASCADE")
+        conn.commit()
+        print("All tables dropped successfully")
 
-def insert_detection_details(detection_id, detection_data):
-    """Insert individual weed detection details."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO detection_details (
-            detection_id, frame_number, weed_class, confidence, 
-            bbox_x, bbox_y, bbox_width, bbox_height,
-            normalized_bbox_x, normalized_bbox_y, normalized_bbox_width, normalized_bbox_height,
-            detection_timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        detection_id, detection_data['frame_number'], detection_data['weed_class'],
-        detection_data['confidence'], detection_data['bbox_x'], detection_data['bbox_y'],
-        detection_data['bbox_width'], detection_data['bbox_height'],
-        detection_data.get('normalized_bbox_x'), detection_data.get('normalized_bbox_y'),
-        detection_data.get('normalized_bbox_width'), detection_data.get('normalized_bbox_height'),
-        detection_data['detection_timestamp']
-    ))
-    
-    conn.commit()
-    conn.close()
+def insert_detection(filename, file_type, summary="", processing_time=0.0, 
+                    input_size_bytes=0, result_size_bytes=0,
+                    cloud_public_id=None, cloud_resource_type=None, 
+                    cloud_secure_url=None, cloud_annotated_url=None,
+                    timestamp=None, total_frames=0, total_detections=0, has_srt_data=False):
+    '''Insert a new detection record and return its ID.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if timestamp is None:
+            timestamp = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO detections (
+                filename, timestamp, file_type, summary, processing_time,
+                input_size_bytes, result_size_bytes,
+                cloud_public_id, cloud_resource_type, cloud_secure_url, cloud_annotated_url,
+                total_frames, total_detections, has_srt_data
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        ''', (filename, timestamp, file_type, summary, processing_time,
+              input_size_bytes, result_size_bytes,
+              cloud_public_id, cloud_resource_type, cloud_secure_url, cloud_annotated_url,
+              total_frames, total_detections, has_srt_data))
+        
+        detection_id = cursor.fetchone()[0]
+        conn.commit()
+        return detection_id
 
-def batch_insert_detection_details(detection_id: int, detections_list: list, srt_frames: dict = None):
-    """Batch insert multiple detection details at once (10x faster than individual inserts).
+def update_detection(detection_id, **kwargs):
+    '''Update detection record with given fields.'''
+    if not kwargs:
+        return
     
-    Args:
-        detection_id: The parent detection session ID
-        detections_list: List of detection data dictionaries
-        srt_frames: Optional dict mapping frame_number -> (lat, lon, alt) for GPS data
-    
-    Returns:
-        Number of rows inserted
-    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        set_clause = ", ".join([f"{key} = %s" for key in kwargs.keys()])
+        values = list(kwargs.values()) + [detection_id]
+        
+        query = f"UPDATE detections SET {set_clause} WHERE id = %s"
+        cursor.execute(query, values)
+        conn.commit()
+
+def get_detection(detection_id):
+    '''Retrieve a single detection by ID.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM detections WHERE id = %s", (detection_id,))
+        return dict(cursor.fetchone()) if cursor.rowcount > 0 else None
+
+def get_all_detections():
+    '''Retrieve all detections ordered by timestamp (newest first).'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM detections ORDER BY timestamp DESC")
+        return [dict(row) for row in cursor.fetchall()]
+
+def delete_detection(detection_id):
+    '''Delete a detection and its related data (cascades automatically).'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM detections WHERE id = %s", (detection_id,))
+        conn.commit()
+
+def insert_detection_details_batch(detection_id, detections_list):
+    '''Bulk insert detection details for a session.'''
     if not detections_list:
-        return 0
+        return
     
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Prepare batch data as tuples (with GPS data if available)
-    batch_data = []
-    for det in detections_list:
-        frame_num = det['frame_number']
-        lat, lon, alt = None, None, None
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
         
-        # Look up GPS data from SRT if available
-        if srt_frames and frame_num in srt_frames:
-            lat, lon, alt = srt_frames[frame_num]
+        values = []
+        for d in detections_list:
+            # Handle both old format (nested bbox/gps) and new format (flattened)
+            if 'bbox' in d and isinstance(d['bbox'], dict):
+                # Old format with nested dict
+                bbox_x = d['bbox']['x']
+                bbox_y = d['bbox']['y']
+                bbox_width = d['bbox']['width']
+                bbox_height = d['bbox']['height']
+                weed_class = d['class']
+            else:
+                # New format with flattened fields
+                bbox_x = d.get('bbox_x', 0)
+                bbox_y = d.get('bbox_y', 0)
+                bbox_width = d.get('bbox_width', 0)
+                bbox_height = d.get('bbox_height', 0)
+                weed_class = d.get('weed_class', 'unknown')
+            
+            values.append((
+                detection_id,
+                d.get('frame_number', 0),
+                weed_class,
+                d.get('confidence', 0.0),
+                bbox_x,
+                bbox_y,
+                bbox_width,
+                bbox_height,
+                d.get('normalized_bbox', {}).get('x') if isinstance(d.get('normalized_bbox'), dict) else None,
+                d.get('normalized_bbox', {}).get('y') if isinstance(d.get('normalized_bbox'), dict) else None,
+                d.get('normalized_bbox', {}).get('width') if isinstance(d.get('normalized_bbox'), dict) else None,
+                d.get('normalized_bbox', {}).get('height') if isinstance(d.get('normalized_bbox'), dict) else None,
+                d.get('detection_timestamp') or d.get('timestamp'),
+                d.get('gps', {}).get('latitude') if isinstance(d.get('gps'), dict) else d.get('latitude'),
+                d.get('gps', {}).get('longitude') if isinstance(d.get('gps'), dict) else d.get('longitude'),
+                d.get('gps', {}).get('altitude') if isinstance(d.get('gps'), dict) else d.get('altitude')
+            ))
         
-        batch_data.append((
-            detection_id,
-            frame_num,
-            det['weed_class'],
-            det['confidence'],
-            det['bbox_x'],
-            det['bbox_y'],
-            det['bbox_width'],
-            det['bbox_height'],
-            det.get('normalized_bbox_x'),
-            det.get('normalized_bbox_y'),
-            det.get('normalized_bbox_width'),
-            det.get('normalized_bbox_height'),
-            det['detection_timestamp'],
-            lat,
-            lon,
-            alt
-        ))
-    
-    # Use executemany for batch insert (much faster than individual inserts)
-    cursor.executemany("""
-        INSERT INTO detection_details (
-            detection_id, frame_number, weed_class, confidence, 
-            bbox_x, bbox_y, bbox_width, bbox_height,
-            normalized_bbox_x, normalized_bbox_y, normalized_bbox_width, normalized_bbox_height,
-            detection_timestamp, latitude, longitude, altitude
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, batch_data)
-    
-    rows_inserted = cursor.rowcount
-    conn.commit()
-    conn.close()
-    
-    return rows_inserted
+        execute_batch(cursor, '''
+            INSERT INTO detection_details (
+                detection_id, frame_number, weed_class, confidence,
+                bbox_x, bbox_y, bbox_width, bbox_height,
+                normalized_bbox_x, normalized_bbox_y, normalized_bbox_width, normalized_bbox_height,
+                detection_timestamp, latitude, longitude, altitude
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ''', values)
+        
+        conn.commit()
 
+# Alias for backward compatibility
+batch_insert_detection_details = insert_detection_details_batch
 
-def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.5, frame_gap: int = 20) -> dict:
+def get_detection_details(detection_id):
+    '''Retrieve all detection details for a session.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT * FROM detection_details 
+            WHERE detection_id = %s 
+            ORDER BY frame_number, id
+        ''', (detection_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_detection_details_with_gps(detection_id):
+    '''Retrieve detection details that have GPS coordinates.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT * FROM detection_details 
+            WHERE detection_id = %s 
+            AND latitude IS NOT NULL 
+            AND longitude IS NOT NULL
+            ORDER BY frame_number
+        ''', (detection_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+def count_detections_by_class(detection_id):
+    '''Count detections grouped by weed class.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT weed_class, COUNT(*) as count 
+            FROM detection_details 
+            WHERE detection_id = %s 
+            GROUP BY weed_class
+        ''', (detection_id,))
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
+def insert_srt_track(detection_id, point_count, start_time, end_time, 
+                    bounds_geojson, path_geojson, frames_json):
+    '''Insert aggregated SRT track data for a session.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO srt_tracks (
+                detection_id, point_count, start_time, end_time,
+                bounds_geojson, path_geojson, frames_json
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (detection_id) DO UPDATE SET
+                point_count = EXCLUDED.point_count,
+                start_time = EXCLUDED.start_time,
+                end_time = EXCLUDED.end_time,
+                bounds_geojson = EXCLUDED.bounds_geojson,
+                path_geojson = EXCLUDED.path_geojson,
+                frames_json = EXCLUDED.frames_json
+        ''', (detection_id, point_count, start_time, end_time,
+              bounds_geojson, path_geojson, frames_json))
+        conn.commit()
+
+def get_srt_track(detection_id):
+    '''Retrieve SRT track data for a session.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT * FROM srt_tracks WHERE detection_id = %s
+        ''', (detection_id,))
+        result = cursor.fetchone()
+        return dict(result) if result else None
+
+def insert_heatmap(detection_id, grid_size_m, bounds_geojson, cells_json):
+    '''Insert aggregated heatmap data for a session.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO heatmaps (
+                detection_id, grid_size_m, bounds_geojson, cells_json
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (detection_id) DO UPDATE SET
+                grid_size_m = EXCLUDED.grid_size_m,
+                bounds_geojson = EXCLUDED.bounds_geojson,
+                cells_json = EXCLUDED.cells_json
+        ''', (detection_id, grid_size_m, bounds_geojson, cells_json))
+        conn.commit()
+
+def get_heatmap(detection_id):
+    '''Retrieve heatmap data for a session.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT * FROM heatmaps WHERE detection_id = %s
+        ''', (detection_id,))
+        result = cursor.fetchone()
+        return dict(result) if result else None
+
+def get_jobs_by_detection(detection_id):
+    '''Get all jobs for a detection.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT * FROM processing_jobs 
+            WHERE detection_id = %s 
+            ORDER BY created_at DESC
+        ''', (detection_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_pending_jobs():
+    '''Get all pending processing jobs.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT * FROM processing_jobs 
+            WHERE status = 'pending' 
+            ORDER BY created_at ASC
+        ''')
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_unique_weed_classes():
+    '''Get all unique weed classes from detection_details.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT DISTINCT weed_class 
+            FROM detection_details 
+            ORDER BY weed_class
+        ''')
+        return [row[0] for row in cursor.fetchall()]
+
+# Alias functions for backward compatibility with main.py
+def insert_detection_details(detection_id, detection_data):
+    '''Insert a single detection detail (backward compatibility wrapper).'''
+    return insert_detection_details_batch(detection_id, [detection_data])
+
+def fetch_detection_session(detection_id):
+    '''Fetch complete detection session with all details, srt_track, and detection_details.
+    Returns same format as SQLite version for frontend compatibility.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Get main detection info
+        cursor.execute("SELECT * FROM detections WHERE id = %s", (detection_id,))
+        detection = cursor.fetchone()
+        
+        if not detection:
+            return None
+        
+        # Get compact SRT track (if available)
+        cursor.execute("""
+            SELECT detection_id, point_count, start_time, end_time, 
+                   bounds_geojson, path_geojson, frames_json 
+            FROM srt_tracks WHERE detection_id = %s
+        """, (detection_id,))
+        srt_track = cursor.fetchone()
+        
+        # Get detection details
+        cursor.execute("""
+            SELECT * FROM detection_details 
+            WHERE detection_id = %s 
+            ORDER BY frame_number, id
+        """, (detection_id,))
+        detection_details = cursor.fetchall()
+        
+        return {
+            'detection': dict(detection),
+            'srt_track': dict(srt_track) if srt_track else None,
+            'detection_details': [dict(row) for row in detection_details],
+            'frame_metadata': []  # Deprecated: kept for backward compatibility
+        }
+
+def fetch_all_detections():
+    '''Fetch all detections (alias for get_all_detections).'''
+    return get_all_detections()
+
+def get_detection_statistics():
+    '''Get overall detection statistics.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total_sessions,
+                SUM(total_detections) as total_detections,
+                SUM(total_frames) as total_frames_processed,
+                COUNT(DISTINCT CASE WHEN has_srt_data THEN id END) as sessions_with_gps
+            FROM detections
+        ''')
+        return dict(cursor.fetchone())
+
+def upsert_srt_track(detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json):
+    '''Upsert SRT track (alias for insert_srt_track).'''
+    return insert_srt_track(detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json)
+
+def update_srt_status(detection_id, has_srt_data):
+    '''Update SRT status for a detection.'''
+    update_detection(detection_id, has_srt_data=has_srt_data)
+
+def fetch_detections_by_class(weed_class):
+    '''Fetch all detections that contain a specific weed class.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT DISTINCT d.* 
+            FROM detections d
+            INNER JOIN detection_details dd ON d.id = dd.detection_id
+            WHERE dd.weed_class = %s
+            ORDER BY d.timestamp DESC
+        ''', (weed_class,))
+        return [dict(row) for row in cursor.fetchall()]
+
+def upsert_heatmap(detection_id, grid_size_m, bounds_geojson, cells_json):
+    '''Upsert heatmap (alias for insert_heatmap).'''
+    return insert_heatmap(detection_id, grid_size_m, bounds_geojson, cells_json)
+
+def calculate_unique_weeds(detection_id, iou_threshold=0.5, frame_gap=20):
     """Calculate unique weed count by tracking weeds across frames using a simple online tracker.
 
     This function iterates detections in temporal order and attempts to match each detection
@@ -362,21 +557,19 @@ def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.5, frame_
     Returns:
         dict with unique_count, total_detections, tracks, and breakdown by class
     """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT id, frame_number, weed_class, confidence,
-               bbox_x, bbox_y, bbox_width, bbox_height,
-               latitude, longitude
-        FROM detection_details
-        WHERE detection_id = ?
-        ORDER BY frame_number, id
-    """, (detection_id,))
-
-    rows = cursor.fetchall()
-    conn.close()
-
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT id, frame_number, weed_class, confidence,
+                   bbox_x, bbox_y, bbox_width, bbox_height,
+                   latitude, longitude
+            FROM detection_details
+            WHERE detection_id = %s
+            ORDER BY frame_number, id
+        """, (detection_id,))
+        
+        rows = cursor.fetchall()
+    
     if not rows:
         return {'unique_count': 0, 'total_detections': 0, 'tracks': [], 'by_class': {}, 'reduction_percentage': 0}
 
@@ -409,15 +602,14 @@ def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.5, frame_
     # Build detection list
     detections = []
     for r in rows:
-        det_id, frame_num, weed_class, confidence, bx, by, bw, bh, lat, lon = r
         detections.append({
-            'id': det_id,
-            'frame': frame_num,
-            'class': weed_class,
-            'confidence': confidence,
-            'bbox': (bx, by, bw, bh),
-            'lat': lat,
-            'lon': lon
+            'id': r['id'],
+            'frame': r['frame_number'],
+            'class': r['weed_class'],
+            'confidence': r['confidence'],
+            'bbox': (r['bbox_x'], r['bbox_y'], r['bbox_width'], r['bbox_height']),
+            'lat': r['latitude'],
+            'lon': r['longitude']
         })
 
     # Online tracker: tracks is a list of dicts with last seen bbox/frame and history
@@ -511,496 +703,115 @@ def calculate_unique_weeds(detection_id: int, iou_threshold: float = 0.5, frame_
         'reduction_percentage': reduction
     }
 
-
-def update_session_summary(detection_id: int):
-    """Update cached summary fields in detections table for fast mobile queries.
-    
-    Call this after inserting detection_details to cache:
-    - weed_class_counts (JSON)
-    - has_gps_data
-    - bounds (min/max lat/lng)
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Get class counts
-    cursor.execute("""
-        SELECT weed_class, COUNT(*) 
-        FROM detection_details 
-        WHERE detection_id = ? 
-        GROUP BY weed_class
-    """, (detection_id,))
-    class_counts = {row[0]: row[1] for row in cursor.fetchall()}
-    class_counts_json = json.dumps(class_counts)
-    
-    # Check if any detections have GPS data
-    cursor.execute("""
-        SELECT COUNT(*) 
-        FROM detection_details 
-        WHERE detection_id = ? AND latitude IS NOT NULL
-    """, (detection_id,))
-    has_gps = cursor.fetchone()[0] > 0
-    
-    # Get GPS bounds if available
-    bounds = {}
-    if has_gps:
-        cursor.execute("""
-            SELECT 
-                MIN(latitude), MAX(latitude),
-                MIN(longitude), MAX(longitude)
-            FROM detection_details 
-            WHERE detection_id = ? AND latitude IS NOT NULL
-        """, (detection_id,))
-        result = cursor.fetchone()
-        if result and result[0] is not None:
-            bounds = {
-                'min_lat': result[0],
-                'max_lat': result[1],
-                'min_lng': result[2],
-                'max_lng': result[3]
-            }
-    
-    # Update detections table
-    cursor.execute("""
-        UPDATE detections SET
-            weed_class_counts = ?,
-            has_gps_data = ?,
-            bounds_min_lat = ?,
-            bounds_max_lat = ?,
-            bounds_min_lng = ?,
-            bounds_max_lng = ?
-        WHERE id = ?
-    """, (
-        class_counts_json,
-        has_gps,
-        bounds.get('min_lat'),
-        bounds.get('max_lat'),
-        bounds.get('min_lng'),
-        bounds.get('max_lng'),
-        detection_id
-    ))
-    
-    conn.commit()
-    conn.close()
-
-
-def get_sessions_for_mobile():
-    """Get all detection sessions optimized for mobile app list view.
-    
-    Returns session data with cached summaries (no joins needed).
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT 
-            id, filename, timestamp, file_type, 
-            total_frames, total_detections, 
-            cloud_secure_url, cloud_annotated_url,
-            weed_class_counts, has_gps_data, has_srt_data
-        FROM detections 
-        ORDER BY timestamp DESC
-    """)
-    
-    sessions = []
-    for row in cursor.fetchall():
-        session = {
-            'id': row[0],
-            'filename': row[1],
-            'timestamp': row[2],
-            'file_type': row[3],
-            'total_frames': row[4],
-            'total_detections': row[5],
-            'cloud_secure_url': row[6],
-            'cloud_annotated_url': row[7],
-            'weed_class_counts': json.loads(row[8]) if row[8] else {},
-            'has_gps_data': bool(row[9]),
-            'has_srt_data': bool(row[10])
-        }
-        sessions.append(session)
-    
-    conn.close()
-    return sessions
-
-
-def get_detections_for_heatmap(detection_id: int):
-    """Get all detections with GPS data for heatmap generation (single query).
-    
-    Much faster than joining tables - GPS data stored directly in detection_details.
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT 
-            frame_number, weed_class, confidence,
-            latitude, longitude, altitude,
-            bbox_x, bbox_y, bbox_width, bbox_height
-        FROM detection_details
-        WHERE detection_id = ? AND latitude IS NOT NULL
-        ORDER BY frame_number
-    """, (detection_id,))
-    
-    detections = []
-    for row in cursor.fetchall():
-        detections.append({
-            'frame_number': row[0],
-            'weed_class': row[1],
-            'confidence': row[2],
-            'latitude': row[3],
-            'longitude': row[4],
-            'altitude': row[5],
-            'bbox': [row[6], row[7], row[8], row[9]]
-        })
-    
-    conn.close()
-    return detections
-
-
-def fetch_detection_session(detection_id):
-    """Fetch complete detection session with all details."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Get main detection info
-    cursor.execute("SELECT * FROM detections WHERE id = ?", (detection_id,))
-    detection = cursor.fetchone()
-    
-    if not detection:
-        conn.close()
-        return None
-    
-    # Get compact SRT track (if available)
-    cursor.execute("SELECT detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json FROM srt_tracks WHERE detection_id = ?", (detection_id,))
-    srt_track = cursor.fetchone()
-    
-    # Get detection details
-    cursor.execute("SELECT * FROM detection_details WHERE detection_id = ? ORDER BY frame_number, id", (detection_id,))
-    detection_details = cursor.fetchall()
-    
-    conn.close()
-    
-    return {
-        'detection': detection,
-        'srt_track': srt_track,
-        'detection_details': detection_details,
-        'frame_metadata': []  # Deprecated: frame_metadata table removed, kept for backward compatibility
-    }
-
-def upsert_srt_track(detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json):
-    """Insert or replace compact SRT track for a detection session."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO srt_tracks (detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(detection_id) DO UPDATE SET
-            point_count=excluded.point_count,
-            start_time=excluded.start_time,
-            end_time=excluded.end_time,
-            bounds_geojson=excluded.bounds_geojson,
-            path_geojson=excluded.path_geojson,
-            frames_json=excluded.frames_json
-        """,
-        (detection_id, point_count, start_time, end_time, bounds_geojson, path_geojson, frames_json)
-    )
-    
-    # Update the detection record to mark it as having SRT data
-    cursor.execute(
-        "UPDATE detections SET has_srt_data = TRUE WHERE id = ?",
-        (detection_id,)
-    )
-    
-    conn.commit()
-    conn.close()
-
-def update_srt_status(detection_id, has_srt_data):
-    """Update the SRT data status for a detection session."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE detections SET has_srt_data = ? WHERE id = ?",
-        (has_srt_data, detection_id)
-    )
-    conn.commit()
-    conn.close()
-
-def upsert_heatmap(detection_id, grid_size_m, bounds_geojson, cells_json):
-    """Insert or replace aggregated heatmap data for a detection session."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO heatmaps (detection_id, grid_size_m, bounds_geojson, cells_json)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(detection_id) DO UPDATE SET
-            grid_size_m=excluded.grid_size_m,
-            bounds_geojson=excluded.bounds_geojson,
-            cells_json=excluded.cells_json
-        """,
-        (detection_id, grid_size_m, bounds_geojson, cells_json)
-    )
-    conn.commit()
-    conn.close()
-
-def fetch_all_detections():
-    """Return all detection session records, sorted by ID descending (newest first)."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM detections ORDER BY id DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def fetch_detections_by_class(weed_class):
-    """Fetch all detections of a specific weed class."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT dd.*, d.filename, d.timestamp 
-        FROM detection_details dd 
-        JOIN detections d ON dd.detection_id = d.id 
-        WHERE dd.weed_class = ? 
-        ORDER BY d.timestamp DESC
-    """, (weed_class,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
-
-def get_detection_statistics():
-    """Get overall statistics about detections."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # Total sessions
-    cursor.execute("SELECT COUNT(*) FROM detections")
-    total_sessions = cursor.fetchone()[0]
-    
-    # Total detections
-    cursor.execute("SELECT COUNT(*) FROM detection_details")
-    total_detections = cursor.fetchone()[0]
-    
-    conn.close()
-    return {
-        "total_sessions": total_sessions,
-        "total_detections": total_detections
-    }
-
-# ========== JOB QUEUE MANAGEMENT ==========
-
+# Job queue management functions (matching SQLite interface)
 def create_processing_job(job_id, original_filename, is_video=False, is_image=False, has_srt=False):
-    """Create a new processing job in the database."""
-    import datetime
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().isoformat()
-    
-    cursor.execute("""
-        INSERT INTO processing_jobs 
-        (job_id, status, progress, created_at, updated_at, original_filename, is_video, is_image, has_srt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (job_id, "queued", "Uploaded, starting processing...", now, now, original_filename, is_video, is_image, has_srt))
-    
-    conn.commit()
-    conn.close()
+    '''Create a new processing job in the database.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO processing_jobs 
+            (job_id, status, progress, original_filename, is_video, is_image, has_srt)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ''', (job_id, 'queued', 'Uploaded, starting processing...', original_filename, is_video, is_image, has_srt))
+        conn.commit()
 
 def update_job_status(job_id, status, progress=None, error_message=None):
-    """Update job status and progress."""
-    import datetime
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().isoformat()
-    
-    if error_message:
-        cursor.execute("""
-            UPDATE processing_jobs 
-            SET status = ?, progress = ?, error_message = ?, updated_at = ?
-            WHERE job_id = ?
-        """, (status, progress, error_message, now, job_id))
-    elif progress:
-        cursor.execute("""
-            UPDATE processing_jobs 
-            SET status = ?, progress = ?, updated_at = ?
-            WHERE job_id = ?
-        """, (status, progress, now, job_id))
-    else:
-        cursor.execute("""
-            UPDATE processing_jobs 
-            SET status = ?, updated_at = ?
-            WHERE job_id = ?
-        """, (status, now, job_id))
-    
-    conn.commit()
-    conn.close()
+    '''Update job status and progress.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        updates = ['status = %s', 'updated_at = CURRENT_TIMESTAMP']
+        values = [status]
+        
+        if progress is not None:
+            updates.append('progress = %s')
+            values.append(progress)
+        
+        if error_message is not None:
+            updates.append('error_message = %s')
+            values.append(error_message)
+        
+        if status in ['completed', 'failed']:
+            updates.append('completed_at = CURRENT_TIMESTAMP')
+        
+        values.append(job_id)
+        
+        query = f"UPDATE processing_jobs SET {', '.join(updates)} WHERE job_id = %s"
+        cursor.execute(query, values)
+        conn.commit()
 
 def update_job_result(job_id, detection_id, result_json, annotated_url=None, temp_video_path=None, needs_compression=False):
-    """Update job with completed result."""
-    import datetime
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().isoformat()
-    
-    cursor.execute("""
-        UPDATE processing_jobs 
-        SET status = ?, detection_id = ?, result_json = ?, temp_video_path = ?, 
-            needs_client_compression = ?, updated_at = ?
-        WHERE job_id = ?
-    """, ("completed", detection_id, result_json, temp_video_path, needs_compression, now, job_id))
-    
-    conn.commit()
-    conn.close()
-
-def mark_compression_started(job_id):
-    """Mark that client has started downloading video for compression."""
-    import datetime
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().isoformat()
-    
-    cursor.execute("""
-        UPDATE processing_jobs 
-        SET compression_started_at = ?, updated_at = ?
-        WHERE job_id = ?
-    """, (now, now, job_id))
-    
-    conn.commit()
-    conn.close()
-
-def mark_compression_completed(job_id, annotated_url):
-    """Mark that client has completed compression and uploaded video."""
-    import datetime
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    now = datetime.datetime.now().isoformat()
-    
-    cursor.execute("""
-        UPDATE processing_jobs 
-        SET compression_completed_at = ?, needs_client_compression = ?, updated_at = ?
-        WHERE job_id = ?
-    """, (now, False, now, job_id))
-    
-    # Also update result_json to include annotated_url
-    cursor.execute("SELECT result_json FROM processing_jobs WHERE job_id = ?", (job_id,))
-    row = cursor.fetchone()
-    if row and row[0]:
-        import json
-        result = json.loads(row[0])
-        result["cloud_annotated_url"] = annotated_url
-        result["needs_client_compression"] = False
-        cursor.execute("""
+    '''Update job with result data.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
             UPDATE processing_jobs 
-            SET result_json = ?
-            WHERE job_id = ?
-        """, (json.dumps(result), job_id))
-    
-    conn.commit()
-    conn.close()
+            SET detection_id = %s,
+                status = %s,
+                progress = %s,
+                result_json = %s,
+                temp_video_path = %s,
+                needs_client_compression = %s,
+                updated_at = CURRENT_TIMESTAMP,
+                completed_at = CURRENT_TIMESTAMP
+            WHERE job_id = %s
+        ''', (detection_id, 'completed', 'Processing complete', result_json, temp_video_path, needs_compression, job_id))
+        
+        # Update detection with annotated URL
+        if annotated_url:
+            update_detection(detection_id, cloud_annotated_url=annotated_url)
+        
+        conn.commit()
 
 def get_job_status(job_id):
-    """Get job status from database."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM processing_jobs WHERE job_id = ?", (job_id,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
-        return None
-    
-    return {
-        "job_id": row[0],
-        "status": row[1],
-        "progress": row[2],
-        "created_at": row[3],
-        "updated_at": row[4],
-        "detection_id": row[5],
-        "original_filename": row[6],
-        "media_path": row[7],
-        "temp_video_path": row[8],
-        "is_video": bool(row[9]),
-        "is_image": bool(row[10]),
-        "has_srt": bool(row[11]),
-        "result_json": row[12],
-        "error_message": row[13],
-        "needs_client_compression": bool(row[14]),
-        "compression_started_at": row[15],
-        "compression_completed_at": row[16]
-    }
+    '''Get job status by job_id.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT * FROM processing_jobs WHERE job_id = %s", (job_id,))
+        result = cursor.fetchone()
+        return dict(result) if result else None
+
+def mark_compression_started(job_id):
+    '''Mark compression as started.'''
+    return update_job_status(job_id, status='compressing', progress='Compressing video...')
+
+def mark_compression_completed(job_id, annotated_url):
+    '''Mark compression as completed.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE processing_jobs 
+            SET status = %s, 
+                progress = %s,
+                updated_at = CURRENT_TIMESTAMP,
+                completed_at = CURRENT_TIMESTAMP
+            WHERE job_id = %s
+        ''', ('completed', 'Compression complete', job_id))
+        conn.commit()
 
 def get_pending_compression_jobs():
-    """Get all jobs waiting for client-side compression."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT * FROM processing_jobs 
-        WHERE status = 'completed' AND needs_client_compression = 1
-        ORDER BY created_at DESC
-    """)
-    rows = cursor.fetchall()
-    conn.close()
-    
-    jobs = []
-    for row in rows:
-        jobs.append({
-            "job_id": row[0],
-            "status": row[1],
-            "progress": row[2],
-            "created_at": row[3],
-            "updated_at": row[4],
-            "detection_id": row[5],
-            "original_filename": row[6],
-            "temp_video_path": row[8],
-            "needs_client_compression": bool(row[14]),
-            "compression_started_at": row[15]
-        })
-    
-    return jobs
+    '''Get jobs that need compression.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute('''
+            SELECT * FROM processing_jobs 
+            WHERE status IN ('pending', 'processing', 'queued') 
+            ORDER BY created_at ASC
+        ''')
+        return [dict(row) for row in cursor.fetchall()]
 
 def cleanup_old_jobs(days=7):
-    """Clean up old completed/failed jobs older than specified days."""
-    import datetime
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat()
-    cursor.execute("""
-        DELETE FROM processing_jobs 
-        WHERE status IN ('completed', 'failed') 
-        AND updated_at < ?
-        AND needs_client_compression = 0
-    """, (cutoff,))
-    
-    deleted_count = cursor.rowcount
-    conn.commit()
-    conn.close()
-    
-    return deleted_count
+    '''Delete old completed jobs.'''
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM processing_jobs 
+            WHERE status IN ('completed', 'failed') 
+            AND created_at < (CURRENT_TIMESTAMP - INTERVAL '%s days')
+        ''', (days,))
+        deleted = cursor.rowcount
+        conn.commit()
+        return deleted
 
-    total_detections = cursor.fetchall()[0][0]
-    
-    # Weed class distribution
-    cursor.execute("SELECT weed_class, COUNT(*) FROM detection_details GROUP BY weed_class")
-    class_distribution = cursor.fetchall()
-    
-    # File type distribution
-    cursor.execute("SELECT file_type, COUNT(*) FROM detections GROUP BY file_type")
-    file_type_distribution = cursor.fetchall()
-    
-    conn.close()
-    
-    return {
-        'total_sessions': total_sessions,
-        'total_detections': total_detections,
-        'class_distribution': class_distribution,
-        'file_type_distribution': file_type_distribution
-    }
-
-if __name__ == "__main__":
-    init_db()
-    print("✅ Enhanced database initialized with new tables!")
-    print("📊 Tables created:")
-    print("   - detections (sessions)")
-    print("   - srt_tracks (compact SRT/GPS data)")
-    print("   - detection_details (individual detections)")
-    print("   - heatmaps (optional grid-based aggregation)")
+# Initialize connection pool on module import
+init_connection_pool()

@@ -20,9 +20,11 @@ interface SessionContextType {
   sessions: DetectionRow[];
   isLoading: boolean;
   error: string;
+  navigationLocked: boolean;
   setSelectedDetection: (detection: DetectionRow | null) => void;
   refreshSessions: () => Promise<void>;
   clearSelection: () => void;
+  setNavigationLocked: (locked: boolean) => void;
 }
 
 const SessionContext = createContext<SessionContextType | undefined>(undefined);
@@ -36,6 +38,7 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
   const [sessions, setSessions] = useState<DetectionRow[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [navigationLocked, setNavigationLocked] = useState(false);
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -68,9 +71,11 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
     sessions,
     isLoading,
     error,
+    navigationLocked,
     setSelectedDetection,
     refreshSessions,
     clearSelection,
+    setNavigationLocked,
   };
 
   return (

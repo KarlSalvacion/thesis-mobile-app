@@ -162,3 +162,21 @@ MEMORY_CLEANUP_INTERVAL = 300  # Clean up temp files every 5 minutes
 MAX_VIDEO_DURATION_SECONDS = 300  # 5 minutes max
 MAX_VIDEO_RESOLUTION = 1080  # 1080p max (down from 1440p)
 COMPRESSION_AGGRESSIVE_MODE = True  # More aggressive compression
+
+# ============================================================================
+# PostgreSQL Database Configuration
+# ============================================================================
+
+# Database connection settings
+# For local development, use: postgresql://username:password@localhost:5432/database_name
+# For Render.com, use the Internal Database URL from your PostgreSQL dashboard
+DATABASE_URL = os.getenv(
+    'DATABASE_URL',
+    'postgresql://postgres:lucido%4025@localhost:5432/weed_detection'
+)
+#postgresql://weed_detection_db_user:WgBIIb6U1adbqvKuSwnKnlAWox7PTrQx@dpg-d43pkhodl3ps73a675hg-a/weed_detection_db
+
+# Connection pool settings
+DB_POOL_MIN_CONN = 1  # Minimum connections in pool
+DB_POOL_MAX_CONN = 10  # Maximum connections in pool
+DB_POOL_TIMEOUT = 30  # Connection timeout in seconds

@@ -1,7 +1,6 @@
 import os
 import datetime
 import time
-import sqlite3
 import uuid
 from typing import Dict, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
@@ -9,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import json
+from psycopg2.extras import RealDictCursor
 from .inference import run_inference_auto, detect_file_type, _annotate_image_file
 import tempfile
 import traceback
@@ -22,14 +22,49 @@ except Exception:
 from .database import (
     insert_detection, insert_detection_details,
     fetch_detection_session, fetch_all_detections, get_detection_statistics,
-    upsert_srt_track, reset_compact_tables, update_srt_status, DB_NAME, init_db,
+    upsert_srt_track, reset_compact_tables, update_srt_status, init_db,
     fetch_detections_by_class, upsert_heatmap, calculate_unique_weeds,
     # Job queue management
     create_processing_job, update_job_status, update_job_result,
     get_job_status, mark_compression_started, mark_compression_completed,
-    get_pending_compression_jobs, cleanup_old_jobs
+    get_pending_compression_jobs, cleanup_old_jobs, get_db_connection, close_connection_pool
 )
 from .srt_parser import parse_srt_file, validate_srt_file
+
+# Helper function to convert dict rows to tuple arrays for frontend compatibility
+def dict_to_detection_tuple(row: dict) -> list:
+    """
+    Convert a detection dict (from RealDictCursor) to a tuple array matching frontend expectations.
+    Frontend expects a 21-element tuple in exact column order from detections table.
+    
+    Order matches: id, filename, timestamp, file_type, summary, total_frames, total_detections,
+    processing_time, input_size_bytes, result_size_bytes, has_srt_data, cloud_public_id,
+    cloud_resource_type, cloud_secure_url, cloud_annotated_url, weed_class_counts, has_gps_data,
+    bounds_min_lat, bounds_max_lat, bounds_min_lng, bounds_max_lng
+    """
+    return [
+        row['id'],                          # 0
+        row['filename'],                    # 1
+        row['timestamp'],                   # 2
+        row['file_type'],                   # 3
+        row.get('summary'),                 # 4
+        row.get('total_frames', 0),         # 5
+        row.get('total_detections', 0),     # 6
+        row.get('processing_time', 0.0),    # 7
+        row.get('input_size_bytes'),        # 8
+        row.get('result_size_bytes'),       # 9
+        row.get('has_srt_data', False),     # 10
+        row.get('cloud_public_id'),         # 11
+        row.get('cloud_resource_type'),     # 12
+        row.get('cloud_secure_url'),        # 13
+        row.get('cloud_annotated_url'),     # 14
+        row.get('weed_class_counts'),       # 15
+        row.get('has_gps_data', False),     # 16
+        row.get('bounds_min_lat'),          # 17
+        row.get('bounds_max_lat'),          # 18
+        row.get('bounds_min_lng'),          # 19
+        row.get('bounds_max_lng')           # 20
+    ]
 
 app = FastAPI()
 app.add_middleware(
@@ -624,19 +659,17 @@ async def upload_compressed_video(
         
         # Update database with annotated URL
         if detection_id:
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            try:
-                cursor.execute(
-                    "UPDATE detections SET cloud_annotated_url = ? WHERE id = ?",
-                    (annotated_url, detection_id)
-                )
-                conn.commit()
-                print(f"[Job {job_id}] Database updated with annotated URL")
-            except Exception as e:
-                print(f"[Job {job_id}] Failed to update annotated URL: {e}")
-            finally:
-                conn.close()
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(
+                        "UPDATE detections SET cloud_annotated_url = %s WHERE id = %s",
+                        (annotated_url, detection_id)
+                    )
+                    conn.commit()
+                    print(f"[Job {job_id}] Database updated with annotated URL")
+                except Exception as e:
+                    print(f"[Job {job_id}] Failed to update annotated URL: {e}")
         
         # Mark compression as completed in job queue
         mark_compression_completed(job_id, annotated_url)
@@ -975,32 +1008,78 @@ async def health_check():
 async def get_detections():
     """Get all detection sessions."""
     detections = fetch_all_detections()
-    # Optionally map in a delivery URL for convenience
-    enriched = []
-    for row in detections:
-        # row: (id, filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data, cloud_public_id, cloud_resource_type, cloud_secure_url)
-        if len(row) >= 14 and row[13]:
-            enriched.append(row)
-        else:
-            enriched.append(row)
-    return {"detections": enriched}
+    # Convert dict rows to tuple arrays for frontend compatibility
+    detection_tuples = [dict_to_detection_tuple(d) for d in detections]
+    return {"detections": detection_tuples}
 
 @app.get("/detections/with-srt/")
 async def get_detections_with_srt():
     """Get only detection sessions that have associated SRT data for mapping."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
+    from psycopg2.extras import RealDictCursor
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute("SELECT * FROM detections WHERE has_srt_data = TRUE ORDER BY timestamp DESC")
-        detections = cursor.fetchall()
-    return {"detections": detections}
+        detections = [dict(row) for row in cursor.fetchall()]
+    # Convert dict rows to tuple arrays for frontend compatibility
+    detection_tuples = [dict_to_detection_tuple(d) for d in detections]
+    return {"detections": detection_tuples}
 
 @app.get("/detection/{detection_id}")
 async def get_detection_details(detection_id: int):
     """Get complete details of a specific detection session."""
-    session = fetch_detection_session(detection_id)
-    if not session:
+    session_data = fetch_detection_session(detection_id)
+    if not session_data:
         raise HTTPException(status_code=404, detail="Detection session not found")
-    return session
+    
+    # Convert detection dict to tuple array for frontend compatibility
+    detection_tuple = dict_to_detection_tuple(session_data['detection'])
+    
+    # Convert detection_details dicts to tuple arrays (frontend expects tuples)
+    # Detection details tuple format: [id, detection_id, frame_number, weed_class, confidence, 
+    #   bbox_x, bbox_y, bbox_width, bbox_height, normalized_bbox_x, normalized_bbox_y, 
+    #   normalized_bbox_width, normalized_bbox_height, detection_timestamp, latitude, longitude, altitude]
+    detection_details_tuples = []
+    for detail in session_data['detection_details']:
+        detection_details_tuples.append([
+            detail['id'],
+            detail['detection_id'],
+            detail['frame_number'],
+            detail['weed_class'],
+            detail['confidence'],
+            detail['bbox_x'],
+            detail['bbox_y'],
+            detail['bbox_width'],
+            detail['bbox_height'],
+            detail.get('normalized_bbox_x'),
+            detail.get('normalized_bbox_y'),
+            detail.get('normalized_bbox_width'),
+            detail.get('normalized_bbox_height'),
+            detail['detection_timestamp'],
+            detail.get('latitude'),
+            detail.get('longitude'),
+            detail.get('altitude')
+        ])
+    
+    # Convert srt_track dict to tuple if exists
+    srt_track_tuple = None
+    if session_data['srt_track']:
+        st = session_data['srt_track']
+        srt_track_tuple = [
+            st['detection_id'],
+            st['point_count'],
+            st.get('start_time'),
+            st.get('end_time'),
+            st.get('bounds_geojson'),
+            st['path_geojson'],
+            st['frames_json']
+        ]
+    
+    return {
+        "detection": detection_tuple,
+        "srt_track": srt_track_tuple,
+        "detection_details": detection_details_tuples,
+        "frame_metadata": []  # Deprecated, kept for compatibility
+    }
 
 @app.get("/detection/{detection_id}/unique-weeds")
 async def get_unique_weeds(
@@ -1045,41 +1124,36 @@ async def delete_detection_session(detection_id: int):
     - SRT tracks data
     - Heatmap data
     """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    try:
-        # Check if detection exists
-        cursor.execute("SELECT id FROM detections WHERE id = ?", (detection_id,))
-        detection = cursor.fetchone()
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
-        if not detection:
-            raise HTTPException(status_code=404, detail="Detection session not found")
+        try:
+            # Check if detection exists
+            cursor.execute("SELECT id FROM detections WHERE id = %s", (detection_id,))
+            detection = cursor.fetchone()
+            
+            if not detection:
+                raise HTTPException(status_code=404, detail="Detection session not found")
+            
+            # Delete the detection (CASCADE will handle related records)
+            cursor.execute("DELETE FROM detections WHERE id = %s", (detection_id,))
+            
+            # Also explicitly delete from related tables in case CASCADE doesn't work
+            cursor.execute("DELETE FROM detection_details WHERE detection_id = %s", (detection_id,))
+            cursor.execute("DELETE FROM srt_tracks WHERE detection_id = %s", (detection_id,))
+            cursor.execute("DELETE FROM heatmaps WHERE detection_id = %s", (detection_id,))
+            
+            conn.commit()
+            
+            return {
+                "message": f"Detection session {detection_id} and all associated data deleted successfully",
+                "deleted_id": detection_id
+            }
         
-        # Delete the detection (CASCADE will handle related records)
-        cursor.execute("DELETE FROM detections WHERE id = ?", (detection_id,))
-        
-        # Also explicitly delete from related tables in case CASCADE doesn't work
-        cursor.execute("DELETE FROM detection_details WHERE detection_id = ?", (detection_id,))
-        cursor.execute("DELETE FROM srt_tracks WHERE detection_id = ?", (detection_id,))
-        cursor.execute("DELETE FROM heatmaps WHERE detection_id = ?", (detection_id,))
-        
-        conn.commit()
-        
-        return {
-            "message": f"Detection session {detection_id} and all associated data deleted successfully",
-            "deleted_id": detection_id
-        }
-    
-    except HTTPException:
-        conn.close()
-        raise
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        raise HTTPException(status_code=500, detail=f"Failed to delete detection session: {str(e)}")
-    finally:
-        conn.close()
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete detection session: {str(e)}")
 
 @app.get("/statistics/")
 async def get_statistics():
@@ -1091,7 +1165,9 @@ async def get_statistics():
 async def get_detections_by_class(weed_class: str):
     """Get all detections of a specific weed class."""
     detections = fetch_detections_by_class(weed_class)
-    return {"weed_class": weed_class, "detections": detections}
+    # Convert dict rows to tuple arrays for frontend compatibility
+    detection_tuples = [dict_to_detection_tuple(d) for d in detections]
+    return {"weed_class": weed_class, "detections": detection_tuples}
 
 @app.post("/admin/reset-compact-tables")
 async def admin_reset_compact_tables(confirm: bool = Query(False, description="Set true to confirm reset")):
@@ -1102,24 +1178,23 @@ async def admin_reset_compact_tables(confirm: bool = Query(False, description="S
     return {"message": "Compact tables reset: srt_tracks, heatmaps"}
 
 @app.post("/admin/reset-db")
-async def admin_reset_db(confirm: bool = Query(False, description="Set true to confirm full DB reset (delete file)")):
-    """Admin: Delete the SQLite DB file and recreate all tables."""
+async def admin_reset_db(confirm: bool = Query(False, description="Set true to confirm full DB reset (drop all tables)")):
+    """Admin: Drop all tables and recreate them."""
     if not confirm:
         raise HTTPException(status_code=400, detail="Confirmation required: set confirm=true")
     try:
-        if os.path.exists(DB_NAME):
-            os.remove(DB_NAME)
-        # Also try removing one level up (in case old DB was at project root)
-        old_db_name = "weed_detection.db"  # Just the filename
-        parent_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, old_db_name)
-        parent_db = os.path.abspath(parent_db)
-        if os.path.exists(parent_db):
-            os.remove(parent_db)
+        with get_db_connection() as conn:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            # Drop all tables in correct order (due to foreign keys)
+            tables = ['processing_jobs', 'detection_details', 'heatmaps', 'srt_tracks', 'detections']
+            for table in tables:
+                cursor.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+            conn.commit()
+        # Recreate tables
+        init_db()
+        return {"message": "Database tables dropped and recreated"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to delete DB file: {e}")
-    # Recreate tables
-    init_db()
-    return {"message": "Database file reset and tables recreated"}
+        raise HTTPException(status_code=500, detail=f"Failed to reset database: {e}")
 
 @app.post("/admin/drop-tables")
 async def admin_drop_tables(tables: str = Query("", description="Comma-separated table names to drop"), confirm: bool = Query(False)):
@@ -1128,39 +1203,30 @@ async def admin_drop_tables(tables: str = Query("", description="Comma-separated
         raise HTTPException(status_code=400, detail="Confirmation required: set confirm=true")
     if not tables:
         raise HTTPException(status_code=400, detail="Provide table names via tables query param")
-    conn = None
     try:
-        import sqlite3
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        dropped = []
-        for name in [t.strip() for t in tables.split(',') if t.strip()]:
-            cursor.execute(f"DROP TABLE IF EXISTS {name}")
-            dropped.append(name)
-        conn.commit()
-        return {"message": "Dropped tables", "dropped": dropped}
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            dropped = []
+            for name in [t.strip() for t in tables.split(',') if t.strip()]:
+                cursor.execute(f"DROP TABLE IF EXISTS {name} CASCADE")
+                dropped.append(name)
+            conn.commit()
+            return {"message": "Dropped tables", "dropped": dropped}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
 
 @app.get("/detection/{detection_id}/gmap-polyline")
 async def get_gmap_polyline(detection_id: int):
     """Return Google Maps-ready polyline points and bounds for a detection's SRT track."""
-    import sqlite3
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT path_geojson, bounds_geojson FROM srt_tracks WHERE detection_id = ?", (detection_id,))
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT path_geojson, bounds_geojson FROM srt_tracks WHERE detection_id = %s", (detection_id,))
         row = cursor.fetchone()
     
     if not row:
         raise HTTPException(status_code=404, detail="SRT track not found")
-    path_geojson = json.loads(row[0])
-    bounds_geojson = json.loads(row[1]) if row[1] else None
+    path_geojson = json.loads(row['path_geojson'])
+    bounds_geojson = json.loads(row['bounds_geojson']) if row['bounds_geojson'] else None
     coords = path_geojson.get('geometry', {}).get('coordinates', [])
     points = [{ 'lat': lat, 'lng': lng } for lng, lat in coords]
     bounds = None
@@ -1174,25 +1240,27 @@ async def get_gmap_polyline(detection_id: int):
 @app.post("/detection/{detection_id}/generate-heatmap")
 async def generate_heatmap(detection_id: int, grid_size_m: float = Query(1.0), persist: bool = Query(True)):
     """Generate heatmap from detection_details mapped to SRT frames; optionally persist aggregated grid."""
-    import sqlite3
     # Load srt frames
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT frames_json, bounds_geojson FROM srt_tracks WHERE detection_id = ?", (detection_id,))
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT frames_json, bounds_geojson FROM srt_tracks WHERE detection_id = %s", (detection_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="SRT track not found")
-        frames_json = row[0]
-        bounds_geojson = row[1]
+        frames_json = row['frames_json']
+        bounds_geojson = row['bounds_geojson']
         frames = { int(f.get('i')): (f.get('lat'), f.get('lon')) for f in json.loads(frames_json) if f.get('lat') is not None and f.get('lon') is not None }
 
         # Load detection details
-        cursor.execute("SELECT frame_number, weed_class, confidence FROM detection_details WHERE detection_id = ?", (detection_id,))
+        cursor.execute("SELECT frame_number, weed_class, confidence FROM detection_details WHERE detection_id = %s", (detection_id,))
         details = cursor.fetchall()
 
     # Map detections to lat/lng points
     points = []
-    for frame_number, weed_class, confidence in details:
+    for detail in details:
+        frame_number = detail['frame_number']
+        weed_class = detail['weed_class']
+        confidence = detail['confidence']
         pos = frames.get(int(frame_number))
         if not pos:
             continue
@@ -1278,7 +1346,6 @@ async def get_unique_weeds_heatmap(
     - Processed video: 10 FPS, 633 frames
     - But timestamps align: frame 0 = 00:00:00,000 in both
     """
-    import sqlite3
     import math
     
     # Helper function to parse SRT timestamp to milliseconds
@@ -1296,9 +1363,9 @@ async def get_unique_weeds_heatmap(
             return None
     
     # Load SRT frames for GPS data
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT frames_json FROM srt_tracks WHERE detection_id = ?", (detection_id,))
+    with get_db_connection() as conn:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SELECT frames_json FROM srt_tracks WHERE detection_id = %s", (detection_id,))
         row = cursor.fetchone()
         if not row:
             # No SRT data available - return basic unique weeds count without GPS mapping
@@ -1307,7 +1374,7 @@ async def get_unique_weeds_heatmap(
                        bbox_x, bbox_y, bbox_width, bbox_height,
                        detection_timestamp
                 FROM detection_details
-                WHERE detection_id = ?
+                WHERE detection_id = %s
                 ORDER BY frame_number, id
             """, (detection_id,))
             
@@ -1352,7 +1419,7 @@ async def get_unique_weeds_heatmap(
                 'no_gps_data': True
             }
         
-        frames_json = row[0]
+        frames_json = row['frames_json']
         srt_frames = json.loads(frames_json)
         
         # Create timestamp -> (lat, lon) mapping
@@ -1375,7 +1442,7 @@ async def get_unique_weeds_heatmap(
                    bbox_x, bbox_y, bbox_width, bbox_height,
                    detection_timestamp
             FROM detection_details
-            WHERE detection_id = ?
+            WHERE detection_id = %s
             ORDER BY frame_number, id
         """, (detection_id,))
         
@@ -1398,7 +1465,15 @@ async def get_unique_weeds_heatmap(
     matched_count = 0
     
     for det in detections:
-        det_id, frame_num, weed_class, confidence, bbox_x, bbox_y, bbox_width, bbox_height, timestamp_str = det
+        det_id = det['id']
+        frame_num = det['frame_number']
+        weed_class = det['weed_class']
+        confidence = det['confidence']
+        bbox_x = det['bbox_x']
+        bbox_y = det['bbox_y']
+        bbox_width = det['bbox_width']
+        bbox_height = det['bbox_height']
+        timestamp_str = det['detection_timestamp']
         
         # Parse detection timestamp
         det_timestamp_ms = srt_timestamp_to_ms(timestamp_str)
@@ -1731,19 +1806,29 @@ async def export_report(
     detection_details = session['detection_details']
     srt_track = session.get('srt_track')
     
-    # Parse detection tuple
-    det_id, filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data = detection[0:11]
-    cloud_public_id = detection[11] if len(detection) > 11 else None
-    cloud_resource_type = detection[12] if len(detection) > 12 else None
-    cloud_secure_url = detection[13] if len(detection) > 13 else None
-    cloud_annotated_url = detection[14] if len(detection) > 14 else None
+    # Extract detection fields from dict
+    det_id = detection['id']
+    filename = detection['filename']
+    timestamp = detection['timestamp']
+    file_type = detection['file_type']
+    summary = detection.get('summary')
+    total_frames = detection.get('total_frames', 0)
+    total_detections = detection.get('total_detections', 0)
+    processing_time = detection.get('processing_time', 0.0)
+    input_size_bytes = detection.get('input_size_bytes')
+    result_size_bytes = detection.get('result_size_bytes')
+    has_srt_data = detection.get('has_srt_data', False)
+    cloud_public_id = detection.get('cloud_public_id')
+    cloud_resource_type = detection.get('cloud_resource_type')
+    cloud_secure_url = detection.get('cloud_secure_url')
+    cloud_annotated_url = detection.get('cloud_annotated_url')
     
     # Calculate statistics
     weed_classes = {}
     total_confidence = 0
     for detail in detection_details:
-        weed_class = detail[3]
-        confidence = detail[4]
+        weed_class = detail['weed_class']
+        confidence = detail['confidence']
         if weed_class not in weed_classes:
             weed_classes[weed_class] = {'count': 0, 'total_confidence': 0}
         weed_classes[weed_class]['count'] += 1
@@ -1786,25 +1871,28 @@ async def export_report(
             },
             'detections': [
                 {
-                    'id': d[0],
-                    'frame_number': d[2],
-                    'weed_class': d[3],
-                    'confidence': round(d[4], 2),
+                    'id': d['id'],
+                    'frame_number': d['frame_number'],
+                    'weed_class': d['weed_class'],
+                    'confidence': round(d['confidence'], 2),
                     'bbox': {
-                        'x': d[5], 'y': d[6], 'width': d[7], 'height': d[8]
+                        'x': d['bbox_x'], 
+                        'y': d['bbox_y'], 
+                        'width': d['bbox_width'], 
+                        'height': d['bbox_height']
                     },
-                    'timestamp': d[14] if len(d) > 14 else None
+                    'timestamp': d.get('detection_timestamp')
                 }
                 for d in detection_details
             ]
         }
         
         if srt_track:
-            frames_json = json.loads(srt_track[6]) if len(srt_track) > 6 else []
+            frames_json = json.loads(srt_track['frames_json'])
             report['gps_data'] = {
-                'point_count': srt_track[1] if len(srt_track) > 1 else 0,
-                'start_time': srt_track[2] if len(srt_track) > 2 else None,
-                'end_time': srt_track[3] if len(srt_track) > 3 else None,
+                'point_count': srt_track['point_count'],
+                'start_time': srt_track.get('start_time'),
+                'end_time': srt_track.get('end_time'),
                 'frames': frames_json
             }
         
@@ -1841,7 +1929,16 @@ async def export_report(
         writer.writerow(['Detailed Detections'])
         writer.writerow(['ID', 'Frame', 'Weed Class', 'Confidence', 'BBox X', 'BBox Y', 'Width', 'Height'])
         for d in detection_details:
-            writer.writerow([d[0], d[2], d[3], f"{d[4]:.2f}", d[5], d[6], d[7], d[8]])
+            writer.writerow([
+                d['id'], 
+                d['frame_number'], 
+                d['weed_class'], 
+                f"{d['confidence']:.2f}", 
+                d['bbox_x'], 
+                d['bbox_y'], 
+                d['bbox_width'], 
+                d['bbox_height']
+            ])
         
         output.seek(0)
         return StreamingResponse(
@@ -2187,10 +2284,10 @@ async def export_report(
             detail_data = [['Frame', 'Weed Class', 'Confidence', 'BBox (x, y, w, h)']]
             for d in detection_details[:50]:
                 detail_data.append([
-                    str(d[2]),
-                    d[3],
-                    f"{d[4]:.1f}%",
-                    f"({d[5]:.0f}, {d[6]:.0f}, {d[7]:.0f}, {d[8]:.0f})"
+                    str(d['frame_number']),
+                    d['weed_class'],
+                    f"{d['confidence']:.1f}%",
+                    f"({d['bbox_x']:.0f}, {d['bbox_y']:.0f}, {d['bbox_width']:.0f}, {d['bbox_height']:.0f})"
                 ])
             
             detail_table = Table(detail_data, colWidths=[1*inch, 2*inch, 1.5*inch, 2*inch])
@@ -2236,16 +2333,26 @@ async def create_share_package(detection_id: int):
     detection = session['detection']
     detection_details = session['detection_details']
     
-    # Parse detection tuple
-    det_id, filename, timestamp, file_type, summary, total_frames, total_detections, processing_time, input_size_bytes, result_size_bytes, has_srt_data = detection[0:11]
-    cloud_public_id = detection[11] if len(detection) > 11 else None
-    cloud_secure_url = detection[13] if len(detection) > 13 else None
-    cloud_annotated_url = detection[14] if len(detection) > 14 else None
+    # Extract detection fields from dict
+    det_id = detection['id']
+    filename = detection['filename']
+    timestamp = detection['timestamp']
+    file_type = detection['file_type']
+    summary = detection.get('summary')
+    total_frames = detection.get('total_frames', 0)
+    total_detections = detection.get('total_detections', 0)
+    processing_time = detection.get('processing_time', 0.0)
+    input_size_bytes = detection.get('input_size_bytes')
+    result_size_bytes = detection.get('result_size_bytes')
+    has_srt_data = detection.get('has_srt_data', False)
+    cloud_public_id = detection.get('cloud_public_id')
+    cloud_secure_url = detection.get('cloud_secure_url')
+    cloud_annotated_url = detection.get('cloud_annotated_url')
     
     # Calculate simple stats
     weed_classes = {}
     for detail in detection_details:
-        weed_class = detail[3]
+        weed_class = detail['weed_class']
         weed_classes[weed_class] = weed_classes.get(weed_class, 0) + 1
     
     # Create shareable package
