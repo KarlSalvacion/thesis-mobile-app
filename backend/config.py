@@ -172,10 +172,10 @@ COMPRESSION_AGGRESSIVE_MODE = True  # More aggressive compression
 # For Render.com, use the Internal Database URL from your PostgreSQL dashboard
 DATABASE_URL = os.getenv(
     'DATABASE_URL',
-    'postgresql://postgres:lucido%4025@localhost:5432/weed_detection'
+    'postgresql://weed_detection_db_user:WgBIIb6U1adbqvKuSwnKnlAWox7PTrQx@dpg-d43pkhodl3ps73a675hg-a/weed_detection_db'
 )
 #postgresql://weed_detection_db_user:WgBIIb6U1adbqvKuSwnKnlAWox7PTrQx@dpg-d43pkhodl3ps73a675hg-a/weed_detection_db
-
+#postgresql://postgres:lucido%4025@localhost:5432/weed_detection
 # Connection pool settings
 DB_POOL_MIN_CONN = 1  # Minimum connections in pool
 DB_POOL_MAX_CONN = 10  # Maximum connections in pool
