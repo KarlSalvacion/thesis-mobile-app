@@ -4,7 +4,7 @@
     "slug": "thesis-mobile-app",
     "version": "1.0.1",
     "orientation": "portrait",
-    "icon": "./src/assets/seedling.png",
+  "icon": "./src/assets/seedling.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
@@ -17,10 +17,10 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./src/assets/adaptive-icon.png",
+        "foregroundImage": "./src/assets/seedling.png",
         "backgroundColor": "#ffffff"
       },
-      "package": "com.karlsalvacion.thesismobileapp",
+      "package": "com.karlsalvacion.thesismobileapp.preview",
       "versionCode": 2,
       "edgeToEdgeEnabled": true,
       "usesCleartextTraffic": true,

@@ -638,19 +638,26 @@ def calculate_unique_weeds(detection_id, iou_threshold=0.5, frame_gap=20):
             if det['lat'] is not None and tr.get('last_lat') is not None:
                 gps_dist = calculate_gps_distance(det['lat'], det['lon'], tr['last_lat'], tr['last_lon'])
 
-            # Matching criteria: Require stronger evidence for matching
+            # Matching criteria: Use GPS when available, otherwise rely more on IoU
             score = 0.0
             if iou >= iou_threshold:
                 # Strong IoU match
                 if gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M:
                     # Both IoU and GPS agree - very strong match
                     score = iou * 2.5
-                elif iou >= 0.8:
-                    # Very high IoU compensates for GPS uncertainty
-                    score = iou * 1.5
+                elif gps_dist is not None:
+                    # GPS available but far - use GPS-influenced scoring
+                    if iou >= 0.8:
+                        score = iou * 1.5
+                    else:
+                        score = iou * 0.8
                 else:
-                    # Decent IoU but GPS uncertain or far
-                    score = iou * 0.8
+                    # NO GPS data - be MORE AGGRESSIVE with IoU-only matching
+                    # This makes non-GPS videos behave similar to GPS videos
+                    if iou >= 0.7:
+                        score = iou * 2.5  # High boost like GPS match
+                    else:
+                        score = iou * 2.0  # Still generous boost for medium IoU
             elif gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M:
                 # Close GPS but low IoU - weaker match
                 score = 0.5 / (1.0 + gps_dist)
