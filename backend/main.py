@@ -1099,7 +1099,9 @@ async def get_unique_weeds(
     if not session:
         raise HTTPException(status_code=404, detail="Detection session not found")
     
+    print(f"🔍 [UNIQUE WEEDS] Calculating for detection {detection_id} with iou_threshold={iou_threshold}, frame_gap={frame_gap}")
     unique_weeds = calculate_unique_weeds(detection_id, iou_threshold, frame_gap)
+    print(f"✅ [UNIQUE WEEDS] Result: {unique_weeds['unique_count']} unique from {unique_weeds['total_detections']} total ({unique_weeds['reduction_percentage']}% reduction)")
     
     return {
         "detection_id": detection_id,

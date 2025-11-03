@@ -154,15 +154,21 @@ const DetectionResults = () => {
             }
           } else {
             // For videos without SRT data, use the basic unique-weeds endpoint
+            console.log(`🔍 Fetching unique weeds for video without SRT: ${detId}`);
             const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.5&frame_gap=20`);
+            console.log(`🔍 Unique weeds response status: ${res3.status}`);
             if (res3.ok) {
               const uniqueData = await res3.json();
+              console.log(`🔍 Unique weeds data:`, uniqueData);
               setUniqueWeedCount(uniqueData.unique_weed_count);
               setUniqueWeedData(uniqueData);
+            } else {
+              const errorText = await res3.text();
+              console.error(`❌ Unique weeds endpoint failed: ${res3.status} - ${errorText}`);
             }
           }
         } catch (e) {
-          console.warn('Could not fetch unique weed count for session', detId, e);
+          console.error('❌ Error fetching unique weed count for session', detId, e);
         }
       } else {
         setUniqueWeedCount(null);

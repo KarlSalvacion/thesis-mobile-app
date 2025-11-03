@@ -616,6 +616,19 @@ def calculate_unique_weeds(detection_id, iou_threshold=0.5, frame_gap=20):
     tracks = []
     GPS_MATCH_THRESHOLD_M = 1.0  # Relaxed to 1.0m - weeds within 1m considered same for more aggressive merging
     MIN_MATCH_SCORE = 0.4  # Reduced threshold - allow weaker matches to merge more tracks
+    
+    has_gps = any(det['lat'] is not None for det in detections)
+    print(f"🔍 [UNIQUE WEEDS] Processing {len(detections)} detections, GPS available: {has_gps}")
+    print(f"🔍 [UNIQUE WEEDS] Using iou_threshold={iou_threshold}, frame_gap={frame_gap}")
+    
+    # For non-GPS videos, be MUCH more aggressive to compensate for lack of GPS
+    if not has_gps:
+        # Lower IoU threshold - accept even weaker bbox matches
+        iou_threshold = max(0.2, iou_threshold - 0.3)  # Reduce by 0.3 (0.5 -> 0.2)
+        # Increase frame gap - allow even longer tracking windows
+        frame_gap = int(frame_gap * 2.0)  # Double the frame gap (20 -> 40 frames)
+        MIN_MATCH_SCORE = 0.25  # Lower minimum score threshold
+        print(f"🔧 [UNIQUE WEEDS] Adjusted for non-GPS: iou_threshold={iou_threshold}, frame_gap={frame_gap}, min_score={MIN_MATCH_SCORE}")
 
     for det in detections:
         matched_track = None
@@ -632,6 +645,16 @@ def calculate_unique_weeds(detection_id, iou_threshold=0.5, frame_gap=20):
 
             # Compute IoU between current detection and track's last bbox
             iou = calculate_iou(det['bbox'], tr['last_bbox'])
+            
+            # For non-GPS videos, also compute pixel distance between bbox centers
+            pixel_dist = None
+            if not has_gps:
+                # Calculate center-to-center distance in pixels
+                det_center_x = det['bbox'][0] + det['bbox'][2] / 2
+                det_center_y = det['bbox'][1] + det['bbox'][3] / 2
+                tr_center_x = tr['last_bbox'][0] + tr['last_bbox'][2] / 2
+                tr_center_y = tr['last_bbox'][1] + tr['last_bbox'][3] / 2
+                pixel_dist = ((det_center_x - tr_center_x)**2 + (det_center_y - tr_center_y)**2)**0.5
 
             # Compute GPS distance if available
             gps_dist = None
@@ -652,15 +675,25 @@ def calculate_unique_weeds(detection_id, iou_threshold=0.5, frame_gap=20):
                     else:
                         score = iou * 0.8
                 else:
-                    # NO GPS data - be MORE AGGRESSIVE with IoU-only matching
+                    # NO GPS data - be EXTREMELY AGGRESSIVE with IoU-only matching
                     # This makes non-GPS videos behave similar to GPS videos
-                    if iou >= 0.7:
-                        score = iou * 2.5  # High boost like GPS match
+                    if iou >= 0.5:
+                        score = iou * 3.0  # Very high boost for decent IoU
+                    elif iou >= 0.3:
+                        score = iou * 2.5  # High boost for medium IoU
                     else:
-                        score = iou * 2.0  # Still generous boost for medium IoU
+                        score = iou * 2.0  # Still generous boost for low IoU
             elif gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M:
                 # Close GPS but low IoU - weaker match
                 score = 0.5 / (1.0 + gps_dist)
+            elif pixel_dist is not None:
+                # No GPS, low IoU - use pixel proximity as last resort
+                # Average bbox size for reference
+                avg_bbox_size = (det['bbox'][2] + det['bbox'][3]) / 2
+                # If centers are close relative to bbox size, consider it a match
+                if pixel_dist < avg_bbox_size * 3.0:  # Within 3x bbox size (more lenient)
+                    # Closer = higher score
+                    score = 1.0 / (1.0 + pixel_dist / avg_bbox_size)
 
             # Prefer tracks with higher score and above minimum threshold
             if score > best_score and score >= MIN_MATCH_SCORE:
