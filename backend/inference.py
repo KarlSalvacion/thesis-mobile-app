@@ -246,6 +246,53 @@ except Exception as e:
     _HAS_PIL = False
     print(f"Warning: PIL/Pillow not available for image annotation: {e}")
 
+def _get_class_color(class_name: str, format: str = 'bgr'):
+    """Get color for a weed class. Supports 'bgr', 'rgb', and 'hex' formats.
+    
+    Args:
+        class_name: Name of the weed class
+        format: Color format - 'bgr' (OpenCV), 'rgb' (PIL), or 'hex' (FFmpeg)
+    
+    Returns:
+        Tuple (B, G, R) for bgr, (R, G, B) for rgb, or 'color_name' for hex
+    """
+    class_name_lower = str(class_name).lower()
+    
+    # Define color mapping for 3 weed species
+    # Using distinct colors: blue, green, yellow
+    if 'caperonia' in class_name_lower or 'Caperonia Palustris' in class_name_lower:
+        # Caperonia Palustris - Blue
+        if format == 'bgr':
+            return (255, 0, 0)  # BGR: Blue
+        elif format == 'rgb':
+            return (0, 0, 255)  # RGB: Blue
+        else:  # hex
+            return 'blue'
+    elif 'crus-galli' in class_name_lower or 'Echinochloa crus-galli' in class_name_lower:
+        # Echinochloa crus-galli - Green
+        if format == 'bgr':
+            return (0, 255, 0)  # BGR: Green
+        elif format == 'rgb':
+            return (0, 255, 0)  # RGB: Green
+        else:  # hex
+            return 'green'
+    elif 'colona' in class_name_lower or 'Echinochloa colona' in class_name_lower:
+        # Echinochloa colona - Yellow
+        if format == 'bgr':
+            return (0, 255, 255)  # BGR: Yellow (actually cyan in BGR)
+        elif format == 'rgb':
+            return (255, 255, 0)  # RGB: Yellow
+        else:  # hex
+            return 'yellow'
+    else:
+        # Default - Red for unknown classes
+        if format == 'bgr':
+            return (0, 0, 255)  # BGR: Red
+        elif format == 'rgb':
+            return (255, 0, 0)  # RGB: Red
+        else:  # hex
+            return 'red'
+
 def _annotate_image_file(input_path: str, detections: List[Dict[str, Any]]) -> Optional[bytes]:
     """Draw boxes, labels, and confidence on an image; return JPEG bytes.
     Uses OpenCV (5-10x faster than PIL) with PIL fallback.
@@ -270,8 +317,11 @@ def _annotate_image_file(input_path: str, detections: List[Dict[str, Any]]) -> O
                 # Convert to integers for OpenCV
                 x, y, w, h = int(x), int(y), int(w), int(h)
                 
-                # Draw rectangle (BGR: red = (0, 0, 255))
-                _cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 3)
+                # Get species-specific color
+                color = _get_class_color(cls, format='bgr')
+                
+                # Draw rectangle with species-specific color
+                _cv2.rectangle(img, (x, y), (x + w, y + h), color, 3)
                 
                 # Draw label background and text
                 label = f"{cls} {conf:.2f}"
@@ -282,8 +332,8 @@ def _annotate_image_file(input_path: str, detections: List[Dict[str, Any]]) -> O
                 # Get text size for background rectangle
                 (text_w, text_h), baseline = _cv2.getTextSize(label, font, font_scale, thickness)
                 
-                # Draw label background
-                _cv2.rectangle(img, (x, y - text_h - 8), (x + text_w + 6, y), (0, 0, 255), -1)
+                # Draw label background with species-specific color
+                _cv2.rectangle(img, (x, y - text_h - 8), (x + text_w + 6, y), color, -1)
                 
                 # Draw text
                 _cv2.putText(img, label, (x + 3, y - 4), font, font_scale, (255, 255, 255), thickness)
@@ -316,7 +366,11 @@ def _annotate_image_file(input_path: str, detections: List[Dict[str, Any]]) -> O
             cls = str(det.get('class', ''))
             conf = det.get('confidence', 0.0)
             box = [x, y, x + w, y + h]
-            draw.rectangle(box, outline=(255, 0, 0), width=3)
+            
+            # Get species-specific color
+            color = _get_class_color(cls, format='rgb')
+            
+            draw.rectangle(box, outline=color, width=3)
             label = f"{cls} {conf:.2f}"
             # Use modern Pillow API for text size (textsize is deprecated)
             if font:
@@ -331,7 +385,7 @@ def _annotate_image_file(input_path: str, detections: List[Dict[str, Any]]) -> O
                 tw, th = (len(label) * 6, 10)
             bx0, by0 = x, y - th - 4
             bx1, by1 = x + tw + 6, y
-            draw.rectangle([bx0, by0, bx1, by1], fill=(255, 0, 0))
+            draw.rectangle([bx0, by0, bx1, by1], fill=color)
             draw.text((x + 3, y - th - 2), label, fill=(255, 255, 255), font=font)
         import io
         buf = io.BytesIO()
@@ -464,19 +518,22 @@ def _create_annotated_video_fast(
                 cls = det.get('class', 'unknown')
                 conf = det.get('confidence', 0.0)
                 
+                # Get species-specific color
+                color = _get_class_color(cls, format='hex')
+                
                 # Sanitize class name for FFmpeg (remove spaces and special chars)
                 cls_safe = cls.replace(' ', '_').replace("'", '').replace('"', '').replace(':', '')
                 
-                # FFmpeg drawbox syntax: drawbox=x=X:y=Y:w=W:h=H:color=red:t=3:enable='between(t,START,END)'
+                # FFmpeg drawbox syntax with species-specific color
                 filter_parts.append(
-                    f"drawbox=x={int(x)}:y={int(y)}:w={int(w)}:h={int(h)}:color=red@0.8:t=3:enable='between(t,{start_time:.3f},{end_time:.3f})'"
+                    f"drawbox=x={int(x)}:y={int(y)}:w={int(w)}:h={int(h)}:color={color}@0.8:t=3:enable='between(t,{start_time:.3f},{end_time:.3f})'"
                 )
                 
                 # Add text label (simplified to avoid FFmpeg parsing issues)
                 label = f"{cls_safe}_{conf:.2f}".replace('.', 'p')  # Replace dot to avoid issues
                 text_y = max(10, int(y) - 5)
                 filter_parts.append(
-                    f"drawtext=text={label}:x={int(x)+2}:y={text_y}:fontsize=16:fontcolor=white:box=1:boxcolor=red@0.8:enable='between(t,{start_time:.3f},{end_time:.3f})'"
+                    f"drawtext=text={label}:x={int(x)+2}:y={text_y}:fontsize=16:fontcolor=white:box=1:boxcolor={color}@0.8:enable='between(t,{start_time:.3f},{end_time:.3f})'"
                 )
                 total_annotations += 1
         

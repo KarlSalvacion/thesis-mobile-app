@@ -499,13 +499,13 @@ async def upload_combined_files(
 ):
     """Upload media file and process in background. Returns job_id immediately for status polling."""
     
-    # Validate file types
-    media_filename = media_file.filename.lower()
-    if not (media_filename.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.mp4', '.mov', '.avi', '.mkv'))):
+    # Validate file types - use lowercase for validation only
+    media_filename_lower = media_file.filename.lower()
+    if not (media_filename_lower.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.mp4', '.mov', '.avi', '.mkv'))):
         raise HTTPException(status_code=400, detail="Media file must be an image or video")
     
-    is_video = media_filename.endswith(('.mp4', '.mov', '.avi', '.mkv'))
-    is_image = media_filename.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif'))
+    is_video = media_filename_lower.endswith(('.mp4', '.mov', '.avi', '.mkv'))
+    is_image = media_filename_lower.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif'))
     
     # Validation rules
     if srt_file and is_image:
@@ -2004,185 +2004,156 @@ async def export_report(
             
             # Heatmap image if SRT data available
             if has_srt_data:
+                print(f"🗺️  Session has SRT data, generating heatmap for PDF...")
                 try:
                     # Get heatmap data
+                    print(f"📊 Fetching heatmap data for detection {detection_id}...")
                     heatmap_response = await get_unique_weeds_heatmap(detection_id, 0.6, 2, 0.3, False)
                     points = heatmap_response.get('points', [])
+                    print(f"📊 Got {len(points)} heatmap points")
                     
                     if points:
                         # Generate heatmap image using folium (Leaflet) like Mapscreen
                         import folium
                         from folium.plugins import HeatMap
-                        import selenium
-                        from selenium import webdriver
-                        from selenium.webdriver.chrome.options import Options
-                        from webdriver_manager.chrome import ChromeDriverManager
                         import tempfile
                         import os
+                        from io import BytesIO
                         
                         # Create folium map with same settings as Mapscreen
-                        if points:
-                            # Calculate center
-                            avg_lat = sum(p['lat'] for p in points) / len(points)
-                            avg_lng = sum(p['lng'] for p in points) / len(points)
-                            
-                            # Create map with Google Satellite tiles (same as Mapscreen)
-                            m = folium.Map(
-                                location=[avg_lat, avg_lng],
-                                zoom_start=17,
-                                max_zoom=20
-                            )
-                            
-                            # Add Google Satellite tiles like Mapscreen
-                            folium.TileLayer(
-                                tiles='https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
-                                attr='Map data ©2025 Google',
-                                name='Google Satellite',
-                                max_zoom=20,
-                                subdomains=['mt0', 'mt1', 'mt2', 'mt3']
-                            ).add_to(m)
-                            
-                            # Add polyline if we have SRT data (flight path)
-                            try:
-                                polyline_response = await get_gmap_polyline(detection_id)
-                                polyline_points = polyline_response.get('points', [])
-                                if polyline_points:
-                                    folium.PolyLine(
-                                        locations=[[p['lat'], p['lng']] for p in polyline_points],
-                                        color='#2563eb',
-                                        weight=3
-                                    ).add_to(m)
-                                    
-                                    # Add start marker (green)
-                                    if polyline_points:
-                                        start_point = polyline_points[0]
-                                        folium.Marker(
-                                            location=[start_point['lat'], start_point['lng']],
-                                            icon=folium.DivIcon(
-                                                html='<div style="background-color: #22c55e; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
-                                                icon_size=(20, 20),
-                                                icon_anchor=(10, 10)
-                                            ),
-                                            popup='Flight Start'
-                                        ).add_to(m)
-                                        
-                                        # Add end marker (red)
-                                        end_point = polyline_points[-1]
-                                        folium.Marker(
-                                            location=[end_point['lat'], end_point['lng']],
-                                            icon=folium.DivIcon(
-                                                html='<div style="background-color: #ef4444; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
-                                                icon_size=(20, 20),
-                                                icon_anchor=(10, 10)
-                                            ),
-                                            popup='Flight End'
-                                        ).add_to(m)
-                            except Exception as e:
-                                print(f"Error adding polyline: {e}")
-                            
-                            # Add heatmap layer with exact same settings as Mapscreen
-                            heat_data = [[p['lat'], p['lng'], p['weight']] for p in points]
-                            from folium.plugins import HeatMap
-                            HeatMap(
-                                heat_data,
-                                radius=6,            # Reduced radius for smaller, tighter heat points
-                                blur=6,              # Slightly less blur to keep points distinct
-                                max_zoom=18,
-                                max=4,               # Lower max to make low-density areas more visible
-                                gradient={           # Custom gradient: green (low) -> yellow -> red (high)
-                                    0.0: 'green',
-                                    0.3: 'lime',
-                                    0.5: 'yellow',
-                                    0.7: 'orange',
-                                    1.0: 'red'
-                                }
-                            ).add_to(m)
-                            
-                            # Fit bounds
-                            if len(points) > 1:
-                                m.fit_bounds([
-                                    [min(p['lat'] for p in points), min(p['lng'] for p in points)],
-                                    [max(p['lat'] for p in points), max(p['lng'] for p in points)]
-                                ])
-                            
-                            # Save to temporary HTML file
+                        # Calculate center
+                        avg_lat = sum(p['lat'] for p in points) / len(points)
+                        avg_lng = sum(p['lng'] for p in points) / len(points)
+                        
+                        # Create map with Google Satellite tiles (same as Mapscreen)
+                        m = folium.Map(
+                            location=[avg_lat, avg_lng],
+                            zoom_start=17,
+                            max_zoom=20
+                        )
+                        
+                        # Add Google Satellite tiles like Mapscreen
+                        folium.TileLayer(
+                            tiles='https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+                            attr='Map data ©2025 Google',
+                            name='Google Satellite',
+                            max_zoom=20,
+                            subdomains=['mt0', 'mt1', 'mt2', 'mt3']
+                        ).add_to(m)
+                        
+                        # Add polyline if we have SRT data (flight path)
+                        try:
+                            print(f"📍 Fetching polyline for detection {detection_id}...")
+                            polyline_response = await get_gmap_polyline(detection_id)
+                            polyline_points = polyline_response.get('points', [])
+                            print(f"📍 Got {len(polyline_points)} polyline points")
+                            if polyline_points:
+                                folium.PolyLine(
+                                    locations=[[p['lat'], p['lng']] for p in polyline_points],
+                                    color='#2563eb',
+                                    weight=3,
+                                    opacity=0.8
+                                ).add_to(m)
+                                print(f"✅ Added polyline to map")
+                                
+                                # Add start marker (green)
+                                start_point = polyline_points[0]
+                                folium.Marker(
+                                    location=[start_point['lat'], start_point['lng']],
+                                    icon=folium.DivIcon(
+                                        html='<div style="background-color: #22c55e; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
+                                        icon_size=(14, 14),
+                                        icon_anchor=(7, 7)
+                                    ),
+                                    popup='Flight Start'
+                                ).add_to(m)
+                                print(f"✅ Added start marker")
+                                
+                                # Add end marker (red)
+                                end_point = polyline_points[-1]
+                                folium.Marker(
+                                    location=[end_point['lat'], end_point['lng']],
+                                    icon=folium.DivIcon(
+                                        html='<div style="background-color: #ef4444; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
+                                        icon_size=(14, 14),
+                                        icon_anchor=(7, 7)
+                                    ),
+                                    popup='Flight End'
+                                ).add_to(m)
+                                print(f"✅ Added end marker")
+                        except Exception as e:
+                            print(f"❌ Error adding polyline: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        
+                        # Add heatmap layer with exact same settings as Mapscreen
+                        heat_data = [[p['lat'], p['lng'], p['weight']] for p in points]
+                        HeatMap(
+                            heat_data,
+                            radius=6,            # Reduced radius for smaller, tighter heat points
+                            blur=6,              # Slightly less blur to keep points distinct
+                            max_zoom=18,
+                            max=4,               # Lower max to make low-density areas more visible
+                            gradient={           # Custom gradient: green (low) -> yellow -> red (high)
+                                0.0: 'green',
+                                0.3: 'lime',
+                                0.5: 'yellow',
+                                0.7: 'orange',
+                                1.0: 'red'
+                            }
+                        ).add_to(m)
+                        
+                        # Fit bounds
+                        if len(points) > 1:
+                            m.fit_bounds([
+                                [min(p['lat'] for p in points), min(p['lng'] for p in points)],
+                                [max(p['lat'] for p in points), max(p['lng'] for p in points)]
+                            ])
+                        
+                        # Save to temporary HTML file
+                        html_file = None
+                        try:
                             with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
                                 html_file = f.name
                                 m.save(html_file)
                             
-                            # Take screenshot using selenium
-                            chrome_options = Options()
-                            chrome_options.add_argument('--headless')
-                            chrome_options.add_argument('--no-sandbox')
-                            chrome_options.add_argument('--disable-dev-shm-usage')
-                            chrome_options.add_argument('--window-size=800,600')
-                            
+                            # Try selenium screenshot first
                             try:
+                                from selenium import webdriver
+                                from selenium.webdriver.chrome.options import Options
                                 from selenium.webdriver.chrome.service import Service
-                                service = Service(ChromeDriverManager().install())
+                                import time
+                                
+                                chrome_options = Options()
+                                chrome_options.add_argument('--headless')
+                                chrome_options.add_argument('--no-sandbox')
+                                chrome_options.add_argument('--disable-dev-shm-usage')
+                                chrome_options.add_argument('--disable-gpu')
+                                chrome_options.add_argument('--window-size=800,600')
+                                
+                                # Try webdriver-manager first, fall back to system Chrome
+                                try:
+                                    from webdriver_manager.chrome import ChromeDriverManager
+                                    service = Service(ChromeDriverManager().install())
+                                except Exception as wdm_error:
+                                    print(f"⚠️  webdriver-manager failed: {wdm_error}, trying system Chrome...")
+                                    # Try to use system Chrome driver
+                                    service = Service()
+                                
                                 driver = webdriver.Chrome(service=service, options=chrome_options)
                                 driver.get(f'file://{html_file}')
-                                # Wait for map to load
-                                import time
-                                time.sleep(5)  # Increased wait time for tiles to load
-                                # Take screenshot
+                                time.sleep(5)  # Wait for tiles to load
                                 screenshot = driver.get_screenshot_as_png()
                                 driver.quit()
                                 
-                                # Convert to BytesIO for PDF
-                                from io import BytesIO
                                 img_buffer = BytesIO(screenshot)
+                                print(f"✅ Screenshot captured with selenium")
                                 
-                                # Add to PDF
-                                story.append(Paragraph("GPS Heatmap", styles['Heading2']))
-                                story.append(Spacer(1, 0.1*inch))
-                                heatmap_img = Image(img_buffer, width=6*inch, height=4*inch)
-                                story.append(heatmap_img)
-                                story.append(Spacer(1, 0.2*inch))
+                            except Exception as selenium_error:
+                                print(f"❌ Error taking screenshot with selenium: {selenium_error}")
+                                print("⚠️  Falling back to matplotlib for heatmap...")
                                 
-                                # Add legend
-                                story.append(Paragraph("Map Legend", styles['Heading3']))
-                                story.append(Spacer(1, 0.1*inch))
-                                
-                                # Create legend table with color indicators
-                                legend_data = [
-                                    ['Low Density', '≤2 weeds', 'Medium Density', '3-5 weeds', 'High Density', '>5 weeds'],
-                                    ['Flight Path', 'Blue line', 'Start Point', 'Green marker', 'End Point', 'Red marker']
-                                ]
-                                
-                                legend_table = Table(legend_data, colWidths=[1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch])
-                                legend_table.setStyle(TableStyle([
-                                    # Header row styling
-                                    ('BACKGROUND', (0, 0), (5, 0), colors.HexColor('#f3f4f6')),
-                                    ('TEXTCOLOR', (0, 0), (5, 0), colors.black),
-                                    ('ALIGN', (0, 0), (5, 0), 'CENTER'),
-                                    ('FONTNAME', (0, 0), (5, 0), 'Helvetica-Bold'),
-                                    ('FONTSIZE', (0, 0), (5, 0), 10),
-                                    ('BOTTOMPADDING', (0, 0), (5, 0), 8),
-                                    
-                                    # Data row styling
-                                    ('BACKGROUND', (0, 1), (5, 1), colors.HexColor('#ffffff')),
-                                    ('TEXTCOLOR', (0, 1), (5, 1), colors.black),
-                                    ('ALIGN', (0, 1), (5, 1), 'CENTER'),
-                                    ('FONTSIZE', (0, 1), (5, 1), 9),
-                                    ('GRID', (0, 0), (5, 1), 0.5, colors.grey),
-                                    
-                                    # Color indicators for density levels
-                                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#22c55e')),  # Low - green
-                                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor('#eab308')),  # Medium - yellow
-                                    ('BACKGROUND', (4, 0), (4, 0), colors.HexColor('#ef4444')),  # High - red
-                                    
-                                    # Color indicators for markers
-                                    ('BACKGROUND', (0, 1), (0, 1), colors.HexColor('#2563eb')),  # Path - blue
-                                    ('BACKGROUND', (2, 1), (2, 1), colors.HexColor('#22c55e')),  # Start - green
-                                    ('BACKGROUND', (4, 1), (4, 1), colors.HexColor('#ef4444')),  # End - red
-                                ]))
-                                story.append(legend_table)
-                                story.append(Spacer(1, 0.3*inch))
-                                
-                            except Exception as e:
-                                print(f"Error taking screenshot: {e}")
-                                # Fallback to matplotlib if selenium fails
+                                # Fallback to matplotlib
                                 import matplotlib.pyplot as plt
                                 fig, ax = plt.subplots(figsize=(6, 4))
                                 lats = [p['lat'] for p in points]
@@ -2199,58 +2170,67 @@ async def export_report(
                                 fig.savefig(img_buffer, format='png', dpi=100, bbox_inches='tight')
                                 img_buffer.seek(0)
                                 plt.close(fig)
-                                story.append(Paragraph("GPS Heatmap", styles['Heading2']))
-                                story.append(Spacer(1, 0.1*inch))
-                                heatmap_img = Image(img_buffer, width=6*inch, height=4*inch)
-                                story.append(heatmap_img)
-                                story.append(Spacer(1, 0.2*inch))
+                                print(f"✅ Heatmap generated with matplotlib")
+                            
+                            # Add to PDF
+                            story.append(Paragraph("GPS Heatmap", styles['Heading2']))
+                            story.append(Spacer(1, 0.1*inch))
+                            heatmap_img = Image(img_buffer, width=6*inch, height=4*inch)
+                            story.append(heatmap_img)
+                            story.append(Spacer(1, 0.2*inch))
+                            
+                            # Add legend
+                            story.append(Paragraph("Map Legend", styles['Heading3']))
+                            story.append(Spacer(1, 0.1*inch))
+                            
+                            # Create legend table with color indicators
+                            legend_data = [
+                                ['Low Density', '≤2 weeds', 'Medium Density', '3-5 weeds', 'High Density', '>5 weeds'],
+                                ['Flight Path', 'Blue line', 'Start Point', 'Green marker', 'End Point', 'Red marker']
+                            ]
+                            
+                            legend_table = Table(legend_data, colWidths=[1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch])
+                            legend_table.setStyle(TableStyle([
+                                # Header row styling
+                                ('BACKGROUND', (0, 0), (5, 0), colors.HexColor('#f3f4f6')),
+                                ('TEXTCOLOR', (0, 0), (5, 0), colors.black),
+                                ('ALIGN', (0, 0), (5, 0), 'CENTER'),
+                                ('FONTNAME', (0, 0), (5, 0), 'Helvetica-Bold'),
+                                ('FONTSIZE', (0, 0), (5, 0), 10),
+                                ('BOTTOMPADDING', (0, 0), (5, 0), 8),
                                 
-                                # Add legend
-                                story.append(Paragraph("Map Legend", styles['Heading3']))
-                                story.append(Spacer(1, 0.1*inch))
+                                # Data row styling
+                                ('BACKGROUND', (0, 1), (5, 1), colors.HexColor('#ffffff')),
+                                ('TEXTCOLOR', (0, 1), (5, 1), colors.black),
+                                ('ALIGN', (0, 1), (5, 1), 'CENTER'),
+                                ('FONTSIZE', (0, 1), (5, 1), 9),
+                                ('GRID', (0, 0), (5, 1), 0.5, colors.grey),
                                 
-                                # Create legend table with color indicators
-                                legend_data = [
-                                    ['Low Density', '≤2 weeds', 'Medium Density', '3-5 weeds', 'High Density', '>5 weeds'],
-                                    ['Flight Path', 'Blue line', 'Start Point', 'Green marker', 'End Point', 'Red marker']
-                                ]
+                                # Color indicators for density levels
+                                ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#22c55e')),  # Low - green
+                                ('BACKGROUND', (2, 0), (2, 0), colors.HexColor('#eab308')),  # Medium - yellow
+                                ('BACKGROUND', (4, 0), (4, 0), colors.HexColor('#ef4444')),  # High - red
                                 
-                                legend_table = Table(legend_data, colWidths=[1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch, 1.2*inch])
-                                legend_table.setStyle(TableStyle([
-                                    # Header row styling
-                                    ('BACKGROUND', (0, 0), (5, 0), colors.HexColor('#f3f4f6')),
-                                    ('TEXTCOLOR', (0, 0), (5, 0), colors.black),
-                                    ('ALIGN', (0, 0), (5, 0), 'CENTER'),
-                                    ('FONTNAME', (0, 0), (5, 0), 'Helvetica-Bold'),
-                                    ('FONTSIZE', (0, 0), (5, 0), 10),
-                                    ('BOTTOMPADDING', (0, 0), (5, 0), 8),
-                                    
-                                    # Data row styling
-                                    ('BACKGROUND', (0, 1), (5, 1), colors.HexColor('#ffffff')),
-                                    ('TEXTCOLOR', (0, 1), (5, 1), colors.black),
-                                    ('ALIGN', (0, 1), (5, 1), 'CENTER'),
-                                    ('FONTSIZE', (0, 1), (5, 1), 9),
-                                    ('GRID', (0, 0), (5, 1), 0.5, colors.grey),
-                                    
-                                    # Color indicators for density levels
-                                    ('BACKGROUND', (0, 0), (0, 0), colors.HexColor('#22c55e')),  # Low - green
-                                    ('BACKGROUND', (2, 0), (2, 0), colors.HexColor('#eab308')),  # Medium - yellow
-                                    ('BACKGROUND', (4, 0), (4, 0), colors.HexColor('#ef4444')),  # High - red
-                                    
-                                    # Color indicators for markers
-                                    ('BACKGROUND', (0, 1), (0, 1), colors.HexColor('#2563eb')),  # Path - blue
-                                    ('BACKGROUND', (2, 1), (2, 1), colors.HexColor('#22c55e')),  # Start - green
-                                    ('BACKGROUND', (4, 1), (4, 1), colors.HexColor('#ef4444')),  # End - red
-                                ]))
-                                story.append(legend_table)
-                                story.append(Spacer(1, 0.3*inch))
-                            finally:
-                                # Clean up temp file
-                                if os.path.exists(html_file):
-                                    os.unlink(html_file)
+                                # Color indicators for markers
+                                ('BACKGROUND', (0, 1), (0, 1), colors.HexColor('#2563eb')),  # Path - blue
+                                ('BACKGROUND', (2, 1), (2, 1), colors.HexColor('#22c55e')),  # Start - green
+                                ('BACKGROUND', (4, 1), (4, 1), colors.HexColor('#ef4444')),  # End - red
+                            ]))
+                            story.append(legend_table)
+                            story.append(Spacer(1, 0.3*inch))
+                            print(f"✅ Heatmap added to PDF")
+                            
+                        finally:
+                            # Clean up temp file
+                            if html_file and os.path.exists(html_file):
+                                os.unlink(html_file)
+                                print(f"🧹 Cleaned up temp HTML file")
+                                
                 except Exception as e:
-                    print(f"Error generating heatmap image: {e}")
-                    # Continue without heatmap
+                    print(f"❌ Error generating heatmap image: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Continue without heatmap - don't fail the entire PDF export
             
             # Weed class summary
             story.append(Paragraph("Weed Species Summary", styles['Heading2']))

@@ -10,6 +10,7 @@ import * as Sharing from 'expo-sharing';
 import { API_BASE } from '../config';
 import { useSession } from '../context/SessionContext';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import ZoomableImage from '../components/ZoomableImage';
 
 type DetectionRow = [
   id: number,
@@ -105,6 +106,15 @@ const DetectionResults = () => {
   
   // DJI Mini 4 Pro aspect ratio is 4:3
   const djiAspectRatio = 4 / 3
+
+  // Error handler callbacks to avoid state updates during render
+  const handleImageError = useCallback((error: any) => {
+    console.log('Image load error:', error);
+  }, []);
+
+  const handleVideoError = useCallback((error: any) => {
+    console.log('Video load error:', error);
+  }, []);
 
   const loadDetectionData = useCallback(async (detection: DetectionRow) => {
     try {
@@ -485,7 +495,7 @@ const DetectionResults = () => {
       <ScrollView className="flex-1" showsVerticalScrollIndicator={false}
         refreshControl={<RefreshControl refreshing={loading} onRefresh={() => refreshSessions()} />}>
         <View className="flex-1 justify-start items-center pb-8 px-4" style={{ paddingTop: 48 }}>
-        {/* Media Container - Expandable with DJI Mini 4 Pro aspect ratio */}
+        {/* Media Container - Flexible preview with better aspect ratio handling */}
         <View className="w-full items-center mb-6">
           <TouchableOpacity 
             onPress={() => setIsModalVisible(true)}
@@ -496,34 +506,29 @@ const DetectionResults = () => {
               className="bg-gray-800 rounded-2xl shadow-lg overflow-hidden"
               style={{ 
                 width: '100%', 
-                aspectRatio: djiAspectRatio 
+                minHeight: 200,
+                maxHeight: screenHeight * 0.5,
               }}
             >
               {selectedDetection && selectedDetection[3] === 'image' ? (
                 <Image
                   source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
-                  resizeMode="cover"
-                  style={{ width: '100%', height: '100%' }}
-                  onError={(error) => {
-                    console.log('Image load error:', error)
-                    Alert.alert('Error', 'Failed to load image from Cloudinary')
-                  }}
+                  resizeMode="contain"
+                  style={{ width: '100%', height: '100%', minHeight: 200 }}
+                  onError={handleImageError}
                 />
               ) : selectedDetection && selectedDetection[3] === 'video' && (selectedDetection as any).cloud_secure_url ? (
                 <Video
                   source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
-                  style={{ width: '100%', height: '100%' }}
-                  resizeMode={ResizeMode.COVER}
+                  style={{ width: '100%', height: 300 }}
+                  resizeMode={ResizeMode.CONTAIN}
                   shouldPlay={false}
                   isLooping={true}
                   isMuted={true}
-                  onError={(error) => {
-                    console.log('Video load error:', error)
-                    Alert.alert('Error', 'Failed to load video')
-                  }}
+                  onError={handleVideoError}
                 />
               ) : (
-                <View className="flex-1 items-center justify-center">
+                <View style={{ width: '100%', height: 250 }} className="items-center justify-center">
                   <Ionicons name="play-circle" size={64} color="white" />
                   <Text className="text-white text-lg font-medium mt-3 text-center">
                     {selectedDetection?.[3] === 'video' ? 'Detection Video' : 'Media preview unavailable'}
@@ -621,7 +626,7 @@ const DetectionResults = () => {
           animationType="fade"
           onRequestClose={() => setIsModalVisible(false)}
         >
-          <View className="flex-1 bg-black/90 justify-center items-center">
+          <View className="flex-1 bg-black justify-center items-center">
             <TouchableOpacity 
               className="absolute top-12 right-4 z-10 bg-black/50 rounded-full p-3"
               onPress={() => setIsModalVisible(false)}
@@ -629,40 +634,37 @@ const DetectionResults = () => {
               <Ionicons name="close" size={24} color="white" />
             </TouchableOpacity>
             
+            {/* Full screen container for media */}
             <View 
-              className="w-full max-w-full mx-4"
               style={{ 
-                aspectRatio: djiAspectRatio,
-                maxHeight: screenHeight * 0.8,
-                maxWidth: screenWidth * 0.95
+                width: screenWidth,
+                height: screenHeight,
+                justifyContent: 'center',
+                alignItems: 'center',
               }}
             >
               {selectedDetection && selectedDetection[3] === 'image' ? (
-                <Image
-                  source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
-                  resizeMode="contain"
+                <ZoomableImage
+                  uri={(selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url}
                   style={{ width: '100%', height: '100%' }}
-                  onError={(error) => {
-                    console.log('Modal image load error:', error)
-                    Alert.alert('Error', 'Failed to load image in fullscreen')
-                  }}
+                  resizeMode="contain"
                 />
               ) : selectedDetection && selectedDetection[3] === 'video' && (selectedDetection as any).cloud_secure_url ? (
                 <Video
                   source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
-                  style={{ width: '100%', height: '100%' }}
+                  style={{ 
+                    width: screenWidth * 0.95, 
+                    height: screenHeight * 0.8,
+                  }}
                   resizeMode={ResizeMode.CONTAIN}
                   shouldPlay={true}
                   isLooping={true}
                   isMuted={false}
                   useNativeControls={true}
-                  onError={(error) => {
-                    console.log('Modal video load error:', error)
-                    Alert.alert('Error', 'Failed to load video in fullscreen')
-                  }}
+                  onError={handleVideoError}
                 />
               ) : (
-                <View className="flex-1 items-center justify-center bg-gray-800 rounded-lg">
+                <View className="flex-1 items-center justify-center bg-gray-800 rounded-lg mx-4">
                   <Ionicons name="alert-circle" size={64} color="white" />
                   <Text className="text-white text-lg font-medium mt-3 text-center">
                     Media Unavailable

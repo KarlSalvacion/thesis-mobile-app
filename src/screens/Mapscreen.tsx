@@ -376,6 +376,11 @@ const Mapscreen = () => {
             onPress={() => {
               if (toggleDisabled) return;
               setShowUserLocation((v) => !v);
+              // Temporarily disable button to prevent rapid toggles during map recentering
+              setToggleDisabled(true);
+              setTimeout(() => {
+                setToggleDisabled(false);
+              }, 1000); // Re-enable after 1 second
             }}
             style={{ backgroundColor: showUserLocation ? '#2563eb' : '#fff', borderRadius: 24, padding: 8, borderWidth: 1, borderColor: '#2563eb', elevation: 2, opacity: toggleDisabled ? 0.5 : 1 }}
             disabled={toggleDisabled}
@@ -396,7 +401,7 @@ const Mapscreen = () => {
           ) : null}
         </View>
       </View>
-      <Pressable onPress={() => refreshSessions()} className='mt-4 px-6 py-2 bg-gray-700 rounded-md w-[95vw] max-w-[420px]'>
+      <Pressable onPress={async () => { await refreshSessions(); }} className='mt-4 px-6 py-2 bg-gray-700 rounded-md w-[95vw] max-w-[420px]'>
         <Text className='text-white font-medium text-center'>Refresh Sessions</Text>
       </Pressable>
 
@@ -640,7 +645,7 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled, userLocation, centerO
         userMarker = L.marker(userLoc, {
           icon: L.divIcon({
             className: 'custom-user-icon',
-            html: '<div style="background-color: #2563eb; width: 22px; height: 22px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>'
+            html: '<div style="background-color: #2563eb; width: 14px; height: 14px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>'
           })
         }).addTo(map).bindPopup('Your Location');
         map.setView(userLoc, 18, { animate: true });
@@ -662,9 +667,9 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled, userLocation, centerO
         const startCoord = coords[0];
         const startIcon = L.divIcon({
           className: 'custom-icon',
-          html: '<div style="background-color: #22c55e; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
-          iconSize: [20, 20],
-          iconAnchor: [10, 10]
+          html: '<div style="background-color: #22c55e; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
+          iconSize: [14, 14],
+          iconAnchor: [7, 7]
         });
         L.marker([startCoord[0], startCoord[1]], { icon: startIcon }).addTo(map)
           .bindPopup('Flight Start');
@@ -672,9 +677,9 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled, userLocation, centerO
         const endCoord = coords[coords.length - 1];
         const endIcon = L.divIcon({
           className: 'custom-icon',
-          html: '<div style="background-color: #ef4444; width: 20px; height: 20px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
-          iconSize: [20, 20],
-          iconAnchor: [10, 10]
+          html: '<div style="background-color: #ef4444; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
+          iconSize: [14, 14],
+          iconAnchor: [7, 7]
         });
         L.marker([endCoord[0], endCoord[1]], { icon: endIcon }).addTo(map)
           .bindPopup('Flight End');

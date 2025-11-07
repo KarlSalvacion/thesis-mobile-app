@@ -123,9 +123,9 @@ FFMPEG_BINARY = "ffmpeg"  # e.g. "C:/ffmpeg/bin/ffmpeg.exe" or None
 # Cloudinary configuration
 CLOUDINARY_URL = ""  # Optional: e.g. cloudinary://<api_key>:<api_secret>@<cloud_name>
 # Or specify discrete credentials if CLOUDINARY_URL is blank
-CLOUDINARY_CLOUD_NAME = "dl8ifxbsd"
-CLOUDINARY_API_KEY = "867463359734984"
-CLOUDINARY_API_SECRET = "ScOI-O32MQU8EkSOdS8yMPfLA_g"
+CLOUDINARY_CLOUD_NAME = "ddfetmwps"
+CLOUDINARY_API_KEY = "295875744174271"
+CLOUDINARY_API_SECRET = "0pAdUNbFFiWxL1kN6sQcYg4K3iA"
 
 # ============================================================================
 # Video Compression Configuration
@@ -172,8 +172,8 @@ COMPRESSION_AGGRESSIVE_MODE = True  # More aggressive compression
 # For Render.com, use the Internal Database URL from your PostgreSQL dashboard
 DATABASE_URL = os.getenv(
     'DATABASE_URL',
-    'postgresql://weed_detection_db_user:WgBIIb6U1adbqvKuSwnKnlAWox7PTrQx@dpg-d43pkhodl3ps73a675hg-a/weed_detection_db'
-    #'postgresql://postgres:lucido%4025@localhost:5432/weed_detection'
+    #'postgresql://weed_detection_db_user:WgBIIb6U1adbqvKuSwnKnlAWox7PTrQx@dpg-d43pkhodl3ps73a675hg-a/weed_detection_db'
+    'postgresql://postgres:lucido%4025@localhost:5432/weed_detection'
 )
 #postgresql://weed_detection_db_user:WgBIIb6U1adbqvKuSwnKnlAWox7PTrQx@dpg-d43pkhodl3ps73a675hg-a/weed_detection_db
 #postgresql://postgres:lucido%4025@localhost:5432/weed_detection
