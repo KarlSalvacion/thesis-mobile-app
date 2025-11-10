@@ -515,12 +515,13 @@ def stitch_video_cv2(frames_dir: str, fps: float, output_path: str, frame_patter
         print(f"Original video dimensions: {width}x{height}")
         
         # Smart resolution scaling to stay under target size
-        # More accurate estimate: ~160KB per frame at 1080p with mp4v codec
-        estimated_size_mb = (frame_count * 160) / 1024  # Conservative estimate at 1080p
+        # Realistic estimate based on actual mp4v codec performance: ~165KB per frame at 1080p
+        # This matches real-world output (97.88MB / 624 frames = 156KB/frame)
+        estimated_size_mb = (frame_count * 165) / 1024  # Realistic estimate at 1080p
         
-        # Calculate scaling factor to stay under target (add 10% safety margin)
+        # Calculate scaling factor to stay under target (add 20% safety margin)
         if estimated_size_mb > target_size_mb:
-            scale_factor = ((target_size_mb * 0.90) / estimated_size_mb) ** 0.5  # 10% buffer + square root for area scaling
+            scale_factor = ((target_size_mb * 0.80) / estimated_size_mb) ** 0.5  # 20% buffer + square root for area scaling
             width = int(width * scale_factor)
             height = int(height * scale_factor)
             print(f"📉 Scaling down to {width}x{height} to stay under {target_size_mb}MB (estimated: {estimated_size_mb:.1f}MB)")

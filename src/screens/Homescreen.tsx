@@ -722,7 +722,10 @@ const Homescreen = () => {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.All,
         allowsEditing: false,
-        quality: 1
+        quality: 1,
+        // Optimize: Don't load full image into memory for preview
+        exif: false,
+        base64: false,
       })
 
       if (result.canceled) {
@@ -736,15 +739,16 @@ const Homescreen = () => {
       if (asset) {
         setMessage('Reading file information...')
         
-        // Get file info asynchronously with timeout
+        // Get file info asynchronously with shorter timeout for images (2s), longer for videos (5s)
         let size: number | null = null
         let inferredName = ''
         
         try {
-          // Try to get file info with timeout (5 seconds)
+          // Optimize: Use shorter timeout for images since they load faster
+          const timeoutDuration = asset.type === 'image' ? 2000 : 5000
           const infoPromise = FileSystem.getInfoAsync(asset.uri)
           const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('Timeout')), 5000)
+            setTimeout(() => reject(new Error('Timeout')), timeoutDuration)
           )
           
           const info: any = await Promise.race([infoPromise, timeoutPromise])

@@ -1053,8 +1053,9 @@ def run_video_inference(
                     ann_video_path = tempfile.mktemp(suffix='_annotated.mp4')
                     print(f'Stitching video with OpenCV at {api_fps} FPS (detection rate)...')
                     
-                    # Use OpenCV stitching with compression (stays under 100MB for Cloudinary)
-                    stitch_success = stitch_video_cv2(ann_frames_dir, api_fps, ann_video_path, frame_pattern='ann_%06d.jpg', target_size_mb=95)
+                    # Use OpenCV stitching with aggressive compression for longer videos (3+ mins)
+                    # Target 70MB to safely handle 1800+ frame videos while maintaining quality
+                    stitch_success = stitch_video_cv2(ann_frames_dir, api_fps, ann_video_path, frame_pattern='ann_%06d.jpg', target_size_mb=70)
                     
                     if not stitch_success:
                         # OpenCV failed - cannot proceed without FFmpeg

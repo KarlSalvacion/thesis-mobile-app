@@ -1912,7 +1912,7 @@ async def export_report(
         writer.writerow(['Filename', filename])
         writer.writerow(['Timestamp', timestamp])
         writer.writerow(['Total Detections', len(detection_details)])
-        writer.writerow(['Average Confidence', f"{avg_confidence:.2f}%"])
+        writer.writerow(['Average Confidence', f"{avg_confidence * 100:.2f}%"])  # Convert 0.0-1.0 to 0-100%
         writer.writerow([])
         
         # Weed class summary
@@ -1923,7 +1923,7 @@ async def export_report(
                 weed_class,
                 data['count'],
                 f"{(data['count'] / len(detection_details)) * 100:.2f}%",
-                f"{data['avg_confidence']:.2f}%"
+                f"{data['avg_confidence'] * 100:.2f}%"  # Convert 0.0-1.0 to 0-100%
             ])
         writer.writerow([])
         
@@ -1985,7 +1985,7 @@ async def export_report(
                 ['Total Frames:', str(total_frames)],
                 ['Total Detections:', str(len(detection_details))],
                 ['Processing Time:', f"{processing_time:.2f}s"],
-                ['Average Confidence:', f"{avg_confidence:.2f}%"],
+                ['Average Confidence:', f"{avg_confidence * 100:.2f}%"],  # Convert 0.0-1.0 to 0-100%
                 ['GPS Data:', 'Yes' if has_srt_data else 'No']
             ]
             
@@ -2141,10 +2141,16 @@ async def export_report(
                                     service = Service()
                                 
                                 driver = webdriver.Chrome(service=service, options=chrome_options)
-                                driver.get(f'file://{html_file}')
-                                time.sleep(5)  # Wait for tiles to load
-                                screenshot = driver.get_screenshot_as_png()
-                                driver.quit()
+                                driver.set_page_load_timeout(10)  # 10s timeout for weak connectivity
+                                
+                                try:
+                                    driver.get(f'file://{html_file}')
+                                    time.sleep(2.5)  # Reduced from 5s - optimize for weak connectivity
+                                    screenshot = driver.get_screenshot_as_png()
+                                    driver.quit()
+                                except Exception as timeout_error:
+                                    driver.quit()
+                                    raise timeout_error  # Trigger matplotlib fallback
                                 
                                 img_buffer = BytesIO(screenshot)
                                 print(f"✅ Screenshot captured with selenium")
@@ -2185,7 +2191,7 @@ async def export_report(
                             
                             # Create legend table with color indicators
                             legend_data = [
-                                ['Low Density', '≤2 weeds', 'Medium Density', '3-5 weeds', 'High Density', '>5 weeds'],
+                                ['Low Density', '≤2 weeds', 'Medium Density', '3 weeds', 'High Density', '≥4 weeds'],
                                 ['Flight Path', 'Blue line', 'Start Point', 'Green marker', 'End Point', 'Red marker']
                             ]
                             
@@ -2242,7 +2248,7 @@ async def export_report(
                     weed_class,
                     str(data['count']),
                     f"{(data['count'] / len(detection_details)) * 100:.1f}%",
-                    f"{data['avg_confidence']:.1f}%"
+                    f"{data['avg_confidence'] * 100:.1f}%"  # Convert 0.0-1.0 to 0-100%
                 ])
             
             class_table = Table(class_data, colWidths=[2*inch, 1.5*inch, 1.5*inch, 1.5*inch])
@@ -2268,7 +2274,7 @@ async def export_report(
                 detail_data.append([
                     str(d['frame_number']),
                     d['weed_class'],
-                    f"{d['confidence']:.1f}%",
+                    f"{d['confidence'] * 100:.1f}%",  # Convert 0.0-1.0 to 0-100%
                     f"({d['bbox_x']:.0f}, {d['bbox_y']:.0f}, {d['bbox_width']:.0f}, {d['bbox_height']:.0f})"
                 ])
             

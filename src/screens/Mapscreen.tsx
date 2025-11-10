@@ -304,17 +304,23 @@ const Mapscreen = () => {
     let low = 0, medium = 0, high = 0;
     
     // Count total weeds (not grid cells) in each density category
+    // Matches heatmap color gradient: ≤2 = green (low), 3 = yellow (medium), ≥4 = red (high)
+    // Note: heatmap max:4 means weight 4 shows as full red (intensity 1.0)
     heatPoints.forEach(point => {
       const weedCount = point.weight;  // Number of unique weeds in this location
       
       if (weedCount <= 2) {
         low += weedCount;  // Add the actual number of weeds, not just 1
-      } else if (weedCount <= 5) {
+      } else if (weedCount === 3) {  // Only 3 is medium (yellow/orange)
         medium += weedCount;
       } else {
-        high += weedCount;
+        high += weedCount;  // 4+ is high (red on heatmap)
       }
     });
+    
+    console.log('🔥 [DENSITY DEBUG] Heatpoints:', heatPoints.length);
+    console.log('🔥 [DENSITY DEBUG] Weights:', heatPoints.map(p => p.weight).join(', '));
+    console.log('🔥 [DENSITY DEBUG] Calculated - Low:', low, 'Medium:', medium, 'High:', high);
     
     const gpsPoints = polyline.length;
     return { low, medium, high, gpsPoints };
@@ -514,19 +520,19 @@ const Mapscreen = () => {
         <View className="flex-row justify-between items-center mt-2 w-full">
           <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2">
             <Text className='text-xs font-bold text-gray-600'>Low Density</Text>
-            <Text className='text-[10px] text-gray-500'>(1-2 per area)</Text>
+            <Text className='text-[10px] text-gray-500'>(≤2 per area)</Text>
             <Text className='text-base font-medium mt-1'>{density.low}</Text>
             <Text className='text-[9px] text-gray-400'>weeds</Text>
           </View>
           <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2">
             <Text className='text-xs font-bold text-gray-600'>Medium</Text>
-            <Text className='text-[10px] text-gray-500'>(3-5 per area)</Text>
+            <Text className='text-[10px] text-gray-500'>(3 per area)</Text>
             <Text className='text-base font-medium mt-1'>{density.medium}</Text>
             <Text className='text-[9px] text-gray-400'>weeds</Text>
           </View>
           <View className="flex-1 flex-col justify-center items-center mx-1 rounded-md py-2">
             <Text className='text-xs font-bold text-gray-600'>High Density</Text>
-            <Text className='text-[10px] text-gray-500'>(6+ per area)</Text>
+            <Text className='text-[10px] text-gray-500'>(≥4 per area)</Text>
             <Text className='text-base font-medium mt-1'>{density.high}</Text>
             <Text className='text-[9px] text-gray-400'>weeds</Text>
           </View>
@@ -637,9 +643,26 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled, userLocation, centerO
     <div id="map"></div>
     <script>
       const coords = ${coordsJson};
-  const map = L.map('map', { zoomControl: true, fullscreenControl: true }).setView([${center.lat}, ${center.lng}], 17);
-      // User marker logic
       const userLoc = ${userLocJson};
+      
+      // Initialize map - start at polyline center to load tiles, then move to user location if available
+      const map = L.map('map', { 
+        zoomControl: true, 
+        fullscreenControl: true,
+        preferCanvas: true,  // Optimize rendering performance
+        zoomAnimation: true,
+        fadeAnimation: true
+      }).setView([${center.lat}, ${center.lng}], 17);
+      
+      // Google Satellite tiles - load first to prevent white flicker
+      L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+        maxZoom: 20,
+        subdomains: ['mt0','mt1','mt2','mt3'],
+        attribution: 'Map data ©2025 Google',
+        keepBuffer: 2,  // Keep tiles in memory for smoother experience
+      }).addTo(map);
+      
+      // User marker logic - add after tiles
       let userMarker = null;
       if (userLoc) {
         userMarker = L.marker(userLoc, {
@@ -648,18 +671,13 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled, userLocation, centerO
             html: '<div style="background-color: #2563eb; width: 14px; height: 14px; border-radius: 50%; border: 3px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>'
           })
         }).addTo(map).bindPopup('Your Location');
-        map.setView(userLoc, 18, { animate: true });
+        // Smoothly pan to user location with animation
+        map.setView(userLoc, 18, { animate: true, duration: 0.5 });
       } else if (coords.length > 1) {
-        // If not showing user location, fit to polyline as before
+        // If not showing user location, fit to polyline
         const poly = L.polyline(coords, { color: '#2563eb', weight: 3 });
         map.fitBounds(poly.getBounds(), { padding: [20, 20] });
       }
-      // Google Satellite tiles
-      L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
-        maxZoom: 20,
-        subdomains: ['mt0','mt1','mt2','mt3'],
-        attribution: 'Map data ©2025 Google',
-      }).addTo(map);
       if (coords.length > 1) {
         const poly = L.polyline(coords, { color: '#2563eb', weight: 3 }).addTo(map);
         map.fitBounds(poly.getBounds(), { padding: [20, 20] });
@@ -702,9 +720,9 @@ function LeafletWebMap({ polyline, heat, setScrollEnabled, userLocation, centerO
         }).addTo(map);
         // Add small markers at exact grid cell centers for clarity
         heat.forEach(point => {
-          const color = point.weight <= 2 ? '#22c55e' :   // green
-                        point.weight <= 5 ? '#eab308' :   // yellow
-                        '#ef4444';                         // red
+          const color = point.weight <= 2 ? '#22c55e' :   // green (low: ≤2)
+                        point.weight === 3 ? '#eab308' :  // yellow (medium: 3)
+                        '#ef4444';                         // red (high: ≥4)
           L.circleMarker([point.lat, point.lng], {
             radius: 3, // smaller marker radius
             fillColor: color,
