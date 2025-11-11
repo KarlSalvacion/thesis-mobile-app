@@ -187,7 +187,7 @@ python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
 ## 👥 Team
 
-Developed by Karl Salvacion and Albert Lucido
+Developed by Albert Lucido, Karl Salvacion, Relli Javier
 
 ## 📝 License
 
@@ -198,3 +198,4 @@ Developed by Karl Salvacion and Albert Lucido
 - Roboflow for AI model hosting
 - Cloudinary for media storage
 - Expo team for mobile development platform
+
