@@ -1046,6 +1046,17 @@ const Homescreen = () => {
             console.log('✅ [COMPRESSION] Compression ratio:', ((compressedSize / selectedMedia.size) * 100).toFixed(1) + '%')
           }
           
+          // Final size check - videos should be under 200MB after compression
+          const MAX_VIDEO_SIZE_MB = 200
+          const compressedSizeMB = compressedSize / (1024 * 1024)
+          
+          if (compressedSizeMB > MAX_VIDEO_SIZE_MB) {
+            console.error(`❌ [COMPRESSION] Compressed video still too large: ${compressedSizeMB.toFixed(2)} MB (max: ${MAX_VIDEO_SIZE_MB} MB)`)
+            setStatus('error')
+            setMessage(`Video is too large even after compression (${compressedSizeMB.toFixed(1)} MB). Please select a shorter video or lower quality source file.`)
+            return
+          }
+          
           mediaUriToUpload = compressedUri
           mediaSizeToUpload = compressedSize
           
@@ -1097,12 +1108,36 @@ const Homescreen = () => {
             mediaUriToUpload = cacheDest
             mediaSizeToUpload = info.exists ? info.size : mediaSizeToUpload
             console.log('✅ [COMPRESSION] Copied compressed image to cache:', cacheDest)
+            
+            // Final size check - images should be under 10MB after compression (Roboflow limit)
+            const MAX_IMAGE_SIZE_MB = 10
+            const compressedSizeMB = mediaSizeToUpload / (1024 * 1024)
+            
+            if (compressedSizeMB > MAX_IMAGE_SIZE_MB) {
+              console.error(`❌ [COMPRESSION] Compressed image still too large: ${compressedSizeMB.toFixed(2)} MB (max: ${MAX_IMAGE_SIZE_MB} MB)`)
+              setStatus('error')
+              setMessage(`Image is too large even after compression (${compressedSizeMB.toFixed(1)} MB). Please select a smaller image or lower resolution.`)
+              return
+            }
+            
+            console.log(`✅ [COMPRESSION] Final image size: ${compressedSizeMB.toFixed(2)} MB (within ${MAX_IMAGE_SIZE_MB} MB limit)`)
           } catch (copyErr) {
             console.warn('⚠️ [COMPRESSION] Failed to copy compressed image to cache, using compressed URI directly', copyErr)
             mediaUriToUpload = compressedUri
             try {
               const info = await FileSystem.getInfoAsync(compressedUri)
               mediaSizeToUpload = info.exists ? info.size : mediaSizeToUpload
+              
+              // Final size check on the compressed URI
+              const MAX_IMAGE_SIZE_MB = 10
+              const compressedSizeMB = mediaSizeToUpload / (1024 * 1024)
+              
+              if (compressedSizeMB > MAX_IMAGE_SIZE_MB) {
+                console.error(`❌ [COMPRESSION] Compressed image still too large: ${compressedSizeMB.toFixed(2)} MB (max: ${MAX_IMAGE_SIZE_MB} MB)`)
+                setStatus('error')
+                setMessage(`Image is too large even after compression (${compressedSizeMB.toFixed(1)} MB). Please select a smaller image or lower resolution.`)
+                return
+              }
             } catch {}
           }
 
