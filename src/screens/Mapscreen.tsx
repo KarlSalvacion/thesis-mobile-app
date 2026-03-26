@@ -228,9 +228,9 @@ const Mapscreen = () => {
           // Generate heatmap based on unique weeds per GPS location
           // MORE AGGRESSIVE parameters for 10 FPS drone video:
           // - grid_size_m=2.0: 2-meter grid cells for agricultural field scale
-          // - iou_threshold=0.5: More lenient matching (50% overlap allows for angle/distance changes)
-          // - frame_gap=20: At 10 FPS, 20 frames = 2.0 seconds (track same weed across longer timespan)
-          const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=2.0&iou_threshold=0.5&frame_gap=20`);
+          // - iou_threshold=0.58: Calibrated matching (58% overlap)
+          // - frame_gap=13: At 10 FPS, 13 frames = 1.3 seconds
+          const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=2.0&iou_threshold=0.58&frame_gap=13`);
           if (res4.ok) {
             const j4 = await res4.json();
             const heatmapPoints = (j4?.points ?? []).map((point: any) => ({ lat: point.lat, lng: point.lng, weight: point.unique_count || point.weight || 1 }));

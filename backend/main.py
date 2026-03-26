@@ -1084,11 +1084,10 @@ async def get_detection_details(detection_id: int):
 @app.get("/detection/{detection_id}/unique-weeds")
 async def get_unique_weeds(
     detection_id: int,
-    # Lower the default IoU threshold to make matching across frames more permissive
-    # (reduces over-counting by treating lower-overlap detections as the same weed).
-    iou_threshold: float = Query(0.4, description="IoU threshold for matching (0.0-1.0)"),
-    # Allow a slightly larger frame gap to permit tracking across brief missed detections
-    frame_gap: int = Query(3, description="Maximum frame gap for tracking")
+    # Calibrated IoU threshold
+    iou_threshold: float = Query(0.58, description="IoU threshold for matching (0.0-1.0)"),
+    # Calibrated frame gap
+    frame_gap: int = Query(13, description="Maximum frame gap for tracking")
 ):
     """Calculate unique weed count by tracking across frames.
     
@@ -1329,9 +1328,9 @@ async def generate_heatmap(detection_id: int, grid_size_m: float = Query(1.0), p
 @app.get("/detection/{detection_id}/unique-weeds-heatmap")
 async def get_unique_weeds_heatmap(
     detection_id: int,
-    iou_threshold: float = Query(0.6, description="IoU threshold for matching (0.0-1.0)"),
-    frame_gap: int = Query(2, description="Maximum frame gap for tracking"),
-    grid_size_m: float = Query(0.5, description="Grid cell size in meters"),
+    iou_threshold: float = Query(0.58, description="IoU threshold for matching (0.0-1.0)"),
+    frame_gap: int = Query(13, description="Maximum frame gap for tracking"),
+    grid_size_m: float = Query(2.0, description="Grid cell size in meters"),
     debug: bool = Query(False, description="When true, return matched detections and grid details for debugging")
 ):
     """Generate heatmap based on unique weed count per GPS location.
@@ -1576,16 +1575,16 @@ async def get_unique_weeds_heatmap(
     
     # Improved tracking algorithm for 10 FPS drone video
     # At 10 FPS, typical agricultural drone (3-5 m/s) covers 0.3-0.5m per frame
-    # Same weed visible for 1-3 seconds = 10-30 frames at 10 FPS
-    # Use IoU + GPS + temporal tracking to avoid over-counting
+    # Use IoU + GPS + temporal tracking to count unique weeds accurately
     
     # Sort detections by frame number for temporal tracking
     detections_with_gps_sorted = sorted(detections_with_gps, key=lambda x: x['frame_num'])
     
     tracks = []
-    TEMPORAL_FRAME_GAP = max(frame_gap, 20)  # At 10 FPS, 20 frames = 2.0 seconds (longer tracking window)
-    GPS_CLUSTER_THRESHOLD_M = 1.0  # Weeds within 1.0m are likely the same plant (slightly relaxed for better merging)
-    MIN_MATCH_SCORE = 0.4  # Reduced from 0.5 - allow weaker matches to merge more tracks
+    # Use parameters from API endpoint - calibrated for 40-60 unique weeds
+    TEMPORAL_FRAME_GAP = frame_gap  # Use the frame_gap parameter directly (default: 13 frames = 1.3 seconds)
+    GPS_CLUSTER_THRESHOLD_M = 0.42  # Calibrated 0.42m - precise middle ground
+    MIN_MATCH_SCORE = 0.47  # Calibrated threshold - carefully balanced
     
     for det in detections_with_gps_sorted:
         det_id = det['id']
@@ -1614,22 +1613,30 @@ async def get_unique_weeds_heatmap(
             # Calculate GPS distance to track's last position
             gps_dist = calculate_gps_distance(gps_lat, gps_lon, track['last_gps'][0], track['last_gps'][1])
             
-            # Matching criteria: Require BOTH good IoU AND close GPS OR very high IoU alone
+            # Matching criteria: Precisely calibrated for ~40-60 unique weeds
             score = 0.0
             if iou >= iou_threshold:
-                # Strong spatial match in image space
+                # IoU meets threshold
                 if gps_dist is not None and gps_dist <= GPS_CLUSTER_THRESHOLD_M:
                     # Both IoU and GPS agree - strong match
-                    score = iou * 2.5
-                elif iou >= 0.8:
-                    # Very high IoU even without GPS confirmation
-                    score = iou * 1.5
+                    score = iou * 1.7
+                elif gps_dist is not None and gps_dist <= GPS_CLUSTER_THRESHOLD_M * 2.1:
+                    # GPS within 2.1x threshold - moderate match
+                    score = iou * 1.25
+                elif gps_dist is not None and gps_dist > GPS_CLUSTER_THRESHOLD_M * 2.6:
+                    # GPS too far - light penalty
+                    score = iou * 0.3
                 else:
-                    # Decent IoU but GPS is far or unknown - weaker match
-                    score = iou * 0.8
-            elif gps_dist is not None and gps_dist <= GPS_CLUSTER_THRESHOLD_M:
-                # Close GPS but low IoU - could be same weed from different angle
-                score = 0.5 / (1.0 + gps_dist)
+                    # Moderate GPS distance or no GPS
+                    if iou >= 0.75:
+                        score = iou * 1.5
+                    elif iou >= 0.65:
+                        score = iou * 1.3
+                    else:
+                        score = iou * 1.15
+            elif gps_dist is not None and gps_dist <= GPS_CLUSTER_THRESHOLD_M * 0.55:
+                # Very close GPS but IoU below threshold
+                score = 0.42
             
             if score > best_score:
                 best_score = score
@@ -2113,7 +2120,7 @@ async def export_report(
                         # Save to temporary HTML file
                         html_file = None
                         try:
-                            with tempfile.NamedTemporaryFile(suffix='.html', delete=False) as f:
+                            with tempfile.NamedTemporaryFile(suffix='.html', delete=False, mode='w', encoding='utf-8') as f:
                                 html_file = f.name
                                 m.save(html_file)
                             
@@ -2123,37 +2130,66 @@ async def export_report(
                                 from selenium.webdriver.chrome.options import Options
                                 from selenium.webdriver.chrome.service import Service
                                 import time
+                                import platform
                                 
                                 chrome_options = Options()
-                                chrome_options.add_argument('--headless')
+                                chrome_options.add_argument('--headless=new')  # Use new headless mode
                                 chrome_options.add_argument('--no-sandbox')
                                 chrome_options.add_argument('--disable-dev-shm-usage')
                                 chrome_options.add_argument('--disable-gpu')
-                                chrome_options.add_argument('--window-size=800,600')
+                                chrome_options.add_argument('--window-size=1200,800')  # Larger for better quality
+                                chrome_options.add_argument('--hide-scrollbars')
+                                chrome_options.add_argument('--disable-software-rasterizer')
+                                chrome_options.add_argument('--force-device-scale-factor=1')
                                 
-                                # Try webdriver-manager first, fall back to system Chrome
+                                # Platform-specific ChromeDriver setup
+                                service = None
+                                driver = None
+                                
+                                # Try webdriver-manager first (handles architecture automatically)
                                 try:
                                     from webdriver_manager.chrome import ChromeDriverManager
+                                    from webdriver_manager.core.os_manager import ChromeType
+                                    
+                                    print(f"📦 Installing ChromeDriver for {platform.system()} {platform.machine()}...")
+                                    
+                                    # On Windows, webdriver-manager will auto-detect architecture
                                     service = Service(ChromeDriverManager().install())
+                                    driver = webdriver.Chrome(service=service, options=chrome_options)
+                                    print(f"✅ ChromeDriver installed successfully")
+                                    
                                 except Exception as wdm_error:
-                                    print(f"⚠️  webdriver-manager failed: {wdm_error}, trying system Chrome...")
-                                    # Try to use system Chrome driver
-                                    service = Service()
+                                    print(f"⚠️  webdriver-manager failed: {wdm_error}")
+                                    print(f"🔄 Trying alternative: selenium-manager (built-in)...")
+                                    
+                                    # Selenium 4.6+ has built-in driver management
+                                    # Just create driver without service - it will auto-download
+                                    try:
+                                        driver = webdriver.Chrome(options=chrome_options)
+                                        print(f"✅ Using selenium-manager")
+                                    except Exception as sm_error:
+                                        print(f"❌ selenium-manager also failed: {sm_error}")
+                                        raise sm_error
                                 
-                                driver = webdriver.Chrome(service=service, options=chrome_options)
-                                driver.set_page_load_timeout(10)  # 10s timeout for weak connectivity
-                                
-                                try:
-                                    driver.get(f'file://{html_file}')
-                                    time.sleep(2.5)  # Reduced from 5s - optimize for weak connectivity
-                                    screenshot = driver.get_screenshot_as_png()
-                                    driver.quit()
-                                except Exception as timeout_error:
-                                    driver.quit()
-                                    raise timeout_error  # Trigger matplotlib fallback
-                                
-                                img_buffer = BytesIO(screenshot)
-                                print(f"✅ Screenshot captured with selenium")
+                                if driver:
+                                    driver.set_page_load_timeout(15)
+                                    
+                                    try:
+                                        # Use file:// URL with proper path formatting
+                                        file_url = f'file:///{html_file.replace(os.sep, "/")}' if platform.system() == 'Windows' else f'file://{html_file}'
+                                        print(f"📄 Loading map from: {file_url}")
+                                        driver.get(file_url)
+                                        time.sleep(3)  # Wait for tiles to load
+                                        screenshot = driver.get_screenshot_as_png()
+                                        driver.quit()
+                                        print(f"✅ Screenshot captured with selenium")
+                                    except Exception as timeout_error:
+                                        driver.quit()
+                                        raise timeout_error  # Trigger matplotlib fallback
+                                    
+                                    img_buffer = BytesIO(screenshot)
+                                else:
+                                    raise Exception("Failed to initialize Chrome driver")
                                 
                             except Exception as selenium_error:
                                 print(f"❌ Error taking screenshot with selenium: {selenium_error}")

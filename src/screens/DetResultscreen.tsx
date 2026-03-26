@@ -148,14 +148,14 @@ const DetectionResults = () => {
           if (detection[10]) { // has_srt_data field
             // Use unique-weeds-heatmap endpoint for videos with GPS data
             // SAME parameters as Mapscreen for consistency
-            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=2.0&iou_threshold=0.5&frame_gap=20`);
+            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=2.0&iou_threshold=0.58&frame_gap=13`);
             if (res3.ok) {
               const uniqueData = await res3.json();
               setUniqueWeedCount(uniqueData.unique_weed_count);
               setUniqueWeedData(uniqueData);
             } else {
               // Fallback to basic unique weeds calculation without GPS
-              const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.5&frame_gap=20`);
+              const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.58&frame_gap=13`);
               if (res4.ok) {
                 const uniqueData = await res4.json();
                 setUniqueWeedCount(uniqueData.unique_weed_count);
@@ -165,7 +165,7 @@ const DetectionResults = () => {
           } else {
             // For videos without SRT data, use the basic unique-weeds endpoint
             console.log(`🔍 Fetching unique weeds for video without SRT: ${detId}`);
-            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.5&frame_gap=20`);
+            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.58&frame_gap=13`);
             console.log(`🔍 Unique weeds response status: ${res3.status}`);
             if (res3.ok) {
               const uniqueData = await res3.json();

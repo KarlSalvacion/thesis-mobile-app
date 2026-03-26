@@ -8,7 +8,7 @@
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "splash": {
-      "image": "./src/assets/splash-icon.png",
+      "image": "./src/assets/seedling.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
@@ -20,7 +20,7 @@
         "foregroundImage": "./src/assets/seedling.png",
         "backgroundColor": "#ffffff"
       },
-      "package": "com.karlsalvacion.thesismobileapp.preview",
+      "package": "com.karlsalvacion.thesismobileapp.development", 
       "versionCode": 2,
       "edgeToEdgeEnabled": true,
       "usesCleartextTraffic": true,
