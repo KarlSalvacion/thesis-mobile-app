@@ -16,7 +16,7 @@ from db.database import (
 from inference.engine import _annotate_image_file, detect_file_type, run_inference_auto
 from utils.cloudinary_utils import upload_image_bytes, upload_remote_url, upload_video_streaming
 from utils.srt_parser import parse_srt_file, validate_srt_file
-from utils.video_utils import transcode_video_to_preview
+from backend.utils.video.video_utils import transcode_video_to_preview
 
 
 def cleanup_temp_files():
@@ -231,7 +231,7 @@ def process_media_background(
                     orig_video_fps = DEFAULT_VIDEO_FPS if DEFAULT_VIDEO_FPS else 30.0
 
                 try:
-                    from utils.video_probe import get_video_duration
+                    from backend.utils.video.video_probe import get_video_duration
 
                     duration_s = get_video_duration(media_path)
                     detection_frames_count = 0
