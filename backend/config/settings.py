@@ -1,19 +1,17 @@
-# Roboflow & Cloudinary configuration (no environment variables needed)
-"""
-Fill in your own Roboflow and Cloudinary credentials below.
-"""
-
 import os
+from dotenv import load_dotenv
+
+load_dotenv()  
 
 # Detect deployment environment
 IS_RENDER = os.getenv('RENDER') is not None
 IS_LOCAL = not IS_RENDER
 
 # Your Roboflow API key
-ROBOFLOW_API_KEY = "ijyg4acaU8ukH7A5E8dy"
+ROBOFLOW_API_KEY = os.getenv('ROBOFLOW_API_KEY')
 
 # Your Roboflow project name
-ROBOFLOW_PROJECT = "model8-6-yolov11-acc-8y3xc"
+ROBOFLOW_PROJECT = os.getenv('ROBOFLOW_PROJECT') 
 
 # Optional: specify workspace explicitly if API key has multiple workspaces
 # Leave blank to use default workspace associated with the API key
@@ -123,9 +121,9 @@ FFMPEG_BINARY = "ffmpeg"  # e.g. "C:/ffmpeg/bin/ffmpeg.exe" or None
 # Cloudinary configuration
 CLOUDINARY_URL = ""  # Optional: e.g. cloudinary://<api_key>:<api_secret>@<cloud_name>
 # Or specify discrete credentials if CLOUDINARY_URL is blank
-CLOUDINARY_CLOUD_NAME = "ddfetmwps"
-CLOUDINARY_API_KEY = "295875744174271"
-CLOUDINARY_API_SECRET = "0pAdUNbFFiWxL1kN6sQcYg4K3iA"
+CLOUDINARY_CLOUD_NAME = os.getenv('CLOUDINARY_CLOUD_NAME')
+CLOUDINARY_API_KEY = os.getenv('CLOUDINARY_API_KEY')
+CLOUDINARY_API_SECRET = os.getenv('CLOUDINARY_API_SECRET')
 
 # ============================================================================
 # Video Compression Configuration
@@ -170,11 +168,7 @@ COMPRESSION_AGGRESSIVE_MODE = True  # More aggressive compression
 # Database connection settings
 # For local development, use: postgresql://username:password@localhost:5432/database_name
 # For Render.com, use the Internal Database URL from your PostgreSQL dashboard
-DATABASE_URL = os.getenv(
-    'DATABASE_URL',
-    'postgresql://weed_detection_db_1pox_user:n7vD5vcEai4mnscF93XlrJLPapLkiley@dpg-d5mbi314tr6s73ch9990-a.singapore-postgres.render.com/weed_detection_db_1pox'
-    #'postgresql://postgres:lucido%4025@localhost:5432/weed_detection'
-)
+DATABASE_URL = os.getenv('DATABASE_URL')  # e.g., 'postgresql://user:password@host:port/dbname'
 #postgresql://weed_detection_db_user:WgBIIb6U1adbqvKuSwnKnlAWox7PTrQx@dpg-d43pkhodl3ps73a675hg-a/weed_detection_db
 #postgresql://postgres:lucido%4025@localhost:5432/weed_detection
 # Connection pool settings

@@ -2,7 +2,7 @@ import os
 from typing import Optional, Dict, Any
 import cloudinary
 import cloudinary.uploader
-from ..config.settings import (
+from config.settings import (
     CLOUDINARY_URL,
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,

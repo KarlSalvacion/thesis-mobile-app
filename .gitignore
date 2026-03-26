@@ -45,6 +45,7 @@ yarn-error.*
 
 # local env files
 .env*.local
+.env
 
 
 # typescript
@@ -52,3 +53,4 @@ yarn-error.*
 
 # Uploads folder (contains user-uploaded videos/images)
 uploads/
+

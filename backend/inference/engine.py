@@ -6,7 +6,7 @@ import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 # Import config early and expose API key to environment before importing inference SDK
-from ..config.settings import (
+from config.settings import (
     ROBOFLOW_API_KEY,
     ROBOFLOW_PROJECT,
     ROBOFLOW_VERSION,
@@ -25,7 +25,7 @@ from ..config.settings import (
     SMART_SKIP_WINDOW,
 )
 try:
-    from ..config.settings import (
+    from config.settings import (
         ENABLE_OBJECT_TRACKING,
         TRACKING_CONFIDENCE_DECAY,
         ENABLE_TEMPORAL_FILTER,
@@ -53,20 +53,21 @@ except ImportError:
     MOTION_MIN_CHANGED_PIXELS = 1500
 
 try:
-    from ..config.settings import VIDEO_ANNOTATION_MODE
+    from config.settings import VIDEO_ANNOTATION_MODE
 except ImportError:
     VIDEO_ANNOTATION_MODE = 'fast'  # Default to fast mode
 
 try:
-    from ..config.settings import DETECTION_PERSISTENCE_FRAMES, DETECTION_PERSISTENCE_MULTIPLIER
+    from config.settings import DETECTION_PERSISTENCE_FRAMES, DETECTION_PERSISTENCE_MULTIPLIER
 except ImportError:
     DETECTION_PERSISTENCE_FRAMES = None  # Auto-calculate
     DETECTION_PERSISTENCE_MULTIPLIER = 1.0
 
-from ..config.settings import FFMPEG_BINARY
-from ..utils.video_utils import get_video_fps, get_video_duration, get_video_frame_count
-from ..utils.video_utils import extract_frames_cv2, stitch_video_cv2, MotionDetectionSkipper
-from ..utils.video_utils import ObjectTracker, TemporalConsistencyFilter, BackgroundSubtractor
+from config.settings import FFMPEG_BINARY
+from utils.video_probe import get_video_fps, get_video_duration, get_video_frame_count
+from utils.video_utils import extract_frames_cv2, stitch_video_cv2
+from utils.video_tracking import MotionDetectionSkipper
+from utils.video_tracking import ObjectTracker, TemporalConsistencyFilter, BackgroundSubtractor
 
 # Ensure the RF API key is in environment for any downstream SDKs
 if ROBOFLOW_API_KEY and not os.environ.get('ROBOFLOW_API_KEY'):

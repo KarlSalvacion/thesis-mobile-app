@@ -1,11 +1,3 @@
-"""Memory monitoring utility for video processing.
-
-Usage:
-    python -m backend.monitor_memory
-
-This will show real-time memory usage during video processing.
-"""
-
 import psutil
 import time
 import os

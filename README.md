@@ -49,6 +49,7 @@ npm start
 **Windows** (Recommended):
 ```bash
 # Run setup script (first time only)
+
 setup-backend.bat
 
 # Start backend server
@@ -69,7 +70,8 @@ source .venv/bin/activate      # Linux/Mac
 pip install -r backend/requirements.txt
 
 # Run server
-python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+cd backend
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 See [BACKEND_SETUP.md](BACKEND_SETUP.md) for detailed backend instructions.

@@ -5,7 +5,17 @@ import json
 import os
 from datetime import datetime
 from contextlib import contextmanager
-from ..config.settings import DATABASE_URL, DB_POOL_MIN_CONN, DB_POOL_MAX_CONN
+from config.settings import DATABASE_URL, DB_POOL_MIN_CONN, DB_POOL_MAX_CONN
+from .weed_tracking import calculate_unique_weeds_impl
+from .job_queue import (
+    create_processing_job_impl,
+    update_job_status_impl,
+    update_job_result_impl,
+    get_job_status_impl,
+    mark_compression_completed_impl,
+    get_pending_compression_jobs_impl,
+    cleanup_old_jobs_impl,
+)
 
 # PostgreSQL connection pool
 connection_pool = None
@@ -556,257 +566,52 @@ def calculate_unique_weeds(detection_id, iou_threshold=0.58, frame_gap=13):
     Returns:
         dict with unique_count, total_detections, tracks, and breakdown by class
     """
-    with get_db_connection() as conn:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("""
-            SELECT id, frame_number, weed_class, confidence,
-                   bbox_x, bbox_y, bbox_width, bbox_height,
-                   latitude, longitude
-            FROM detection_details
-            WHERE detection_id = %s
-            ORDER BY frame_number, id
-        """, (detection_id,))
-        
-        rows = cursor.fetchall()
-    
-    if not rows:
-        return {'unique_count': 0, 'total_detections': 0, 'tracks': [], 'by_class': {}, 'reduction_percentage': 0}
-
-    # Helper: IoU
-    def calculate_iou(box1, box2):
-        x1, y1, w1, h1 = box1
-        x2, y2, w2, h2 = box2
-        x_left = max(x1, x2)
-        y_top = max(y1, y2)
-        x_right = min(x1 + w1, x2 + w2)
-        y_bottom = min(y1 + h1, y2 + h2)
-        if x_right <= x_left or y_bottom <= y_top:
-            return 0.0
-        inter = (x_right - x_left) * (y_bottom - y_top)
-        union = w1 * h1 + w2 * h2 - inter
-        return inter / union if union > 0 else 0.0
-
-    # Helper: GPS haversine distance (meters)
-    def calculate_gps_distance(lat1, lon1, lat2, lon2):
-        if None in (lat1, lon1, lat2, lon2):
-            return None
-        from math import radians, sin, cos, asin, sqrt
-        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-        c = 2 * asin(sqrt(a))
-        return 6371000 * c
-
-    # Build detection list
-    detections = []
-    for r in rows:
-        detections.append({
-            'id': r['id'],
-            'frame': r['frame_number'],
-            'class': r['weed_class'],
-            'confidence': r['confidence'],
-            'bbox': (r['bbox_x'], r['bbox_y'], r['bbox_width'], r['bbox_height']),
-            'lat': r['latitude'],
-            'lon': r['longitude']
-        })
-
-    # Online tracker: tracks is a list of dicts with last seen bbox/frame and history
-    tracks = []
-    GPS_MATCH_THRESHOLD_M = 0.42  # Calibrated 0.42m - precise middle ground
-    MIN_MATCH_SCORE = 0.47  # Calibrated threshold - carefully balanced
-    
-    has_gps = any(det['lat'] is not None for det in detections)
-    print(f"🔍 [UNIQUE WEEDS] Processing {len(detections)} detections, GPS available: {has_gps}")
-    print(f"🔍 [UNIQUE WEEDS] Using iou_threshold={iou_threshold}, frame_gap={frame_gap}")
-    
-    # For non-GPS videos, adjust parameters moderately
-    if not has_gps:
-        # Lower IoU threshold - accept weaker bbox matches
-        iou_threshold = max(0.3, iou_threshold - 0.2)  # Reduce by 0.2 (0.5 -> 0.3)
-        # Increase frame gap moderately
-        frame_gap = int(frame_gap * 1.8)  # 1.8x the frame gap (15 -> 27 frames)
-        MIN_MATCH_SCORE = 0.3  # Lower minimum score threshold
-        print(f"🔧 [UNIQUE WEEDS] Adjusted for non-GPS: iou_threshold={iou_threshold}, frame_gap={frame_gap}, min_score={MIN_MATCH_SCORE}")
-
-    for det in detections:
-        matched_track = None
-        best_score = 0.0
-
-        # Try to match to existing tracks of same class
-        for tr in tracks:
-            if tr['class'] != det['class']:
-                continue
-
-            # Enforce temporal gap
-            if det['frame'] - tr['last_frame'] > frame_gap:
-                continue
-
-            # Compute IoU between current detection and track's last bbox
-            iou = calculate_iou(det['bbox'], tr['last_bbox'])
-            
-            # For non-GPS videos, also compute pixel distance between bbox centers
-            pixel_dist = None
-            if not has_gps:
-                # Calculate center-to-center distance in pixels
-                det_center_x = det['bbox'][0] + det['bbox'][2] / 2
-                det_center_y = det['bbox'][1] + det['bbox'][3] / 2
-                tr_center_x = tr['last_bbox'][0] + tr['last_bbox'][2] / 2
-                tr_center_y = tr['last_bbox'][1] + tr['last_bbox'][3] / 2
-                pixel_dist = ((det_center_x - tr_center_x)**2 + (det_center_y - tr_center_y)**2)**0.5
-
-            # Compute GPS distance if available
-            gps_dist = None
-            if det['lat'] is not None and tr.get('last_lat') is not None:
-                gps_dist = calculate_gps_distance(det['lat'], det['lon'], tr['last_lat'], tr['last_lon'])
-
-            # Matching criteria: Precisely calibrated for ~40-60 unique weeds
-            score = 0.0
-            if iou >= iou_threshold:
-                # IoU meets threshold
-                if gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M:
-                    # Both IoU and GPS agree - strong match
-                    score = iou * 1.7
-                elif gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M * 2.1:
-                    # GPS within 2.1x threshold - moderate match
-                    score = iou * 1.25
-                elif gps_dist is not None and gps_dist > GPS_MATCH_THRESHOLD_M * 2.6:
-                    # GPS too far - light penalty
-                    score = iou * 0.3
-                else:
-                    # Moderate GPS distance or no GPS
-                    if iou >= 0.75:
-                        score = iou * 1.5
-                    elif iou >= 0.65:
-                        score = iou * 1.3
-                    else:
-                        score = iou * 1.15
-            elif gps_dist is not None and gps_dist <= GPS_MATCH_THRESHOLD_M * 0.55:
-                # Very close GPS but IoU below threshold
-                score = 0.42
-            elif pixel_dist is not None and iou >= iou_threshold * 0.7:
-                # No GPS, IoU close to threshold - use pixel proximity
-                avg_bbox_size = (det['bbox'][2] + det['bbox'][3]) / 2
-                if pixel_dist < avg_bbox_size * 2.3:
-                    score = 0.52 / (1.0 + pixel_dist / avg_bbox_size)
-                else:
-                    score = 0.0
-
-            # Prefer tracks with higher score and above minimum threshold
-            if score > best_score and score >= MIN_MATCH_SCORE:
-                best_score = score
-                matched_track = tr
-
-        if matched_track is not None:
-            # Append detection to matched track, update last seen info
-            matched_track['detections'].append(det)
-            matched_track['detection_ids'].append(det['id'])
-            matched_track['last_frame'] = det['frame']
-            matched_track['last_bbox'] = det['bbox']
-            if det['lat'] is not None:
-                matched_track['last_lat'] = det['lat']
-                matched_track['last_lon'] = det['lon']
-            matched_track['count'] += 1
-            matched_track['avg_confidence'] = (matched_track['avg_confidence'] * (matched_track['count'] - 1) + det['confidence']) / matched_track['count']
-        else:
-            # Start a new track
-            new_tr = {
-                'class': det['class'],
-                'detections': [det],
-                'detection_ids': [det['id']],
-                'first_frame': det['frame'],
-                'last_frame': det['frame'],
-                'last_bbox': det['bbox'],
-                'last_lat': det['lat'],
-                'last_lon': det['lon'],
-                'count': 1,
-                'avg_confidence': det['confidence']
-            }
-            tracks.append(new_tr)
-
-    # Summarize
-    unique_count = len(tracks)
-    by_class = {}
-    for tr in tracks:
-        by_class[tr['class']] = by_class.get(tr['class'], 0) + 1
-
-    reduction = round((1 - unique_count / len(detections)) * 100, 1) if len(detections) > 0 else 0
-
-    return {
-        'unique_count': unique_count,
-        'total_detections': len(detections),
-        'tracks': tracks,
-        'by_class': by_class,
-        'reduction_percentage': reduction
-    }
+    return calculate_unique_weeds_impl(
+        get_db_connection,
+        RealDictCursor,
+        detection_id,
+        iou_threshold=iou_threshold,
+        frame_gap=frame_gap,
+    )
 
 # Job queue management functions (matching SQLite interface)
 def create_processing_job(job_id, original_filename, is_video=False, is_image=False, has_srt=False):
     '''Create a new processing job in the database.'''
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO processing_jobs 
-            (job_id, status, progress, original_filename, is_video, is_image, has_srt)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ''', (job_id, 'queued', 'Uploaded, starting processing...', original_filename, is_video, is_image, has_srt))
-        conn.commit()
+    return create_processing_job_impl(
+        get_db_connection,
+        job_id,
+        original_filename,
+        is_video=is_video,
+        is_image=is_image,
+        has_srt=has_srt,
+    )
 
 def update_job_status(job_id, status, progress=None, error_message=None):
     '''Update job status and progress.'''
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        
-        updates = ['status = %s', 'updated_at = CURRENT_TIMESTAMP']
-        values = [status]
-        
-        if progress is not None:
-            updates.append('progress = %s')
-            values.append(progress)
-        
-        if error_message is not None:
-            updates.append('error_message = %s')
-            values.append(error_message)
-        
-        if status in ['completed', 'failed']:
-            updates.append('completed_at = CURRENT_TIMESTAMP')
-        
-        values.append(job_id)
-        
-        query = f"UPDATE processing_jobs SET {', '.join(updates)} WHERE job_id = %s"
-        cursor.execute(query, values)
-        conn.commit()
+    return update_job_status_impl(
+        get_db_connection,
+        job_id,
+        status,
+        progress=progress,
+        error_message=error_message,
+    )
 
 def update_job_result(job_id, detection_id, result_json, annotated_url=None, temp_video_path=None, needs_compression=False):
     '''Update job with result data.'''
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE processing_jobs 
-            SET detection_id = %s,
-                status = %s,
-                progress = %s,
-                result_json = %s,
-                temp_video_path = %s,
-                needs_client_compression = %s,
-                updated_at = CURRENT_TIMESTAMP,
-                completed_at = CURRENT_TIMESTAMP
-            WHERE job_id = %s
-        ''', (detection_id, 'completed', 'Processing complete', result_json, temp_video_path, needs_compression, job_id))
-        
-        # Update detection with annotated URL
-        if annotated_url:
-            update_detection(detection_id, cloud_annotated_url=annotated_url)
-        
-        conn.commit()
+    return update_job_result_impl(
+        get_db_connection,
+        update_detection,
+        job_id,
+        detection_id,
+        result_json,
+        annotated_url=annotated_url,
+        temp_video_path=temp_video_path,
+        needs_compression=needs_compression,
+    )
 
 def get_job_status(job_id):
     '''Get job status by job_id.'''
-    with get_db_connection() as conn:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM processing_jobs WHERE job_id = %s", (job_id,))
-        result = cursor.fetchone()
-        return dict(result) if result else None
+    return get_job_status_impl(get_db_connection, RealDictCursor, job_id)
 
 def mark_compression_started(job_id):
     '''Mark compression as started.'''
@@ -814,41 +619,15 @@ def mark_compression_started(job_id):
 
 def mark_compression_completed(job_id, annotated_url):
     '''Mark compression as completed.'''
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE processing_jobs 
-            SET status = %s, 
-                progress = %s,
-                updated_at = CURRENT_TIMESTAMP,
-                completed_at = CURRENT_TIMESTAMP
-            WHERE job_id = %s
-        ''', ('completed', 'Compression complete', job_id))
-        conn.commit()
+    return mark_compression_completed_impl(get_db_connection, job_id)
 
 def get_pending_compression_jobs():
     '''Get jobs that need compression.'''
-    with get_db_connection() as conn:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute('''
-            SELECT * FROM processing_jobs 
-            WHERE status IN ('pending', 'processing', 'queued') 
-            ORDER BY created_at ASC
-        ''')
-        return [dict(row) for row in cursor.fetchall()]
+    return get_pending_compression_jobs_impl(get_db_connection, RealDictCursor)
 
 def cleanup_old_jobs(days=7):
     '''Delete old completed jobs.'''
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            DELETE FROM processing_jobs 
-            WHERE status IN ('completed', 'failed') 
-            AND created_at < (CURRENT_TIMESTAMP - INTERVAL '%s days')
-        ''', (days,))
-        deleted = cursor.rowcount
-        conn.commit()
-        return deleted
+    return cleanup_old_jobs_impl(get_db_connection, days=days)
 
 # Initialize connection pool on module import
 init_connection_pool()

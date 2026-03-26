@@ -1,17 +1,9 @@
-"""Video utilities.
-
-This project does not require ffmpeg. The transcode function is intentionally a
-no-op: uploads will send the original file to Cloudinary. Keeping this helper
-prevents import errors for code that referenced it while avoiding external
-ffmpeg dependencies.
-"""
-
 import os
 from typing import Optional, List
 import tempfile
 import subprocess
 import shlex
-from ..config.settings import FFMPEG_BINARY, ANNOTATED_VIDEO_HEIGHT, ANNOTATED_VIDEO_BITRATE, MAX_CLOUDINARY_UPLOAD_SIZE
+from config.settings import FFMPEG_BINARY, ANNOTATED_VIDEO_HEIGHT, ANNOTATED_VIDEO_BITRATE, MAX_CLOUDINARY_UPLOAD_SIZE
 
 
 def transcode_video_to_preview(input_path: str, target_height: Optional[int] = None, target_bitrate: Optional[str] = None) -> str:
