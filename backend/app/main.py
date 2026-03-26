@@ -9,17 +9,17 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import json
 from psycopg2.extras import RealDictCursor
-from .inference import run_inference_auto, detect_file_type, _annotate_image_file
+from ..inference.engine import run_inference_auto, detect_file_type, _annotate_image_file
 import tempfile
 import traceback
-from .cloudinary_utils import upload_image_bytes, upload_video_streaming, build_delivery_url, upload_remote_url
-from .video_utils import transcode_video_to_preview
+from ..utils.cloudinary_utils import upload_image_bytes, upload_video_streaming, build_delivery_url, upload_remote_url
+from ..utils.video_utils import transcode_video_to_preview
 from io import BytesIO
 try:
     from PIL import Image
 except Exception:
     Image = None
-from .database import (
+from ..db.database import (
     insert_detection, insert_detection_details,
     fetch_detection_session, fetch_all_detections, get_detection_statistics,
     upsert_srt_track, reset_compact_tables, update_srt_status, init_db,
@@ -29,7 +29,7 @@ from .database import (
     get_job_status, mark_compression_started, mark_compression_completed,
     get_pending_compression_jobs, cleanup_old_jobs, get_db_connection, close_connection_pool
 )
-from .srt_parser import parse_srt_file, validate_srt_file
+from ..utils.srt_parser import parse_srt_file, validate_srt_file
 
 # Helper function to convert dict rows to tuple arrays for frontend compatibility
 def dict_to_detection_tuple(row: dict) -> list:
@@ -89,7 +89,7 @@ init_db()
 processing_jobs: Dict[str, Dict[str, Any]] = {}
 
 # Render.com Standard Plan: Job queue management
-from .config import MAX_CONCURRENT_JOBS
+from ..config.settings import MAX_CONCURRENT_JOBS
 active_jobs = 0
 job_queue = []
 
@@ -97,7 +97,7 @@ def cleanup_temp_files():
     """Clean up temporary files to prevent disk space issues on Render.com"""
     import glob
     import os
-    from .config import MEMORY_CLEANUP_INTERVAL
+    from ..config.settings import MEMORY_CLEANUP_INTERVAL
     
     temp_patterns = [
         '/tmp/rf_robo_*',
@@ -187,7 +187,7 @@ def process_media_background(
                 used_compressed = False
                 try:
                     size = os.path.getsize(media_path)
-                    from .config import MAX_CLOUDINARY_UPLOAD_SIZE
+                    from ..config.settings import MAX_CLOUDINARY_UPLOAD_SIZE
                     
                     if size > MAX_CLOUDINARY_UPLOAD_SIZE:
                         print(f"[Job {job_id}] File too large ({size / (1024*1024):.2f} MB), compressing with FFmpeg...")
@@ -311,13 +311,13 @@ def process_media_background(
                     orig_video_fps = None
 
                 # Fallback to config FPS if original FPS not available
-                from .config import DEFAULT_VIDEO_FPS
+                from ..config.settings import DEFAULT_VIDEO_FPS
                 if orig_video_fps is None:
                     orig_video_fps = DEFAULT_VIDEO_FPS if DEFAULT_VIDEO_FPS else 30.0
 
                 # Prefer to compute detection_rate from returned detections and video duration
                 try:
-                    from .video_utils import get_video_duration
+                    from ..utils.video_utils import get_video_duration
                     duration_s = get_video_duration(media_path)
                     # Count detection frames returned (for video results each item is a list)
                     detection_frames_count = 0
@@ -364,7 +364,7 @@ def process_media_background(
                     })
             
             if batch_details:
-                from backend.database import batch_insert_detection_details
+                from backend.db.database import batch_insert_detection_details
                 batch_insert_detection_details(detection_id, batch_details)
 
         # Process SRT file if provided
@@ -641,7 +641,7 @@ async def upload_compressed_video(
             f.write(video_bytes)
         
         # Upload to Cloudinary
-        from .cloudinary_utils import upload_video_streaming
+        from ..utils.cloudinary_utils import upload_video_streaming
         
         # Parse result to get detection_id and filename
         detection_id = job_data.get("detection_id")
@@ -804,7 +804,7 @@ async def upload_file(
     print(f"Processing file: {file.filename} ({file_size_mb:.1f} MB)")
     
     # Render.com Standard Plan: Enforce file size limits
-    from .config import MAX_UPLOAD_SIZE_MB
+    from ..config.settings import MAX_UPLOAD_SIZE_MB
     if file_size_mb > MAX_UPLOAD_SIZE_MB:
         raise HTTPException(
             status_code=413, 
@@ -1400,7 +1400,7 @@ async def get_unique_weeds_heatmap(
                 }
             
             # Calculate unique weeds without GPS mapping
-            from .database import calculate_unique_weeds
+            from ..db.database import calculate_unique_weeds
             unique_weeds = calculate_unique_weeds(detection_id, iou_threshold, frame_gap)
             
             return {

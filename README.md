@@ -69,7 +69,7 @@ source .venv/bin/activate      # Linux/Mac
 pip install -r backend/requirements.txt
 
 # Run server
-python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 See [BACKEND_SETUP.md](BACKEND_SETUP.md) for detailed backend instructions.
@@ -129,10 +129,10 @@ npm run ios        # Run on iOS
 ### Backend
 ```bash
 # With auto-reload
-python -m uvicorn backend.main:app --reload
+python -m uvicorn backend.app.main:app --reload
 
 # Production mode
-python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## 📦 Dependencies

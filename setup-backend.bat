@@ -36,6 +36,6 @@ echo To start the backend server, run:
 echo   run-backend.bat
 echo.
 echo Or manually:
-echo   python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+echo   python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 echo.
 pause

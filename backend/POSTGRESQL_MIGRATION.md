@@ -78,7 +78,7 @@ This will install `psycopg2-binary` (PostgreSQL adapter) along with other depend
 ```bash
 # From project root
 cd backend
-uvicorn backend.main:app --reload
+uvicorn backend.app.main:app --reload
 ```
 
 The application will automatically:

@@ -44,14 +44,23 @@ Video/Image Upload → Weed Detection → Store Results → Upload SRT → Link 
 
 ```
 backend/
-├── main.py                 # FastAPI application with endpoints
-├── database.py            # Database operations and schema
-├── inference.py           # AI model integration (Roboflow)
-├── srt_parser.py          # SRT subtitle file parser
-├── test_enhanced_system.py # System testing script
+├── app/
+│   └── main.py            # FastAPI application entrypoint
+├── config/
+│   └── settings.py        # Environment and runtime settings
+├── db/
+│   ├── database.py        # PostgreSQL database operations and schema
+│   └── database_sqlite_backup.py
+├── inference/
+│   └── engine.py          # AI model integration (Roboflow)
+├── utils/
+│   ├── cloudinary_utils.py
+│   ├── srt_parser.py
+│   ├── video_utils.py
+│   └── monitor_memory.py
+├── main.py                # Compatibility entrypoint (imports app.main)
 ├── requirements.txt       # Python dependencies
-├── weed_detection.db      # SQLite database
-└── uploads/               # File storage directory
+└── uploads/               # Optional local file storage directory
 ```
 
 ## 🛠️ Installation & Setup
@@ -75,16 +84,16 @@ backend/
    ```
 
 3. **Set up your Roboflow API key:**
-   Edit `inference.py` and replace the API key with your own.
+   Edit `config/settings.py` and replace the API key with your own.
 
 4. **Initialize the database:**
    ```bash
-   python database.py
+   python -m backend.db.database
    ```
 
 5. **Run the system:**
    ```bash
-   python main.py
+   python -m uvicorn backend.app.main:app --reload
    ```
 
 The API will be available at `http://localhost:8000`

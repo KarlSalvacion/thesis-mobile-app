@@ -23,7 +23,6 @@
       "package": "com.karlsalvacion.thesismobileapp.development", 
       "versionCode": 2,
       "edgeToEdgeEnabled": true,
-      "usesCleartextTraffic": true,
       "config": {
         "googleMaps": {
           "apiKey": "AIzaSyBNOC7IRLAho_XveXf8VjNliy1_Gca8oHU"

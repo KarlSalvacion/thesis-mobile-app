@@ -97,14 +97,14 @@ export function parseSrtString(input: string): SrtParseResult {
 
 export async function readSrtFileToString(uri: string): Promise<string> {
   // Dynamically import to avoid bundling if unused
-  const FileSystem = await import('expo-file-system')
+  const FileSystem = await import('expo-file-system/legacy')
   const { exists, uri: normalized } = await ensureFileExists(uri)
   if (!exists) throw new Error('File does not exist: ' + uri)
   return await FileSystem.readAsStringAsync(normalized, { encoding: FileSystem.EncodingType.UTF8 })
 }
 
 async function ensureFileExists(uri: string): Promise<{ exists: boolean; uri: string }> {
-  const FileSystem = await import('expo-file-system')
+  const FileSystem = await import('expo-file-system/legacy')
   const info = await FileSystem.getInfoAsync(uri)
   return { exists: !!info.exists, uri }
 }

@@ -3,7 +3,7 @@ import { View, Text, Pressable, ActivityIndicator, ScrollView, RefreshControl, A
 import { SafeAreaView } from 'react-native-safe-area-context'
 import * as DocumentPicker from 'expo-document-picker'
 import * as ImagePicker from 'expo-image-picker'
-import * as FileSystem from 'expo-file-system'
+import * as FileSystem from 'expo-file-system/legacy'
 import { Ionicons, FontAwesome6 } from '@expo/vector-icons'
 import { Video, Image as CompressorImage } from 'react-native-compressor'
 import { useSession } from '../context/SessionContext'
