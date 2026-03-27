@@ -3,7 +3,7 @@ import shutil
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from config.settings import (
+from backend.config.settings import (
     DEFAULT_CONFIDENCE,
     DEFAULT_OVERLAP,
     DEFAULT_VIDEO_FPS,
@@ -14,15 +14,15 @@ from config.settings import (
     VIDEO_ANNOTATION_MODE,
     USE_ORIGINAL_FPS,
 )
-from inference.annotation import HAS_PIL, _annotate_image_file, _create_annotated_video_fast
-from inference.helpers import (
+from backend.app.inference.annotation import HAS_PIL, _annotate_image_file, _create_annotated_video_fast
+from backend.app.inference.helpers import (
     _extract_annotated_from_response,
     _normalize_prediction,
     _parse_roboflow_video_response,
     detect_file_type,
 )
-from inference.image_runner import run_inference
-from inference.runtime import model
+from backend.app.inference.image_runner import run_inference
+from backend.app.inference.runtime import model
 from backend.utils.video.video_probe import get_video_duration, get_video_fps, get_video_frame_count
 from backend.utils.video.video_utils import extract_frames_cv2, stitch_video_cv2
 

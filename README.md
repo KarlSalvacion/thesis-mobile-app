@@ -69,9 +69,19 @@ source .venv/bin/activate      # Linux/Mac
 # Install dependencies
 pip install -r backend/requirements.txt
 
+# Create database 
+
+create your database  
+add your details to the url
+Sample URL: postgresql://user:password@host:5432/dbname
+
+add it to the .env file use .env.example as a guide for needed values.
+
+run init_database.py to create the tables.
+python -m backend.db.init_database 
+
 # Run server
-cd backend
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 See [BACKEND_SETUP.md](BACKEND_SETUP.md) for detailed backend instructions.
@@ -79,7 +89,7 @@ See [BACKEND_SETUP.md](BACKEND_SETUP.md) for detailed backend instructions.
 ### 3. Run Mobile App
 
 1. Make sure backend is running on `http://localhost:8000`
-2. Start Expo: `npm start`
+2. Start Expo: `npm start` or `npx expo start --tunnel` 
 3. Scan QR code with Expo Go app
 4. Update backend URL in `src/config.ts` if needed
 

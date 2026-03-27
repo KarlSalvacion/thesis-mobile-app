@@ -32,14 +32,8 @@ COMPRESS_FRAMES_BEFORE_INFERENCE = True  # Reduce image size before sending (fas
 INFERENCE_IMAGE_SIZE = 640  # Resize to this width/height before inference (640 is optimal for YOLO)
 
 # Compression strategy (environment-aware)
-# Using FFmpeg for video compression
 ENABLE_PRECOMPRESSION = True  # Enable FFmpeg compression for large files
 MAX_VIDEO_SIZE_WITHOUT_COMPRESSION_MB = 100  # Files >100 MB will be compressed with FFmpeg
-
-# Frame interval for video detection (process every Nth frame for speed)
-# 1 = detect on every frame, 2 = detect every 2nd frame, 3 = every 3rd frame, etc.
-# Higher values = faster processing but may skip objects that stay in frame
-# NOTE: The output video will still contain ALL frames at original FPS
 FRAME_INTERVAL = 1  # Process every frame for maximum accuracy (no skipping)
 
 # Smart frame skipping: Skip frames only if no recent detections
@@ -48,14 +42,9 @@ ENABLE_SMART_SKIP = True  # Enable adaptive frame skipping
 SMART_SKIP_WINDOW = 15  # If detection found, process next N frames fully
 
 # Video annotation optimization mode
-# 'fast' = Only process frames at detection FPS, use FFmpeg drawtext overlay (10-20x faster)
-# 'quality' = Extract all frames, annotate individually, stitch back (slower, higher quality)
-VIDEO_ANNOTATION_MODE = 'quality'  # Use 'fast' for 10-20x faster processing (OpenCV drawing)
+VIDEO_ANNOTATION_MODE = 'quality' # Choose 'fast' or 'quality' based on your needs
 
 # Detection persistence for video annotations (how long bounding boxes stay visible)
-# For drone weed detection: Match persistence to detection interval to avoid stacking
-# Formula: original_fps / detection_fps (e.g., 30 FPS / 5 FPS = 6 frames)
-# This creates seamless coverage without overlapping boxes
 DETECTION_PERSISTENCE_FRAMES = None  # Auto-calculate based on FPS (original_fps / detection_fps)
 DETECTION_PERSISTENCE_MULTIPLIER = 1.0  # Multiply by this for overlap (1.0 = seamless, 1.5 = 50% overlap)
 
@@ -64,8 +53,6 @@ DETECTION_PERSISTENCE_MULTIPLIER = 1.0  # Multiply by this for overlap (1.0 = se
 MAX_VIDEO_FRAMES = 10000  # Support videos up to 5+ minutes at 30 FPS
 
 # Use original video FPS for annotated output (RECOMMENDED)
-# True = Output video has same FPS, length, and smoothness as original
-# False = Output video plays at detection FPS (slower, choppy playback)
 USE_ORIGINAL_FPS = True  # Keep True for full-length video with annotations
 
 # Force local frame sampling for videos (bypass Roboflow video API)
@@ -76,9 +63,6 @@ FORCE_LOCAL_VIDEO_PROCESSING = False
 # Advanced OpenCV Features (require opencv-python-headless installed)
 # ============================================================================
 
-# Object tracking - Track detected objects across frames for smoother bounding boxes
-# NOTE: Disabled for drone weed detection since weeds are static (don't move)
-# Tracking is for moving objects like people/vehicles, not needed for static weeds
 ENABLE_OBJECT_TRACKING = False  # Disabled for static weed detection
 TRACKING_CONFIDENCE_DECAY = 0.95  # How quickly confidence decays when object not detected (0.9-0.99)
 
@@ -104,18 +88,7 @@ MOTION_MIN_CHANGED_PIXELS = 1500  # Minimum pixels changed to consider as motion
 # ============================================================================
 # Video Processing Backend
 # ============================================================================
-# OpenCV is now the PRIMARY video processing engine (no FFmpeg required for detection)
-# - Frame extraction: cv2.VideoCapture (2-3x faster than FFmpeg)
-# - Video stitching: cv2.VideoWriter (2-3x faster than FFmpeg)
-# FFmpeg is only used for:
-#   - Video metadata (FPS, duration) - falls back to OpenCV if unavailable
-#   - Video compression (transcode_video_to_preview) - optional feature
-# 
-# To use this system: pip install opencv-python-headless (already in requirements.txt)
-# FFmpeg is NO LONGER REQUIRED for object detection workflows
 
-# Path to ffmpeg binary (OPTIONAL - only needed for video compression)
-# Leave as "ffmpeg" if you have it installed, or set to None to skip FFmpeg entirely
 FFMPEG_BINARY = "ffmpeg"  # e.g. "C:/ffmpeg/bin/ffmpeg.exe" or None
 
 # Cloudinary configuration
@@ -128,24 +101,13 @@ CLOUDINARY_API_SECRET = os.getenv('CLOUDINARY_API_SECRET')
 # ============================================================================
 # Video Compression Configuration
 # ============================================================================
-# Compression / Delivery preferences
-# Max width for annotated images
+
 ANNOTATED_IMAGE_MAX_WIDTH = 1280
-# JPEG quality for annotated images
 ANNOTATED_IMAGE_JPEG_QUALITY = 70
-# Target video height and bitrate for annotated previews
 ANNOTATED_VIDEO_HEIGHT = 1080  # 1080p for better quality
 ANNOTATED_VIDEO_BITRATE = "8000k"  # 8 Mbps for high quality
 
-# Path to ffmpeg binary (leave as "ffmpeg" if added to PATH)
 FFMPEG_BINARY = "ffmpeg"  # e.g. "C:/ffmpeg/bin/ffmpeg.exe"
-
-# Tip: If you don't want to modify the system PATH, set the absolute ffmpeg
-# executable path here. Example on Windows:
-#
-# FFMPEG_BINARY = r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"
-#
-# Or add ffmpeg to your PATH (recommended) and leave FFMPEG_BINARY as "ffmpeg".
 
 # Maximum upload size allowed by Cloudinary accounts (bytes). Default: 100 MB
 MAX_CLOUDINARY_UPLOAD_SIZE = 104_857_600
@@ -165,13 +127,9 @@ COMPRESSION_AGGRESSIVE_MODE = True  # More aggressive compression
 # PostgreSQL Database Configuration
 # ============================================================================
 
-# Database connection settings
-# For local development, use: postgresql://username:password@localhost:5432/database_name
-# For Render.com, use the Internal Database URL from your PostgreSQL dashboard
 DATABASE_URL = os.getenv('DATABASE_URL')  # e.g., 'postgresql://user:password@host:port/dbname'
-#postgresql://weed_detection_db_user:WgBIIb6U1adbqvKuSwnKnlAWox7PTrQx@dpg-d43pkhodl3ps73a675hg-a/weed_detection_db
-#postgresql://postgres:lucido%4025@localhost:5432/weed_detection
-# Connection pool settings
+
+
 DB_POOL_MIN_CONN = 1  # Minimum connections in pool
 DB_POOL_MAX_CONN = 10  # Maximum connections in pool
 DB_POOL_TIMEOUT = 30  # Connection timeout in seconds

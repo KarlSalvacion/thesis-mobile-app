@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 from psycopg2.extras import RealDictCursor
 
-from db.database import get_db_connection, init_db, reset_compact_tables
+from backend.db.database import get_db_connection, init_db, reset_compact_tables
 
 router = APIRouter()
 

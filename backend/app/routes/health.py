@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from db.database import get_pending_compression_jobs
+from backend.db.database import get_pending_compression_jobs
 
 router = APIRouter()
 

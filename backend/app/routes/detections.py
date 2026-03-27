@@ -5,8 +5,8 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from psycopg2.extras import RealDictCursor
 
-from app.serializers import dict_to_detection_tuple, detection_details_to_tuples, srt_track_to_tuple
-from db.database import (
+from backend.app.serializers import dict_to_detection_tuple, detection_details_to_tuples, srt_track_to_tuple
+from backend.db.database import (
     calculate_unique_weeds,
     fetch_all_detections,
     fetch_detection_session,

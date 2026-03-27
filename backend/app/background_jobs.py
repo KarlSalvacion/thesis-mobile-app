@@ -4,8 +4,8 @@ import os
 import time
 import traceback
 
-from config.settings import DEFAULT_VIDEO_FPS, MAX_CLOUDINARY_UPLOAD_SIZE, MEMORY_CLEANUP_INTERVAL
-from db.database import (
+from backend.config.settings import DEFAULT_VIDEO_FPS, MAX_CLOUDINARY_UPLOAD_SIZE, MEMORY_CLEANUP_INTERVAL
+from backend.db.database import (
     get_job_status,
     insert_detection,
     update_job_result,
@@ -13,9 +13,9 @@ from db.database import (
     update_srt_status,
     upsert_srt_track,
 )
-from inference.engine import _annotate_image_file, detect_file_type, run_inference_auto
-from utils.cloudinary_utils import upload_image_bytes, upload_remote_url, upload_video_streaming
-from utils.srt_parser import parse_srt_file, validate_srt_file
+from backend.app.inference.engine import _annotate_image_file, detect_file_type, run_inference_auto
+from backend.utils.cloudinary_utils import upload_image_bytes, upload_remote_url, upload_video_streaming
+from backend.utils.srt_parser import parse_srt_file, validate_srt_file
 from backend.utils.video.video_utils import transcode_video_to_preview
 
 

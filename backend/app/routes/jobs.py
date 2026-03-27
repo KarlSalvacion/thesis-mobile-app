@@ -5,7 +5,7 @@ import tempfile
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from db.database import (
+from backend.db.database import (
     cleanup_old_jobs,
     get_job_status,
     get_pending_compression_jobs,
@@ -14,7 +14,7 @@ from db.database import (
     mark_compression_started,
     update_job_status,
 )
-from utils.cloudinary_utils import upload_video_streaming
+from backend.utils.cloudinary_utils import upload_video_streaming
 
 router = APIRouter()
 

@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 from typing import Any, Dict, List, Optional
 
-from config.settings import (
+from backend.config.settings import (
     COMPRESS_FRAMES_BEFORE_INFERENCE,
     DETECTION_PERSISTENCE_FRAMES,
     DETECTION_PERSISTENCE_MULTIPLIER,
@@ -11,7 +11,7 @@ from config.settings import (
     FFMPEG_BINARY,
     FRAME_INTERVAL,
 )
-from inference.helpers import _get_class_color
+from backend.app.inference.helpers import _get_class_color
 
 try:
     import cv2 as _cv2

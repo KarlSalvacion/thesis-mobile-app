@@ -1,9 +1,9 @@
 from typing import Any, Dict, List, Optional, Tuple
 
-from config.settings import DEFAULT_CONFIDENCE, DEFAULT_OVERLAP, USE_LOCAL_INFERENCE
-from inference.annotation import HAS_PIL, _annotate_image_file
-from inference.helpers import _extract_annotated_from_response, _normalize_prediction
-from inference.runtime import local_model, model
+from backend.config.settings import DEFAULT_CONFIDENCE, DEFAULT_OVERLAP, USE_LOCAL_INFERENCE
+from backend.app.inference.annotation import HAS_PIL, _annotate_image_file
+from backend.app.inference.helpers import _extract_annotated_from_response, _normalize_prediction
+from backend.app.inference.runtime import local_model, model
 
 
 def run_inference(image_path: str, confidence: Optional[int] = None, overlap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], Optional[str]]:

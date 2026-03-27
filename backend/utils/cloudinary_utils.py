@@ -2,7 +2,7 @@ import os
 from typing import Optional, Dict, Any
 import cloudinary
 import cloudinary.uploader
-from config.settings import (
+from backend.config.settings import (
     CLOUDINARY_URL,
     CLOUDINARY_CLOUD_NAME,
     CLOUDINARY_API_KEY,
@@ -12,7 +12,6 @@ from config.settings import (
     ANNOTATED_VIDEO_HEIGHT,
     ANNOTATED_VIDEO_BITRATE,
 )
-
 
 def _ensure_configured() -> None:
     # Prefer discrete credentials if provided

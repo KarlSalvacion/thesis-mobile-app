@@ -1,5 +1,5 @@
-from inference.runtime import local_model, model, project, rf, ws
-from inference.helpers import (
+from backend.app.inference.runtime import local_model, model, project, rf, ws
+from backend.app.inference.helpers import (
     _extract_annotated_from_response,
     _normalize_prediction,
     _parse_roboflow_video_response,
@@ -7,14 +7,14 @@ from inference.helpers import (
     detect_file_type,
     merge_detections,
 )
-from inference.annotation import (
+from backend.app.inference.annotation import (
     SmartFrameSkipper,
     _annotate_image_file,
     _compress_frame_for_inference,
     _create_annotated_video_fast,
 )
-from inference.image_runner import run_inference
-from inference.video_runner import run_inference_auto, run_video_inference
+from backend.app.inference.image_runner import run_inference
+from backend.app.inference.video_runner import run_inference_auto, run_video_inference
 
 __all__ = [
     'rf',

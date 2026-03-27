@@ -4,14 +4,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from db.database import close_connection_pool, init_db
+from backend.db.database import close_connection_pool, init_db
 
-from app.routes.admin import router as admin_router
-from app.routes.detections import router as detections_router
-from app.routes.health import router as health_router
-from app.routes.jobs import router as jobs_router
-from app.routes.maps_reports import router as maps_reports_router
-from app.routes.uploads import router as uploads_router
+from backend.app.routes.admin import router as admin_router
+from backend.app.routes.detections import router as detections_router
+from backend.app.routes.health import router as health_router
+from backend.app.routes.jobs import router as jobs_router
+from backend.app.routes.maps_reports import router as maps_reports_router
+from backend.app.routes.uploads import router as uploads_router
 
 app = FastAPI()
 app.add_middleware(
@@ -43,6 +43,9 @@ app.include_router(maps_reports_router)
 def shutdown_event() -> None:
     close_connection_pool()
 
+@app.get("/")
+def root():
+    return {"message": "API is running!"}
 
 if __name__ == '__main__':
     import uvicorn

@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg2.extras import RealDictCursor
 
-from db.database import (
+from backend.db.database import (
     calculate_unique_weeds,
     fetch_detection_session,
     get_db_connection,

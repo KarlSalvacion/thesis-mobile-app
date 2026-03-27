@@ -2,7 +2,7 @@ import os
 import subprocess
 import tempfile
 
-from config.settings import FFMPEG_BINARY
+from backend.config.settings import FFMPEG_BINARY
 from backend.utils.video.video_probe import needs_reencoding
 
 

@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 from typing import Optional
 
-from config.settings import ANNOTATED_VIDEO_BITRATE, ANNOTATED_VIDEO_HEIGHT, FFMPEG_BINARY, MAX_CLOUDINARY_UPLOAD_SIZE
+from backend.config.settings import ANNOTATED_VIDEO_BITRATE, ANNOTATED_VIDEO_HEIGHT, FFMPEG_BINARY, MAX_CLOUDINARY_UPLOAD_SIZE
 
 
 def transcode_video_to_preview(input_path: str, target_height: Optional[int] = None, target_bitrate: Optional[str] = None) -> str:

@@ -2,7 +2,7 @@ import os
 
 from roboflow import Roboflow
 
-from config.settings import ROBOFLOW_API_KEY, ROBOFLOW_PROJECT, ROBOFLOW_VERSION, ROBOFLOW_WORKSPACE, USE_LOCAL_INFERENCE
+from backend.config.settings import ROBOFLOW_API_KEY, ROBOFLOW_PROJECT, ROBOFLOW_VERSION, ROBOFLOW_WORKSPACE, USE_LOCAL_INFERENCE
 
 # Ensure the RF API key is in environment for any downstream SDKs.
 if ROBOFLOW_API_KEY and not os.environ.get('ROBOFLOW_API_KEY'):

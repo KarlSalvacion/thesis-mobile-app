@@ -7,9 +7,9 @@ from io import BytesIO
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 
-from app.background_jobs import process_media_background
-from db.database import create_processing_job, upsert_srt_track
-from utils.srt_parser import parse_srt_file, validate_srt_file
+from backend.app.background_jobs import process_media_background
+from backend.db.database import create_processing_job, upsert_srt_track
+from backend.utils.srt_parser import parse_srt_file, validate_srt_file
 
 try:
     from PIL import Image

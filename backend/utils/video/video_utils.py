@@ -8,9 +8,9 @@ Implementation modules:
 - utils.video_tracking
 """
 
-from utils.video.transcode import transcode_video_to_preview
-from utils.video.compression import compress_for_inference
-from utils.video.opencv_io import extract_frames_cv2, stitch_video_cv2
+from backend.utils.video.transcode import transcode_video_to_preview
+from backend.utils.video.compression import compress_for_inference
+from backend.utils.video.opencv_io import extract_frames_cv2, stitch_video_cv2
 from backend.utils.video.video_probe import (
     get_video_codec,
     needs_reencoding,

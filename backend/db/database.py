@@ -5,7 +5,7 @@ import json
 import os
 from datetime import datetime
 from contextlib import contextmanager
-from config.settings import DATABASE_URL, DB_POOL_MIN_CONN, DB_POOL_MAX_CONN
+from backend.config.settings import DATABASE_URL, DB_POOL_MIN_CONN, DB_POOL_MAX_CONN
 from .weed_tracking import calculate_unique_weeds_impl
 from .job_queue import (
     create_processing_job_impl,
@@ -17,6 +17,7 @@ from .job_queue import (
     cleanup_old_jobs_impl,
 )
 
+print("DATABASE_URL:", DATABASE_URL)
 # PostgreSQL connection pool
 connection_pool = None
 
