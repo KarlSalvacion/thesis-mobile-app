@@ -1,81 +1,44 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import * as ScreenOrientation from 'expo-screen-orientation';
-import { View, Text, ActivityIndicator, ScrollView, RefreshControl, Image, TouchableOpacity, Modal, Dimensions, Alert, Linking, Platform } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
-import { useNavigation } from '@react-navigation/native';
-import { Video, ResizeMode } from 'expo-av';
-import * as FileSystem from 'expo-file-system/legacy';
-import * as Sharing from 'expo-sharing';
-import { API_BASE } from '../config';
-import { useSession } from '../context/SessionContext';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import ZoomableImage from '../components/ZoomableImage';
-
-type DetectionRow = [
-  id: number,
-  filename: string,
-  timestamp: string,
-  file_type: string,
-  summary: string | null,
-  total_frames: number,
-  total_detections: number,
-  processing_time: number,
-  input_size_bytes: number | null,
-  result_size_bytes: number | null,
-  has_srt_data: boolean | null
-]
-
-type FrameMetadataRow = [
-  id: number,
-  detection_id: number,
-  frame_number: number,
-  timestamp: string,
-  latitude: number | null,
-  longitude: number | null,
-  altitude: number | null,
-  relative_altitude: number | null,
-  iso: number | null,
-  shutter_speed: string | null,
-  f_number: number | null,
-  exposure_value: number | null,
-  focal_length: number | null,
-  color_temperature: number | null,
-]
-
-type DetectionDetailRow = [
-  id: number,
-  detection_id: number,
-  frame_number: number,
-  weed_class: string,
-  confidence: number,
-  bbox_x: number,
-  bbox_y: number,
-  bbox_width: number,
-  bbox_height: number,
-  normalized_bbox_x: number | null,
-  normalized_bbox_y: number | null,
-  normalized_bbox_width: number | null,
-  normalized_bbox_height: number | null,
-  detection_timestamp: string
-]
-
-function pickColorForClass(className: string): string {
-  const map: Record<string, string> = {
-    amaranthus: 'bg-red-500',
-    echinochloa: 'bg-orange-500',
-    default: 'bg-yellow-500',
-  }
-  const key = className.toLowerCase()
-  if (key.includes('amaran')) return map.amaranthus
-  if (key.includes('echino')) return map.echinochloa
-  return map.default
-}
+import React, { useEffect, useMemo, useState, useCallback } from 'react'
+import * as ScreenOrientation from 'expo-screen-orientation'
+import {
+  View,
+  Text,
+  ActivityIndicator,
+  ScrollView,
+  RefreshControl,
+  Modal,
+  Dimensions,
+  Alert,
+  Linking,
+} from 'react-native'
+import { SafeAreaView } from 'react-native-safe-area-context'
+import { useNavigation } from '@react-navigation/native'
+import * as FileSystem from 'expo-file-system/legacy'
+import * as Sharing from 'expo-sharing'
+import { API_BASE } from '../config'
+import { useSession } from '../context/SessionContext'
+import {
+  DetectionDetailRow,
+  DetectionRow,
+  FrameMetadataRow,
+  UniqueWeedPayload,
+} from '../components/detresults/types'
+import {
+  buildDetectionSummary,
+  fetchDetectionResultsData,
+  formatAmPm,
+} from '../services/detResultsService'
+import DetMediaPreviewCard from '../components/detresults/DetMediaPreviewCard'
+import DetFullscreenMediaModal from '../components/detresults/DetFullscreenMediaModal'
+import DetSessionSelectionModal from '../components/detresults/DetSessionSelectionModal'
+import DetSummaryCard from '../components/detresults/DetSummaryCard'
+import DetSpeciesBreakdownCard from '../components/detresults/DetSpeciesBreakdownCard'
+import DetActionsCard from '../components/detresults/DetActionsCard'
+import DetExportOverlay from '../components/detresults/DetExportOverlay'
 
 const DetectionResults = () => {
   const navigation = useNavigation()
-  const { selectedDetection, sessions, refreshSessions, setSelectedDetection } = useSession();
-  const insets = useSafeAreaInsets();
+  const { selectedDetection, sessions, refreshSessions, setSelectedDetection } = useSession()
   const [loading, setLoading] = useState<boolean>(false)
   const [error, setError] = useState<string>('')
   const [details, setDetails] = useState<DetectionDetailRow[]>([])
@@ -83,138 +46,70 @@ const DetectionResults = () => {
   const [isModalVisible, setIsModalVisible] = useState<boolean>(false)
   const [sessionModalVisible, setSessionModalVisible] = useState<boolean>(false)
   const [exporting, setExporting] = useState<boolean>(false)
-  // Handle orientation lock for fullscreen modal
-  useEffect(() => {
-    if (isModalVisible) {
-      // Allow all orientations in fullscreen
-      ScreenOrientation.unlockAsync();
-    } else {
-      // Lock to portrait when not in fullscreen
-      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
-    }
-    // Clean up: lock to portrait when unmounting
-    return () => {
-      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
-    };
-  }, [isModalVisible]);
   const [exportCancelToken, setExportCancelToken] = useState<AbortController | null>(null)
   const [uniqueWeedCount, setUniqueWeedCount] = useState<number | null>(null)
-  const [uniqueWeedData, setUniqueWeedData] = useState<any>(null)
+  const [uniqueWeedData, setUniqueWeedData] = useState<UniqueWeedPayload | null>(null)
 
-  // Get screen dimensions for modal sizing
   const { width: screenWidth, height: screenHeight } = Dimensions.get('window')
-  
-  // DJI Mini 4 Pro aspect ratio is 4:3
-  const djiAspectRatio = 4 / 3
 
-  // Error handler callbacks to avoid state updates during render
-  const handleImageError = useCallback((error: any) => {
-    console.log('Image load error:', error);
-  }, []);
+  useEffect(() => {
+    if (isModalVisible) {
+      ScreenOrientation.unlockAsync()
+    } else {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP)
+    }
 
-  const handleVideoError = useCallback((error: any) => {
-    console.log('Video load error:', error);
-  }, []);
+    return () => {
+      ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP)
+    }
+  }, [isModalVisible])
+
+  const handleImageError = useCallback((err: any) => {
+    console.log('Image load error:', err)
+  }, [])
+
+  const handleVideoError = useCallback((err: any) => {
+    console.log('Video load error:', err)
+  }, [])
 
   const loadDetectionData = useCallback(async (detection: DetectionRow) => {
     try {
-      setLoading(true);
-      setError('');
-      
-      const detId = detection[0];
-      const res = await fetch(`${API_BASE}/detection/${detId}`);
-      if (!res.ok) throw new Error(`Failed to load session ${detId}`);
-      const j = await res.json();
-      
-      // Attach cloud URLs returned by backend.detection tuple for consistent display
-      const detectionTuple = j?.detection ?? [];
-      ;(detection as any).cloud_public_id = detectionTuple[11];
-      ;(detection as any).cloud_resource_type = detectionTuple[12];
-      ;(detection as any).cloud_secure_url = detectionTuple[13];
-      ;(detection as any).cloud_annotated_url = detectionTuple[14];
-      
-      console.log('🔍 [DEBUG] Detection tuple length:', detectionTuple.length);
-      console.log('🔍 [DEBUG] Cloud URLs:', {
-        secure: detectionTuple[13],
-        annotated: detectionTuple[14]
-      });
-      
-      setFrames((j?.frame_metadata ?? []) as FrameMetadataRow[]);
-      setDetails((j?.detection_details ?? []) as DetectionDetailRow[]);
+      setLoading(true)
+      setError('')
 
-      if (detection[3] === 'video') {
-        try {
-          // Check if this detection has SRT data first
-          if (detection[10]) { // has_srt_data field
-            // Use unique-weeds-heatmap endpoint for videos with GPS data
-            // SAME parameters as Mapscreen for consistency
-            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds-heatmap?grid_size_m=2.0&iou_threshold=0.58&frame_gap=13`);
-            if (res3.ok) {
-              const uniqueData = await res3.json();
-              setUniqueWeedCount(uniqueData.unique_weed_count);
-              setUniqueWeedData(uniqueData);
-            } else {
-              // Fallback to basic unique weeds calculation without GPS
-              const res4 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.58&frame_gap=13`);
-              if (res4.ok) {
-                const uniqueData = await res4.json();
-                setUniqueWeedCount(uniqueData.unique_weed_count);
-                setUniqueWeedData(uniqueData);
-              }
-            }
-          } else {
-            // For videos without SRT data, use the basic unique-weeds endpoint
-            console.log(`🔍 Fetching unique weeds for video without SRT: ${detId}`);
-            const res3 = await fetch(`${API_BASE}/detection/${detId}/unique-weeds?iou_threshold=0.58&frame_gap=13`);
-            console.log(`🔍 Unique weeds response status: ${res3.status}`);
-            if (res3.ok) {
-              const uniqueData = await res3.json();
-              console.log(`🔍 Unique weeds data:`, uniqueData);
-              setUniqueWeedCount(uniqueData.unique_weed_count);
-              setUniqueWeedData(uniqueData);
-            } else {
-              const errorText = await res3.text();
-              console.error(`❌ Unique weeds endpoint failed: ${res3.status} - ${errorText}`);
-            }
-          }
-        } catch (e) {
-          console.error('❌ Error fetching unique weed count for session', detId, e);
-        }
-      } else {
-        setUniqueWeedCount(null);
-        setUniqueWeedData(null);
-      }
+      const payload = await fetchDetectionResultsData(detection)
+      setFrames(payload.frames)
+      setDetails(payload.details)
+      setUniqueWeedCount(payload.uniqueWeedCount)
+      setUniqueWeedData(payload.uniqueWeedData)
     } catch (e: any) {
-      setError(e?.message || 'Failed to load session');
+      setError(e?.message || 'Failed to load session')
     } finally {
-      setLoading(false);
+      setLoading(false)
     }
-  }, []);
+  }, [])
 
-  // Load detection data when selected detection changes
   useEffect(() => {
     if (selectedDetection) {
-      loadDetectionData(selectedDetection);
+      loadDetectionData(selectedDetection as DetectionRow)
     } else {
-      // Clear all data when no detection is selected
-      setDetails([]);
-      setFrames([]);
-      setUniqueWeedCount(null);
-      setUniqueWeedData(null);
-      setError('');
+      setDetails([])
+      setFrames([])
+      setUniqueWeedCount(null)
+      setUniqueWeedData(null)
+      setError('')
     }
-  }, [selectedDetection, loadDetectionData]);
+  }, [selectedDetection, loadDetectionData])
 
-  // Action Handlers
   const handleViewMap = useCallback(() => {
     if (!selectedDetection) {
       Alert.alert('No Data', 'No detection session available.')
       return
     }
-    
+
     const detectionId = selectedDetection[0]
     const hasGPS = selectedDetection[10]
-    
+
     if (!hasGPS) {
       Alert.alert(
         'GPS Data Required',
@@ -223,27 +118,81 @@ const DetectionResults = () => {
       )
       return
     }
-    
-    // Navigate to Map screen
-    (navigation as any).navigate('Map', { 
+
+    ;(navigation as any).navigate('Map', {
       detectionId,
-      autoFocus: true 
+      autoFocus: true,
     })
   }, [selectedDetection, navigation])
 
   const handleOpenSelectSession = useCallback(async () => {
-    await refreshSessions();
-    setSessionModalVisible(true);
-  }, [refreshSessions]);
+    await refreshSessions()
+    setSessionModalVisible(true)
+  }, [refreshSessions])
 
   const cancelExport = useCallback(() => {
     if (exportCancelToken) {
       exportCancelToken.abort()
       setExportCancelToken(null)
       setExporting(false)
-      console.log('🚫 Export cancelled by user')
+      console.log('Export cancelled by user')
     }
   }, [exportCancelToken])
+
+  const exportReport = async (detectionId: number, format: string) => {
+    try {
+      setExporting(true)
+
+      const abortController = new AbortController()
+      setExportCancelToken(abortController)
+
+      const url = `${API_BASE}/detection/${detectionId}/export?format=${format}`
+      const filename = `detection_report_${detectionId}.${format}`
+      const fileUri = `${FileSystem.documentDirectory}${filename}`
+
+      const downloadResult = await FileSystem.downloadAsync(url, fileUri)
+
+      if (abortController.signal.aborted) {
+        return
+      }
+
+      if (downloadResult.status === 200) {
+        const canShare = await Sharing.isAvailableAsync()
+        if (canShare) {
+          await Sharing.shareAsync(downloadResult.uri, {
+            mimeType:
+              format === 'json'
+                ? 'application/json'
+                : format === 'csv'
+                  ? 'text/csv'
+                  : 'application/pdf',
+            dialogTitle: `Export Detection Report (${format.toUpperCase()})`,
+          })
+        } else {
+          Alert.alert('Export Complete', `Report saved to:\n${downloadResult.uri}`, [{ text: 'OK' }])
+        }
+      } else {
+        throw new Error(`Download failed with status: ${downloadResult.status}`)
+      }
+    } catch (error: any) {
+      if (error.name === 'AbortError' || error.message?.includes('aborted')) {
+        return
+      }
+
+      if (error.message?.includes('reportlab')) {
+        Alert.alert(
+          'PDF Export Unavailable',
+          'PDF export requires additional setup on the server. Try JSON or CSV format instead.',
+          [{ text: 'OK' }]
+        )
+      } else {
+        Alert.alert('Export Failed', error.message || 'Could not export report. Please try again.', [{ text: 'OK' }])
+      }
+    } finally {
+      setExporting(false)
+      setExportCancelToken(null)
+    }
+  }
 
   const handleExport = useCallback(async () => {
     if (!selectedDetection) {
@@ -253,106 +202,13 @@ const DetectionResults = () => {
 
     const detectionId = selectedDetection[0]
 
-    Alert.alert(
-      'Export Format',
-      'Choose export format:',
-      [
-        {
-          text: 'JSON',
-          onPress: () => exportReport(detectionId, 'json')
-        },
-        {
-          text: 'CSV',
-          onPress: () => exportReport(detectionId, 'csv')
-        },
-        {
-          text: 'PDF',
-          onPress: () => exportReport(detectionId, 'pdf')
-        },
-        {
-          text: 'Cancel',
-          style: 'cancel'
-        }
-      ]
-    )
+    Alert.alert('Export Format', 'Choose export format:', [
+      { text: 'JSON', onPress: () => exportReport(detectionId, 'json') },
+      { text: 'CSV', onPress: () => exportReport(detectionId, 'csv') },
+      { text: 'PDF', onPress: () => exportReport(detectionId, 'pdf') },
+      { text: 'Cancel', style: 'cancel' },
+    ])
   }, [selectedDetection])
-
-  const exportReport = async (detectionId: number, format: string) => {
-    try {
-      setExporting(true)
-      
-      // Create abort controller for cancellation
-      const abortController = new AbortController()
-      setExportCancelToken(abortController)
-      
-      const url = `${API_BASE}/detection/${detectionId}/export?format=${format}`
-      
-      console.log(`📥 Exporting ${format.toUpperCase()} report...`)
-      
-      const filename = `detection_report_${detectionId}.${format}`
-      const fileUri = `${FileSystem.documentDirectory}${filename}`
-      
-      // Download the file with abort signal
-      const downloadResult = await FileSystem.downloadAsync(url, fileUri)
-      
-      // Check if export was cancelled after download
-      if (abortController.signal.aborted) {
-        console.log('🚫 Export cancelled during download')
-        return
-      }
-      
-      if (downloadResult.status === 200) {
-        console.log('✅ Report downloaded:', downloadResult.uri)
-        
-        // Check if sharing is available
-        const canShare = await Sharing.isAvailableAsync()
-        
-        if (canShare) {
-          await Sharing.shareAsync(downloadResult.uri, {
-            mimeType: format === 'json' ? 'application/json' : 
-                     format === 'csv' ? 'text/csv' : 
-                     'application/pdf',
-            dialogTitle: `Export Detection Report (${format.toUpperCase()})`
-          })
-        } else {
-          Alert.alert(
-            'Export Complete',
-            `Report saved to:\n${downloadResult.uri}`,
-            [
-              { text: 'OK' }
-            ]
-          )
-        }
-      } else {
-        throw new Error(`Download failed with status: ${downloadResult.status}`)
-      }
-    } catch (error: any) {
-      console.error('❌ Export error:', error)
-      
-      // Check if export was cancelled
-      if (error.name === 'AbortError' || error.message?.includes('aborted')) {
-        console.log('🚫 Export was cancelled')
-        return // Don't show error alert for cancellation
-      }
-      
-      if (error.message?.includes('reportlab')) {
-        Alert.alert(
-          'PDF Export Unavailable',
-          'PDF export requires additional setup on the server. Try JSON or CSV format instead.',
-          [{ text: 'OK' }]
-        )
-      } else {
-        Alert.alert(
-          'Export Failed',
-          error.message || 'Could not export report. Please try again.',
-          [{ text: 'OK' }]
-        )
-      }
-    } finally {
-      setExporting(false)
-      setExportCancelToken(null)
-    }
-  }
 
   const handleShare = useCallback(async () => {
     if (!selectedDetection) {
@@ -364,535 +220,145 @@ const DetectionResults = () => {
 
     try {
       setExporting(true)
-      
-      console.log('📤 Creating share package...')
-      const response = await fetch(`${API_BASE}/detection/${detectionId}/share`, {
-        method: 'POST'
-      })
-      
+
+      const response = await fetch(`${API_BASE}/detection/${detectionId}/share`, { method: 'POST' })
       if (!response.ok) {
         throw new Error(`Share failed: ${response.status}`)
       }
-      
+
       const shareData = await response.json()
-      console.log('✅ Share package created:', shareData)
-      
-      const shareMessage = shareData.share_message || 
-        `🌿 Weed Detection Results\n\nFile: ${selectedDetection[1]}\nDetected: ${details.length} weeds\n\nView: ${shareData.media_urls?.annotated || 'N/A'}`
-      
-      // Check if native sharing is available
+      const shareMessage =
+        shareData.share_message ||
+        `Weed Detection Results\n\nFile: ${selectedDetection[1]}\nDetected: ${details.length} weeds\n\nView: ${shareData.media_urls?.annotated || 'N/A'}`
+
       const canShare = await Sharing.isAvailableAsync()
-      
+
       if (canShare && shareData.media_urls?.annotated) {
-        // Download annotated media first
         const filename = `detection_${detectionId}_annotated.${selectedDetection[3] === 'video' ? 'mp4' : 'jpg'}`
         const fileUri = `${FileSystem.cacheDirectory}${filename}`
-        
+
         try {
           const downloadResult = await FileSystem.downloadAsync(shareData.media_urls.annotated, fileUri)
-          
           if (downloadResult.status === 200) {
             await Sharing.shareAsync(downloadResult.uri, {
               mimeType: selectedDetection[3] === 'video' ? 'video/mp4' : 'image/jpeg',
-              dialogTitle: 'Share Detection Results'
+              dialogTitle: 'Share Detection Results',
             })
           } else {
-            // Fallback to URL only
-            Alert.alert(
-              'Share Results',
-              shareMessage,
-              [
-                {
-                  text: 'Copy Link',
-                  onPress: () => {
-                    // In a real app, you'd copy to clipboard here
-                    Alert.alert('Link', shareData.media_urls?.annotated || 'No link available')
-                  }
+            Alert.alert('Share Results', shareMessage, [
+              {
+                text: 'Copy Link',
+                onPress: () => {
+                  Alert.alert('Link', shareData.media_urls?.annotated || 'No link available')
                 },
-                { text: 'Cancel', style: 'cancel' }
-              ]
-            )
+              },
+              { text: 'Cancel', style: 'cancel' },
+            ])
           }
-        } catch (downloadError) {
-          console.error('Download error:', downloadError)
-          // Fallback to text share
+        } catch {
           Alert.alert('Share Results', shareMessage, [{ text: 'OK' }])
         }
       } else {
-        // Fallback to alert with message
-        Alert.alert(
-          'Share Results',
-          shareMessage,
-          [
-            {
-              text: 'Open Link',
-              onPress: () => {
-                const url = shareData.media_urls?.annotated || shareData.media_urls?.original
-                if (url) {
-                  Linking.openURL(url)
-                }
-              }
+        Alert.alert('Share Results', shareMessage, [
+          {
+            text: 'Open Link',
+            onPress: () => {
+              const url = shareData.media_urls?.annotated || shareData.media_urls?.original
+              if (url) Linking.openURL(url)
             },
-            { text: 'OK' }
-          ]
-        )
+          },
+          { text: 'OK' },
+        ])
       }
     } catch (error: any) {
-      console.error('❌ Share error:', error)
-      Alert.alert(
-        'Share Failed',
-        error.message || 'Could not create share package. Please try again.',
-        [{ text: 'OK' }]
-      )
+      Alert.alert('Share Failed', error.message || 'Could not create share package. Please try again.', [
+        { text: 'OK' },
+      ])
     } finally {
       setExporting(false)
     }
   }, [selectedDetection, details])
 
-  const summary = useMemo(() => {
-    if (!selectedDetection) return null
-    const totalDetections = details.length
-    const avgConfidence =
-      totalDetections > 0
-        ? Math.round((details.reduce((s, d) => s + (d[4] ?? 0), 0) / totalDetections) * 1000) / 10
-        : 0
-    const ts = selectedDetection[2]
-    const byClass: Record<string, { count: number; avg: number }> = {}
-    details.forEach(d => {
-      const name = d[3]
-      const conf = d[4] ?? 0
-      if (!byClass[name]) byClass[name] = { count: 0, avg: 0 }
-      const prev = byClass[name]
-      prev.count += 1
-      prev.avg += conf
-    })
-    const species = Object.entries(byClass)
-      .map(([name, v]) => ({
-        name,
-        count: v.count,
-        confidence: v.count ? Math.round((v.avg / v.count) * 1000) / 10 : 0,
-        color: pickColorForClass(name),
-      }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 6)
-    return { totalWeeds: totalDetections, confidence: avgConfidence, timestamp: ts, species }
-  }, [selectedDetection, details])
-
-  function formatAmPm(ts?: string | null) {
-    if (!ts) return ''
-    try {
-      const d = new Date(ts)
-      const dateStr = d.toLocaleDateString()
-      const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })
-      return `${dateStr} ${timeStr}`
-    } catch {
-      return String(ts)
-    }
-  }
+  const summary = useMemo(
+    () => buildDetectionSummary((selectedDetection as DetectionRow | null) ?? null, details),
+    [selectedDetection, details]
+  )
 
   return (
     <SafeAreaView className="flex-1 bg-bgColor1" edges={['top']}>
-      <ScrollView className="flex-1" showsVerticalScrollIndicator={false}
-        refreshControl={<RefreshControl refreshing={loading} onRefresh={() => refreshSessions()} />}>
+      <ScrollView
+        className="flex-1"
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={loading} onRefresh={() => refreshSessions()} />}
+      >
         <View className="flex-1 justify-start items-center pb-8 px-4" style={{ paddingTop: 48 }}>
-        {/* Media Container - Flexible preview with better aspect ratio handling */}
-        <View className="w-full items-center mb-6">
-          <TouchableOpacity 
-            onPress={() => setIsModalVisible(true)}
-            activeOpacity={0.8}
-            className="w-full max-w-md"
-          >
-            <View 
-              className="bg-gray-800 rounded-2xl shadow-lg overflow-hidden"
-              style={{ 
-                width: '100%', 
-                minHeight: 200,
-                maxHeight: screenHeight * 0.5,
-              }}
-            >
-              {selectedDetection && selectedDetection[3] === 'image' ? (
-                <Image
-                  source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
-                  resizeMode="contain"
-                  style={{ width: '100%', height: '100%', minHeight: 200 }}
-                  onError={handleImageError}
-                />
-              ) : selectedDetection && selectedDetection[3] === 'video' && (selectedDetection as any).cloud_secure_url ? (
-                <Video
-                  source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
-                  style={{ width: '100%', height: 300 }}
-                  resizeMode={ResizeMode.CONTAIN}
-                  shouldPlay={false}
-                  isLooping={true}
-                  isMuted={true}
-                  onError={handleVideoError}
-                />
-              ) : (
-                <View style={{ width: '100%', height: 250 }} className="items-center justify-center">
-                  <Ionicons name="play-circle" size={64} color="white" />
-                  <Text className="text-white text-lg font-medium mt-3 text-center">
-                    {selectedDetection?.[3] === 'video' ? 'Detection Video' : 'Media preview unavailable'}
-                  </Text>
-                  <Text className="text-gray-300 text-xs mt-1 px-3 text-center">
-                    {selectedDetection?.[3] === 'video'
-                      ? 'Tap to expand and play video'
-                      : 'No media available for preview'}
-                  </Text>
-                </View>
-              )}
-              
-              {/* Expand indicator overlay */}
-              <View className="absolute top-2 right-2 bg-black/50 rounded-full p-2">
-                <Ionicons name="expand" size={20} color="white" />
-              </View>
-              </View>
+          <DetMediaPreviewCard
+            selectedDetection={(selectedDetection as DetectionRow | null) ?? null}
+            screenHeight={screenHeight}
+            onOpenFullscreen={() => setIsModalVisible(true)}
+            onImageError={handleImageError}
+            onVideoError={handleVideoError}
+          />
 
-              {/* Session Selection Modal */}
-              <Modal visible={sessionModalVisible} transparent={true} animationType="slide" onRequestClose={() => setSessionModalVisible(false)}>
-                <View className="flex-1 bg-black/60 justify-end">
-                  <View className="bg-white rounded-t-2xl p-4 max-h-3/4">
-                    <Text className="text-lg font-semibold mb-2">Select Detection Session</Text>
-                    <ScrollView style={{ maxHeight: 360 }}>
-                      {sessions.length === 0 && (
-                        <View className="p-4"><Text className="text-gray-500">No sessions available.</Text></View>
-                      )}
-                      {sessions.map((s) => (
-                        <TouchableOpacity key={s[0]} className="p-3 border-b border-gray-100" onPress={() => {
-                          setSelectedDetection(s);
-                          setSessionModalVisible(false);
-                        }}>
-                          <View className="flex-row items-center justify-between">
-                            <View className="flex-1">
-                              <Text className="font-medium">{s[1]}</Text>
-                              <Text className="text-xs text-gray-500">{formatAmPm(s[2])} • {s[3]}</Text>
-                            </View>
-                            <View className="flex-row items-center">
-                              <Text className="text-sm text-gray-400 mr-3">{s[6]} detections</Text>
-                              <TouchableOpacity
-                                onPress={(e) => {
-                                  e.stopPropagation();
-                                  Alert.alert(
-                                    'Delete Session',
-                                    `Are you sure you want to delete "${s[1]}"?\n\nThis will permanently delete all data including:\n• Detection details\n• GPS tracks\n• Heatmaps\n\nThis action cannot be undone.`,
-                                    [
-                                      { text: 'Cancel', style: 'cancel' },
-                                      {
-                                        text: 'Delete',
-                                        style: 'destructive',
-                                        onPress: async () => {
-                                          try {
-                                            const response = await fetch(`${API_BASE}/detection/${s[0]}`, {
-                                              method: 'DELETE',
-                                            });
-                                            if (response.ok) {
-                                              await refreshSessions();
-                                              if (selectedDetection && selectedDetection[0] === s[0]) {
-                                                setSelectedDetection(null);
-                                              }
-                                              Alert.alert('Success', 'Session deleted successfully');
-                                            } else {
-                                              Alert.alert('Error', 'Failed to delete session');
-                                            }
-                                          } catch (error) {
-                                            Alert.alert('Error', 'Failed to delete session');
-                                          }
-                                        },
-                                      },
-                                    ]
-                                  );
-                                }}
-                                className="p-2"
-                              >
-                                <Ionicons name="trash-outline" size={20} color="#ef4444" />
-                              </TouchableOpacity>
-                            </View>
-                          </View>
-                        </TouchableOpacity>
-                      ))}
-                    </ScrollView>
-                    <TouchableOpacity className="mt-3 p-3 bg-gray-100 rounded-lg" onPress={() => setSessionModalVisible(false)}>
-                      <Text className="text-center text-gray-700">Close</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              </Modal>
-          </TouchableOpacity>
-        </View>
+          <DetSessionSelectionModal
+            visible={sessionModalVisible}
+            sessions={(sessions as DetectionRow[]) ?? []}
+            selectedDetection={(selectedDetection as DetectionRow | null) ?? null}
+            onClose={() => setSessionModalVisible(false)}
+            onSelectSession={(session) => setSelectedDetection(session)}
+            onClearSelection={() => setSelectedDetection(null)}
+            onRefreshSessions={refreshSessions}
+            formatAmPm={formatAmPm}
+          />
 
-        {/* Fullscreen Modal */}
-        <Modal
-          visible={isModalVisible}
-          transparent={true}
-          animationType="fade"
-          onRequestClose={() => setIsModalVisible(false)}
-        >
-          <View className="flex-1 bg-black justify-center items-center">
-            <TouchableOpacity 
-              className="absolute top-12 right-4 z-10 bg-black/50 rounded-full p-3"
-              onPress={() => setIsModalVisible(false)}
-            >
-              <Ionicons name="close" size={24} color="white" />
-            </TouchableOpacity>
-            
-            {/* Full screen container for media */}
-            <View 
-              style={{ 
-                width: screenWidth,
-                height: screenHeight,
-                justifyContent: 'center',
-                alignItems: 'center',
-              }}
-            >
-              {selectedDetection && selectedDetection[3] === 'image' ? (
-                <ZoomableImage
-                  uri={(selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url}
-                  style={{ width: '100%', height: '100%' }}
-                  resizeMode="contain"
-                />
-              ) : selectedDetection && selectedDetection[3] === 'video' && (selectedDetection as any).cloud_secure_url ? (
-                <Video
-                  source={{ uri: (selectedDetection as any).cloud_annotated_url || (selectedDetection as any).cloud_secure_url }}
-                  style={{ 
-                    width: screenWidth * 0.95, 
-                    height: screenHeight * 0.8,
-                  }}
-                  resizeMode={ResizeMode.CONTAIN}
-                  shouldPlay={true}
-                  isLooping={true}
-                  isMuted={false}
-                  useNativeControls={true}
-                  onError={handleVideoError}
-                />
-              ) : (
-                <View className="flex-1 items-center justify-center bg-gray-800 rounded-lg mx-4">
-                  <Ionicons name="alert-circle" size={64} color="white" />
-                  <Text className="text-white text-lg font-medium mt-3 text-center">
-                    Media Unavailable
-                  </Text>
-                  <Text className="text-gray-300 text-sm mt-1 px-4 text-center">
-                    The media file could not be loaded for preview
-                  </Text>
-                </View>
-              )}
-            </View>
-          </View>
-        </Modal>
+          <DetFullscreenMediaModal
+            visible={isModalVisible}
+            selectedDetection={(selectedDetection as DetectionRow | null) ?? null}
+            screenWidth={screenWidth}
+            screenHeight={screenHeight}
+            onClose={() => setIsModalVisible(false)}
+            onVideoError={handleVideoError}
+          />
 
-        {/* Header */}
-        {loading && (
-          <View className="w-full max-w-md mb-6">
-            <View className="bg-white rounded-2xl shadow-lg p-6 items-center">
-              <ActivityIndicator />
-              <Text className="text-gray-600 mt-2">Loading results…</Text>
-            </View>
-          </View>
-        )}
-        {!!error && (
-          <View className="w-full max-w-md mb-6">
-            <View className="bg-white rounded-2xl shadow-lg p-6">
-              <Text className="text-red-600 text-center">{error}</Text>
-            </View>
-          </View>
-        )}
-
-        {/* Summary Stats */}
-        <View className="w-full max-w-md mb-6">
-          <View className="bg-white rounded-2xl shadow-lg p-6">
-            <Text className="text-lg font-semibold text-gray-700 mb-4 text-center">
-              Detection Summary
-            </Text>
-            
-            <View className="flex-row justify-between items-center mb-4">
-              <View className="items-center flex-1">
-                <View className="bg-green-100 rounded-full w-16 h-16 items-center justify-center mb-2">
-                  <Text className="text-2xl font-bold text-green-600">
-                    {uniqueWeedCount !== null ? uniqueWeedCount : (summary?.totalWeeds ?? 0)}
-                  </Text>
-                </View>
-                <Text className="text-sm text-gray-600 text-center">
-                  {uniqueWeedCount !== null ? 'Estimated Unique Weeds' : 'Total Weeds'}
-                </Text>
-                {uniqueWeedCount !== null && uniqueWeedData && (
-                  <Text className="text-xs text-gray-500 text-center mt-1">
-                    ({uniqueWeedData.total_detections} detections)
-                    {uniqueWeedData.no_gps_data && (
-                      <Text className="text-orange-600"> • No GPS data</Text>
-                    )}
-                  </Text>
-                )}
-              </View>
-              
-              <View className="items-center flex-1">
-                <View className="bg-blue-100 rounded-full w-16 h-16 items-center justify-center mb-2">
-                  <Text className="text-lg font-bold text-blue-600">
-                    {summary?.confidence ?? 0}%
-                  </Text>
-                </View>
-                <Text className="text-sm text-gray-600 text-center">Confidence</Text>
+          {loading && (
+            <View className="w-full max-w-md mb-6">
+              <View className="bg-white rounded-2xl shadow-lg p-6 items-center">
+                <ActivityIndicator />
+                <Text className="text-gray-600 mt-2">Loading results...</Text>
               </View>
             </View>
+          )}
 
-            <View className="bg-gray-50 rounded-lg p-3">
-              <Text className="text-xs text-gray-600 text-center">
-                {selectedDetection ? `File: ${selectedDetection[1]} (${selectedDetection[3]})` : ''}
-              </Text>
-              <Text className="text-xs text-gray-500 text-center mt-1">
-                {summary?.timestamp ? `Detected on ${formatAmPm(summary.timestamp)}` : 'No recent session'}
-              </Text>
-              {selectedDetection && (
-                <View className="flex-row items-center justify-center mt-2">
-                  {selectedDetection[10] ? (
-                    <>
-                      <View className="w-2 h-2 bg-green-500 rounded-full mr-1" />
-                      <Text className='text-xs text-green-600 font-medium'>GPS Data Available</Text>
-                    </>
-                  ) : (
-                    <>
-                      <View className="w-2 h-2 bg-gray-400 rounded-full mr-1" />
-                      <Text className='text-xs text-gray-500 font-medium'>No GPS Data</Text>
-                    </>
-                  )}
-                </View>
-              )}
-            </View>
-          </View>
-        </View>
-
-        {/* Species Breakdown */}
-        <View className="w-full max-w-md mb-6">
-          <View className="bg-white rounded-2xl shadow-lg p-6">
-            <Text className="text-lg font-semibold text-gray-700 mb-4 text-center">
-              Weed Species Detected
-            </Text>
-            
-            {(summary?.species ?? []).map((species, index) => (
-              <View key={index} className="mb-4 last:mb-0">
-                <View className="flex-row items-center justify-between mb-2">
-                  <View className="flex-row items-center">
-                    <View className={`w-4 h-4 rounded-full ${species.color} mr-3`} />
-                    <Text className="text-base font-medium text-gray-800">
-                      {species.name}
-                    </Text>
-                  </View>
-                  <Text className="text-lg font-bold text-gray-700">
-                    {species.count}
-                  </Text>
-                </View>
-                
-                <View className="flex-row items-center justify-between">
-                  <View className="flex-1 bg-gray-200 rounded-full h-2 mr-3">
-                    <View 
-                      className={`h-2 rounded-full ${species.color}`}
-                      style={{ width: `${Math.min(100, Math.max(0, species.confidence))}%` }}
-                    />
-                  </View>
-                  <Text className="text-sm text-gray-600 min-w-[50px] text-right">
-                    {species.confidence}%
-                  </Text>
-                </View>
+          {!!error && (
+            <View className="w-full max-w-md mb-6">
+              <View className="bg-white rounded-2xl shadow-lg p-6">
+                <Text className="text-red-600 text-center">{error}</Text>
               </View>
-            ))}
-            {(!summary || (summary.species?.length ?? 0) === 0) && (
-              <Text className="text-center text-gray-500">No detections available.</Text>
-            )}
-          </View>
+            </View>
+          )}
+
+          <DetSummaryCard
+            summary={summary}
+            selectedDetection={(selectedDetection as DetectionRow | null) ?? null}
+            uniqueWeedCount={uniqueWeedCount}
+            uniqueWeedData={uniqueWeedData}
+            formatAmPm={formatAmPm}
+          />
+
+          <DetSpeciesBreakdownCard summary={summary} />
+
+          <DetActionsCard
+            exporting={exporting}
+            onViewMap={handleViewMap}
+            onSelectSession={handleOpenSelectSession}
+            onExport={handleExport}
+            onCancelExport={cancelExport}
+            onShare={handleShare}
+          />
         </View>
 
-        {/* Action Buttons */}
-        <View className="w-full max-w-md">
-          <View className="bg-white rounded-2xl shadow-lg p-6">
-            <Text className="text-lg font-semibold text-gray-700 mb-4 text-center">
-              Actions
-            </Text>
-            
-            <View className="space-y-3">
-              <TouchableOpacity 
-                className="bg-green-50 border border-green-200 rounded-lg p-3"
-                onPress={handleViewMap}
-                disabled={exporting}
-              >
-                <View className="flex-row items-center">
-                  <Ionicons name="map" size={24} color="rgb(37, 165, 120)" />
-                  <Text className="text-green-700 font-medium ml-3 flex-1">
-                    View on Map
-                  </Text>
-                  <Ionicons name="chevron-forward" size={20} color="rgb(37, 165, 120)" />
-                </View>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                className="bg-gray-50 border border-gray-200 rounded-lg p-3"
-                onPress={handleOpenSelectSession}
-                disabled={exporting}
-              >
-                <View className="flex-row items-center">
-                  <FontAwesome6 name="list" size={20} color="rgb(107, 114, 128)" />
-                  <Text className="text-gray-700 font-medium ml-3 flex-1">
-                    Select Session
-                  </Text>
-                  <Ionicons name="chevron-forward" size={20} color="rgb(107, 114, 128)" />
-                </View>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                className="bg-blue-50 border border-blue-200 rounded-lg p-3"
-                onPress={exporting ? cancelExport : handleExport}
-                disabled={false}
-              >
-                <View className="flex-row items-center">
-                  <FontAwesome6 name={exporting ? "times" : "download"} size={20} color="rgb(59, 130, 246)" />
-                  <Text className="text-blue-700 font-medium ml-3 flex-1">
-                    {exporting ? 'Cancel Export' : 'Export Report'}
-                  </Text>
-                  {exporting ? (
-                    <Ionicons name="close" size={20} color="rgb(239, 68, 68)" />
-                  ) : (
-                    <Ionicons name="chevron-forward" size={20} color="rgb(59, 130, 246)" />
-                  )}
-                </View>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                className="bg-orange-50 border border-orange-200 rounded-lg p-3"
-                onPress={handleShare}
-                disabled={exporting}
-              >
-                <View className="flex-row items-center">
-                  <FontAwesome6 name="share" size={20} color="rgb(245, 101, 101)" />
-                  <Text className="text-orange-700 font-medium ml-3 flex-1">
-                    Share Results
-                  </Text>
-                  <Ionicons name="chevron-forward" size={20} color="rgb(245, 101, 101)" />
-                </View>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </View>
-
-      {/* Loading overlay for export */}
-      {exporting && (
-        <View className="absolute inset-0 bg-black/50 flex items-center justify-center z-50">
-          <View className="bg-white rounded-2xl p-6 mx-4 shadow-xl">
-            <View className="items-center">
-              <ActivityIndicator size="large" color="#2563eb" />
-              <Text className="text-lg font-semibold text-gray-800 mt-4 mb-2">
-                Generating Report
-              </Text>
-              <Text className="text-sm text-gray-600 text-center mb-4">
-                Preparing File...
-              </Text>
-              <TouchableOpacity
-                className="bg-red-50 border border-red-200 rounded-lg px-4 py-2"
-                onPress={cancelExport}
-              >
-                <Text className="text-red-700 font-medium">Cancel</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      )}
-    </ScrollView>
+        <DetExportOverlay visible={exporting} onCancel={cancelExport} />
+      </ScrollView>
     </SafeAreaView>
   )
 }
