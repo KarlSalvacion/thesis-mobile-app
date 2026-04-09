@@ -169,7 +169,11 @@ const Mapscreen = () => {
 
   // Check map library availability once, but force LeafletWebMap in Expo Go
   useEffect(() => {
-    const isExpoGo = typeof navigator !== 'undefined' && navigator.product === 'ReactNative' && ((global as any)?.Expo || (global as any)?.expo);
+    const runtimeGlobal = globalThis as any;
+    const isExpoGo =
+      typeof navigator !== 'undefined' &&
+      navigator.product === 'ReactNative' &&
+      (runtimeGlobal?.Expo || runtimeGlobal?.expo);
     if (isExpoGo) {
       setMapsAvailable(false);
     } else {
