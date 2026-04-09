@@ -4,6 +4,9 @@
       "eas": {
         "projectId": "39a66666-5707-4483-bed2-0cde5855e793"
       }
+    },
+    "android": {
+      "package": "com.karlsalvacion.thesismobileapp"
     }
   }
 }
